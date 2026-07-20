@@ -132,7 +132,7 @@ def parse_device(value: str) -> int | str:
 
 
 def record_once(output_path: Path, device: int | str | None = None, sleep: Callable[[float], None] = time.sleep) -> None:
-    """Enter押下から1.5秒保持で確定する長押しを模擬し、15秒クリップを保存する手動スパイク。"""
+    """Enter後の1.5秒待機で長押しを模擬し、15秒クリップを保存する。"""
     capture_format: CaptureFormat = select_capture_format(device)
     # 再接続しても、切断直前に得た音声を失わないよう生存期間を関数全体にする。
     pre_roll: ByteRingBuffer = ByteRingBuffer(capture_format)
@@ -178,22 +178,14 @@ def record_once(output_path: Path, device: int | str | None = None, sleep: Calla
                 callback=callback,
                 finished_callback=finished_callback,
             ):
-                input('Enterで押下を開始します。')
+                input('Enterで記録操作を開始します。1.5秒後に記録を確定します。')
                 if stream_finished.is_set():
                     raise InputStreamStoppedError('input stream stopped before capture')
-                released = threading.Event()
-
-                def wait_release(*, released: threading.Event = released) -> None:
-                    input('解放するにはEnterを押します（1.5秒保持で記録が確定します）。')
-                    released.set()
-
-                threading.Thread(target=wait_release, daemon=True).start()
-                if released.wait(HOLD_SECONDS):
-                    print('長押しで記録します。')
-                    return
+                # 標準入力はキー押下・解放を通知しないため、CLIでは固定待機で長押しを模擬する。
+                sleep(HOLD_SECONDS)
                 if stream_finished.is_set():
                     raise InputStreamStoppedError('input stream stopped before capture')
-                # 長押し成立時点で操作前音声を確定し、解放を待たずに後録りへ進む。以降の押下は無視する。
+                # 長押し成立時点で操作前音声を確定し、直後の5秒を後録りする。
                 pre_pcm = pre_roll.snapshot(PRE_ROLL_SECONDS * capture_format.bytes_per_second)
                 post_roll.clear()
                 collecting_post_roll.set()
