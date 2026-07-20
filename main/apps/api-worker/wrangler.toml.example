@@ -1,0 +1,27 @@
+name = "little-echoes-api"
+main = "src/index.ts"
+compatibility_date = "2026-07-21"
+workers_dev = false
+
+# 実ID・ホスト名・Secretはこのテンプレートへ書き込まない。
+# デプロイ用のwrangler.tomlは.gitignore対象にし、ユーザー承認後に作成する。
+
+[[d1_databases]]
+binding = "DB"
+database_name = "little-echoes-demo"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "PRIVATE_MEDIA"
+bucket_name = "little-echoes-demo-media"
+
+[[workflows]]
+binding = "ANALYSIS_WORKFLOW"
+name = "little-echoes-analysis"
+class_name = "AnalysisWorkflow"
+
+[vars]
+DEMO_WRITE_ENABLED = "false"
+ACCESS_TEAM_DOMAIN = "REPLACE_WITH_ACCESS_TEAM_DOMAIN"
+ACCESS_AUD = "REPLACE_WITH_ACCESS_AUD"
