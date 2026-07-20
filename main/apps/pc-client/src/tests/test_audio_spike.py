@@ -1,15 +1,18 @@
 """Phase 1A音声スパイクの境界を確認する。"""
 
+import struct
 import wave
 from pathlib import Path
 
 import pytest
 from audio.spike import (
     HOLD_SECONDS,
+    NORMALIZATION_TARGET_PEAK,
     POST_ROLL_SECONDS,
     PRE_ROLL_SECONDS,
     ByteRingBuffer,
     CaptureFormat,
+    boost_quiet_pcm,
     downsample_48k_to_24k,
     parse_device,
     save_baseline_clip,
@@ -70,6 +73,33 @@ def test_downsample_rejects_incomplete_pair() -> None:
     """完全なサンプル対でないPCMを拒否する。"""
     with pytest.raises(ValueError, match='complete sample pairs'):
         downsample_48k_to_24k(b'\x00\x00')
+
+
+def test_boost_quiet_pcm_raises_voice_level_with_a_bounded_gain() -> None:
+    """小さい発話は最大8倍まで増幅する。"""
+    pcm = b'\xe8\x03\x18\xfc'
+    assert boost_quiet_pcm(pcm) == b'@\x1f\xc0\xe0'
+
+
+def test_boost_quiet_pcm_does_not_raise_silence_or_loud_audio() -> None:
+    """無音相当と十分大きい音声のレベルは変えない。"""
+    assert boost_quiet_pcm(b'\x64\x00') == b'\x64\x00'
+    assert boost_quiet_pcm(b'xi') == b'xi'
+
+
+def test_boost_quiet_pcm_ignores_a_single_loud_outlier() -> None:
+    """単発のキー音があっても、小さい発話を増幅し16-bit範囲へ収める。"""
+    pcm = struct.pack('<100h', *([1_000] * 99), 30_000)
+    adjusted: tuple[int, ...] = struct.unpack('<100h', boost_quiet_pcm(pcm))
+    assert adjusted[0] == 8_000
+    assert NORMALIZATION_TARGET_PEAK < adjusted[-1] <= 32_767
+
+
+def test_boost_quiet_pcm_handles_a_short_word_among_silence() -> None:
+    """短い発話が無音に埋もれても補正対象にする。"""
+    pcm = struct.pack('<100h', *([0] * 96), *([1_000] * 4))
+    adjusted: tuple[int, ...] = struct.unpack('<100h', boost_quiet_pcm(pcm))
+    assert adjusted[-1] == 8_000
 
 
 def test_write_wav_uses_baseline_format(tmp_path: Path) -> None:

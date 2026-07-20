@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import struct
 import threading
 import time
@@ -23,6 +24,11 @@ PRE_ROLL_SECONDS: Final[int] = 10
 POST_ROLL_SECONDS: Final[int] = 5
 HOLD_SECONDS: Final[float] = 1.5
 STATUS_MESSAGE_LIMIT: Final[int] = 16
+NORMALIZATION_TARGET_PEAK: Final[int] = 27_000
+NORMALIZATION_MIN_PEAK: Final[int] = 256
+NORMALIZATION_MAX_GAIN: Final[float] = 8.0
+MAX_SAMPLE_VALUE: Final[int] = 32_767
+MIN_SAMPLE_VALUE: Final[int] = -32_768
 
 
 class InputStreamStoppedError(RuntimeError):
@@ -98,6 +104,36 @@ def downsample_48k_to_24k(pcm: bytes) -> bytes:
     return struct.pack(f'<{len(averaged)}h', *averaged)
 
 
+def boost_quiet_pcm(pcm: bytes) -> bytes:
+    """単発の大きな音を除外して小さい発話だけを上限付きで増幅する。"""
+    if len(pcm) % SAMPLE_WIDTH != 0:
+        raise ValueError('PCM must contain complete 16-bit samples')
+    samples: tuple[int, ...] = struct.unpack(f'<{len(pcm) // SAMPLE_WIDTH}h', pcm)
+    if not samples:
+        return pcm
+    audible_samples: list[int] = sorted(abs(sample) for sample in samples if abs(sample) >= NORMALIZATION_MIN_PEAK)
+    if not audible_samples:
+        return pcm
+    percentile_index: int = math.ceil(len(audible_samples) * 0.95) - 1
+    reference_level: int = audible_samples[percentile_index]
+    if reference_level >= NORMALIZATION_TARGET_PEAK:
+        return pcm
+    gain: float = min(NORMALIZATION_TARGET_PEAK / reference_level, NORMALIZATION_MAX_GAIN)
+    adjusted: list[int] = [_soft_limit(sample * gain) for sample in samples]
+    return struct.pack(f'<{len(adjusted)}h', *adjusted)
+
+
+def _soft_limit(value: float) -> int:
+    """目標ピークを超える突発音だけを滑らかに圧縮する。"""
+    magnitude: float = abs(value)
+    if magnitude <= NORMALIZATION_TARGET_PEAK:
+        return round(value)
+    headroom: int = MAX_SAMPLE_VALUE - NORMALIZATION_TARGET_PEAK
+    compressed: float = NORMALIZATION_TARGET_PEAK + headroom * (1 - math.exp(-(magnitude - NORMALIZATION_TARGET_PEAK) / headroom))
+    limited: int = min(MAX_SAMPLE_VALUE, round(compressed))
+    return limited if value >= 0 else max(MIN_SAMPLE_VALUE, -limited)
+
+
 def write_wav(path: Path, pcm: bytes, audio_format: CaptureFormat) -> None:
     """基準PCMをmono WAVとして保存する。"""
     if audio_format != CaptureFormat(TARGET_RATE):
@@ -112,7 +148,7 @@ def write_wav(path: Path, pcm: bytes, audio_format: CaptureFormat) -> None:
 def save_baseline_clip(output_path: Path, pcm: bytes, capture_format: CaptureFormat) -> None:
     """キャプチャPCMを基準形式へ揃えて保存する。"""
     baseline_pcm: bytes = downsample_48k_to_24k(pcm) if capture_format.sample_rate == FALLBACK_RATE else pcm
-    write_wav(output_path, baseline_pcm, CaptureFormat(TARGET_RATE))
+    write_wav(output_path, boost_quiet_pcm(baseline_pcm), CaptureFormat(TARGET_RATE))
 
 
 def select_capture_format(device: int | str | None = None) -> CaptureFormat:
