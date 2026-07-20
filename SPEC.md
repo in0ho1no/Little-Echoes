@@ -858,6 +858,8 @@ Workflowsの`step.do()`は既定で複数回試行されるため、既定値を
   "post_roll_truncated": false,
   "duration_seconds": 15,
   "audio_object_key": "recordings/rec_xxx.wav",
+  "audio_sha256": "opaque-content-hash-for-idempotency",
+  "upload_status": "ready",
   "analysis_status": "ready",
   "active_attempt_id": null,
   "review_status": "pending",
@@ -871,6 +873,8 @@ Workflowsの`step.do()`は既定で複数回試行されるため、既定値を
 ```
 
 `client_capture_id`はクライアントがクリップ確定時に生成し、`household_id + source_id + client_capture_id`を一意にする。同じスプールデータを再送しても録音を重複作成しない。
+
+アップロード時はD1で同じ一意キーと不透明なR2キーを`reserved`として先に予約し、同じSHA-256のWAVだけを受理する。キーの再利用でハッシュが異なる場合は`IDEMPOTENCY_CONFLICT`とし、上書きしない。R2保存が成功してから`upload_status = ready`にし、失敗時は予約行を`failed`として有限回の後始末対象にする。`upload_status`が`ready`以外の録音は通常の取得・解析対象にしない。
 
 録音日時は次の規則を守る。
 
@@ -1259,7 +1263,7 @@ DELETE /api/v1/recordings/{recording_id}
 - D1とR2を原子的に削除できるとはみなさない
 - 削除Workflowの失敗時は`delete_failed`として記録し、合計3回までだけ再試行する
 - 削除完了前に同じデータを再表示しない
-- 完了後は`recording_id`、`household_id`、`deleted`状態、`deleted_at`だけの最小トゥームストーンを残し、音声キー、文字起こし、メモ、単語、日記、画像を削除する
+- 完了後は`recording_tombstones`に`recording_id`、`household_id`、`deleted`状態、`deleted_at`だけを残す。元の`Recording`行と音声キー、文字起こし、メモ、単語、日記、画像を削除する
 
 ### 絵日記一覧
 
@@ -1569,6 +1573,8 @@ little-echoes/
 - テスト用サンプル
 
 PythonとTypeScript間で型を完全共有できない場合も、JSON SchemaまたはOpenAPIを正とする。
+
+Phase 1の実装で必要なD1制約、R2キー形式、ジョブ・認可・エラー表現、契約テストの具体化は[main/docs/phase1-contracts.md](main/docs/phase1-contracts.md)に置く。同書は本書の要件を弱めず、矛盾がある場合は本書を優先する。
 
 ---
 

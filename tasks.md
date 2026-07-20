@@ -32,7 +32,7 @@ For Python changes, use the existing Python Quality/Review agents and the projec
 | Phase | Status | Completion evidence / entry gate |
 | --- | --- | --- |
 | 0 — Baseline | Complete (submission artifact pending) | README added and reviewed; commit `61a122b`; preserve `/feedback` Session ID before submission |
-| 1 — Contracts, security, data design | Not started | First align the Python source/test layout with `main/` or explicitly approve an alternative configuration |
+| 1 — Contracts, security, data design | In progress | `main/docs/phase1-contracts.md` documents threat/data flow, D1/R2/job/auth/error/test contracts. Python source/test layout approval remains required before executable contract tests. |
 | 1A — PC audio spike | Not started | Run in parallel with Phase 1 after its source layout is ready |
 | 2 — Fixed-data vertical slice | Not started | Start with Workflows; use the narrowly defined fallback only under the conditions in `SPEC.md`. Custom domain and Cloudflare zone setup are user prerequisites |
 | 3 — Approval, timestamps, dictionary | Not started | Phase 2 vertical slice validated |
@@ -68,6 +68,16 @@ For Python changes, use the existing Python Quality/Review agents and the projec
 ### Phase 1 entry gate
 
 `pyproject.toml` and the Python quality configuration currently target `src/`, while the repository scaffold is `main/src/`. Choose and approve one source layout before changing configuration or adding Python product code. The recommended direction is to keep product code under `main/` as specified in `SPEC.md`, then update all test/type/lint paths together in one reviewed change.
+
+### 2026-07-20 progress
+
+- [x] Threat model and data-flow artifact: `main/docs/phase1-contracts.md`.
+- [x] D1, R2, authorization, Workflow, idempotency, locking, finite-cost, OpenAI-data, error, and contract-test representations are documented there without changing product requirements.
+- [x] Shared machine-readable API contract: `main/packages/shared/api/openapi.json` (validated as JSON; 13 paths).
+- [x] Sol review completed; corrected tenant composite FKs, global/lifetime quota representation, upload idempotency, device response minimization, audit fields, automatic deletion, and multipart exception.
+- [ ] Create executable contract tests from the shared OpenAPI source after the source/test layout gate is approved.
+- [ ] Run the Python quality suite after Python sources/tests exist at the approved target path.
+- [ ] Fable5 review remains pending because it is not available in this environment.
 
 ## Phase 1A — PC audio spike
 
