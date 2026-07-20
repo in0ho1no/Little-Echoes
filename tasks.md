@@ -1,239 +1,174 @@
-# Little Echoes — tasks.md
+# Little Echoes — 実行計画
 
-## Purpose and document boundary
+## 文書の役割
 
-This document is the executable project plan for Little Echoes. It records phase work, validation, review loops, submission preparation, and implementation gates. Product requirements, architecture, API contracts, security requirements, and acceptance criteria belong in [SPEC.md](SPEC.md).
+本書はPhaseごとの作業、進捗、検証、レビュー、提出準備を定める実行計画である。プロダクト要件、アーキテクチャ、API・データ契約、セキュリティ要件、受入条件は [SPEC.md](SPEC.md) を正とする。仕様・安全性・コスト・プライバシーを変える場合は、実装前に `SPEC.md` を更新する。
 
-When a request changes product behavior or a security, cost, or privacy rule, update `SPEC.md` before implementation. When it changes execution order, progress, validation, or review work, update this document.
+## Phase 実行ルール
 
-## Phase command contract
+`Phase Nを実施してください` の指示を受けたら、次の順で進める。
 
-The command `Phase Nを実施してください` starts the named phase using this workflow:
+1. `AGENTS.md`、`SPEC.md`、本書、対象Phaseの入口条件を確認する。
+2. 未決の製品判断、依存追加、設定変更、外部認証情報だけを確認する。
+3. 小さくレビュー可能な単位で実装し、必要最小限の自動検証を行う。
+4. Terra実装、Sol独立レビュー、利用可能な場合のFable5レビューを行い、採用した修正後に再検証する。
+5. 実施結果と残る入口条件を本書へ記録する。Fable5が使えない場合は未実施として明記し、完了とは扱わない。
 
-1. Read `AGENTS.md`, `SPEC.md`, this document, and the target phase's gates.
-2. Check prerequisites and required user approvals. Ask only when a missing decision, new dependency, configuration change, or external credential would materially change the work.
-3. Publish a short implementation plan, then complete the phase in small, reviewable changes.
-4. Run relevant automated checks and preserve their results.
-5. Run the Agentic review loop. Fix findings, then rerun affected checks.
-6. Update this document with completion evidence and remaining gates. Update `SPEC.md` first if implementation revealed a specification change.
+Python変更時は既存のPython Quality/Reviewエージェントを、横断的な設計変更時は `ag-little-echoes-architecture-review` を使う。
 
-## Agentic review loop
+## Phase の状態
 
-Use this loop by default unless the user asks for a different process.
-
-1. **Terra implementation** — implement the phase and run the smallest relevant automated tests.
-2. **Sol independent review** — review the changed files against `SPEC.md`, security, bounded cost, user experience, and test coverage. Fix accepted findings, then rerun affected tests.
-3. **Fable5 independent review** — run it when Fable5 is available in the active environment. Fix accepted findings and rerun affected tests. If it is unavailable, record the review as pending; never describe it as completed.
-
-For Python changes, use the existing Python Quality/Review agents and the project quality commands in `AGENTS.md`. For cross-component security and architecture reviews, use `ag-little-echoes-architecture-review`.
-
-## Phase status
-
-| Phase | Status | Completion evidence / entry gate |
+| Phase | 状態 | 根拠・入口条件 |
 | --- | --- | --- |
-| 0 — Baseline | Complete (submission artifact pending) | README added and reviewed; commit `61a122b`; preserve `/feedback` Session ID before submission |
-| 1 — Contracts, security, data design | In progress | `main/docs/phase1-contracts.md` documents threat/data flow, D1/R2/job/auth/error/test contracts. Python source/test layout approval remains required before executable contract tests. |
-| 1A — PC audio spike | Not started | Run in parallel with Phase 1 after its source layout is ready |
-| 2 — Fixed-data vertical slice | Not started | Start with Workflows; use the narrowly defined fallback only under the conditions in `SPEC.md`. Custom domain and Cloudflare zone setup are user prerequisites |
-| 3 — Approval, timestamps, dictionary | Not started | Phase 2 vertical slice validated |
-| 4 — PC reference client | Not started | Phase 1A findings reflected in `SPEC.md` |
-| 5 — OpenAI analysis | Not started | Mock vertical slice and cost controls validated |
-| 6 — Diary and images | Not started | Approval flow validated |
-| 7 — Security and submission hardening | Not started | Core flows complete |
-| 8 — Atom VoiceS3R | Optional | PC, backend, and web flows stable |
+| 0 — ベースライン | 完了（提出用Session IDは未取得） | README、参照境界、基準コミットを整備。`61a122b` |
+| 1 — 契約・安全性・データ設計 | 進行中 | 契約文書・OpenAPIを作成済み。実行可能な契約テストを残す |
+| 1A — PC音声スパイク | 未着手 | Phase 1と並行。PCクライアント配置は確定済み |
+| 2 — 固定データ縦断スライス | 未着手 | Cloudflareのカスタムドメインとゾーン設定が必要 |
+| 3 — 承認・日時・辞典 | 未着手 | Phase 2の縦断スライス確認後 |
+| 4 — PC参照クライアント | 未着手 | Phase 1Aの知見を仕様へ反映後 |
+| 5 — OpenAI解析 | 未着手 | モック縦断スライスとコスト制御の確認後 |
+| 6 — 日記・画像 | 未着手 | 承認フロー確認後 |
+| 7 — セキュリティ・提出強化 | 未着手 | 中核フロー完了後 |
+| 8 — Atom VoiceS3R | 任意 | PC・バックエンド・Webが安定後 |
 
-## Phase 0 — Baseline
+## Phase 0 — ベースライン
 
-- [x] Confirm the public-repository policy.
-- [x] Record the reference boundary and baseline commit in README.
-- [x] State that `reference/` is not a runtime dependency.
-- [x] State Pre-existing, Build Week, and optional scope in README.
-- [x] Start the Codex work session.
-- [ ] Preserve the required `/feedback` Session ID for submission.
+- [x] 公開リポジトリ方針、参照実装境界、Build Weekの範囲をREADMEへ記録。
+- [x] `reference/`を実行時依存にしない方針を記録。
+- [ ] 提出に必要な `/feedback` Session IDを保存。
 
-## Phase 1 — Contracts, security, and data design
+## Phase 1 — 契約・安全性・データ設計
 
-1. Create the threat model and data-flow artifact.
-2. Synchronize state-transition tables/diagram with API schemas.
-3. Define Recording, Transcript, WordCandidate, WordOccurrence, DiaryEntry, DiaryImage, DictionaryWord, ProcessingAttempt, AsyncJob, and UsageCounter.
-4. Define OpenAPI or JSON Schema and common error schema.
-5. Define D1 schema, uniqueness constraints, foreign keys, and transaction boundaries.
-6. Define private R2 key layout plus retention/deletion policy.
-7. Define management/device routes, Access JWT validation, and device-token authorization.
-8. Define Workflow job identity, state, explicit retry settings, and D1 consistency rules.
-9. Define idempotency, optimistic locking, per-item/daily cost caps, expiry, and emergency stop behavior.
-10. Define `store: false`, no OpenAI background mode, and disclosure requirements.
-11. Add sample JSON and API-contract tests.
+1. 脅威モデルとデータフローを作成する。
+2. 状態遷移表・図とAPIスキーマを同期する。
+3. Recording、Transcript、WordCandidate、WordOccurrence、DiaryEntry、DiaryImage、DictionaryWord、ProcessingAttempt、AsyncJob、UsageCounterを定義する。
+4. OpenAPIまたはJSON Schemaと共通エラー形式を定義する。
+5. D1スキーマ、ユニーク制約、外部キー、トランザクション境界を定義する。
+6. 非公開R2キー形式、保持・削除を定義する。
+7. 管理/デバイス経路、Access JWT検証、デバイストークン認可を定義する。
+8. WorkflowのID・状態・有限再試行・D1整合性を定義する。
+9. 冪等性、楽観ロック、録音別/日別上限、期限、緊急停止を定義する。
+10. `store: false`、OpenAI background mode不使用、開示事項を定義する。
+11. サンプルJSONと契約テストを追加する。
 
-### Phase 1 entry gate
+### Phase 1 の進捗（2026-07-20）
 
-`pyproject.toml` and the Python quality configuration currently target `src/`, while the repository scaffold is `main/src/`. Choose and approve one source layout before changing configuration or adding Python product code. The recommended direction is to keep product code under `main/` as specified in `SPEC.md`, then update all test/type/lint paths together in one reviewed change.
+- [x] 脅威モデル、データフロー、D1/R2、認可、Workflow、冪等性、上限、エラー、テスト観点を [phase1-contracts.md](main/docs/phase1-contracts.md) に記録。
+- [x] 13経路の機械可読な共有API契約を [openapi.json](main/packages/shared/api/openapi.json) に追加し、JSON構造を検証。
+- [x] Solレビューで見つかった世帯分離、全体/生涯上限、アップロード冪等性、最小トゥームストーン、デバイス応答範囲を修正。High指摘なし。
+- [x] Python配置を `main/apps/pc-client/src/` とし、品質設定を同じ配置へ更新。
+- [ ] OpenAPIを入力にした実行可能な契約テストを追加。
+- [ ] Fable5レビュー（この環境では利用不可のため保留）。
 
-### 2026-07-20 progress
+## Phase 1A — PC音声スパイク
 
-- [x] Threat model and data-flow artifact: `main/docs/phase1-contracts.md`.
-- [x] D1, R2, authorization, Workflow, idempotency, locking, finite-cost, OpenAI-data, error, and contract-test representations are documented there without changing product requirements.
-- [x] Shared machine-readable API contract: `main/packages/shared/api/openapi.json` (validated as JSON; 13 paths).
-- [x] Sol review completed; corrected tenant composite FKs, global/lifetime quota representation, upload idempotency, device response minimization, audit fields, automatic deletion, and multipart exception.
-- [ ] Create executable contract tests from the shared OpenAPI source after the source/test layout gate is approved.
-- [ ] Run the Python quality suite after Python sources/tests exist at the approved target path.
-- [ ] Fable5 review remains pending because it is not available in this environment.
+クラウド非接続の単体スクリプトとして半日で区切る。`sounddevice` 0.5.5は承認・lock済み。
 
-## Phase 1A — PC audio spike
+1. 入力デバイスを列挙する。
+2. 24 kHz入力と48 kHzフォールバックを確認する。
+3. `RawInputStream` の `bytes` で10秒の上書きリングバッファを実装する。
+4. 1.5秒長押し、5秒後録り、24 kHz/16-bit/mono WAV保存を実装する。
+5. GUI/コールバック/ワーカー分離、切断検出、1回だけの自動再接続を確認する。
 
-Timebox this cloud-disconnected script to half a day. `sounddevice` 0.5.5 is already approved and locked.
+完了条件: コールバックでブロッキングI/Oをしないこと、前の音声を含むWAVを繰り返し作れること、デモPCで24 kHz直接または48 kHzフォールバックが動くこと、知見を製品統合前に `SPEC.md` へ反映すること。
 
-1. Enumerate input devices.
-2. Check 24 kHz input and the 48 kHz fallback.
-3. Obtain `bytes` blocks from `RawInputStream` and implement a 10-second overwrite ring buffer.
-4. Implement the 1.5-second hold rule, five-second post-roll, and 24 kHz/16-bit/mono WAV save.
-5. Verify GUI/callback/worker separation plus disconnect detection and one automatic reopen attempt.
+## Phase 2 — 固定データ縦断スライス
 
-Completion criteria: no blocking callback I/O; repeatable WAV includes preceding audio; either direct 24 kHz or 48 kHz fallback works on the demo PC; spike findings are recorded in `SPEC.md` before product integration.
+1. Worker、Workflows、D1、R2を作成し、Wranglerの`compatibility_date`を固定する。
+2. 管理/デバイスホストを分離し、認可とAccess JWTの署名・`iss`・`aud`・`exp`検証を実装する。
+3. 固定WAVをR2/D1へ保存する。
+4. モックWorkflowを`202 Accepted`と状態ポーリングで動かし、モック文字起こし・単語候補を追加する。
+5. 認可済み状態取得、音声再生、確認キュー/詳細、状態・エラー表示を追加する。
+6. `client_capture_id`と`AsyncJob.id`を重複排除する。
 
-## Phase 2 — Fixed-data vertical slice
+このPhaseでOpenAI APIは呼ばない。先に認証、状態、UI、データ境界を決定的にテストする。Workflowsを第一選択とし、半日超の統合障害時だけ `SPEC.md` の縮退経路を、事前更新と復旧制限の記録を伴って検討する。
 
-1. Create Worker, Workflows, D1, and R2 projects; pin a compatible Wrangler `compatibility_date`.
-2. Separate management and device hosts, implement authorization, and validate Access JWT signature, `iss`, `aud`, and `exp`.
-3. Upload fixed WAV input and store it in R2/D1.
-4. Accept a mock Workflow with `202 Accepted`, poll state, and add mock transcription/word candidates.
-5. Add authorized state lookup, audio playback, review queue/detail screens, and explicit state/error display.
-6. Deduplicate both `client_capture_id` and `AsyncJob.id`.
+## Phase 3 — 承認・日時・辞典
 
-Do not call OpenAI during this phase. Deterministically test authentication, state, UI, and data boundaries first.
+下書き・日時編集の監査、承認トランザクション、WordOccurrenceと初出/`NEW`再計算、辞典・発話履歴、重複/競合/過去日時承認テストを実装する。
 
-### Phase 2 architecture gate
+## Phase 4 — PC参照クライアント
 
-Start with Cloudflare Workflows. If its integration takes more than the timebox defined in `SPEC.md`, the documented `ctx.waitUntil()` plus `AsyncJob` fallback may be considered only after the required `SPEC.md` update and explicit recording of the recovery limitations. Do not silently select a fallback.
+Phase 1Aの録音機能を製品化し、`tkinter` GUI、状態/長押し表示、ローカルスプール、自動アップロード、有限再試行、復旧操作、固定音声送信を追加する。
 
-## Phase 3 — Approval, timestamps, and word dictionary
+## Phase 5 — OpenAI解析
 
-1. Save review drafts and edit timestamps with audit events.
-2. Edit transcription/candidates and implement the approval transaction.
-3. Create WordOccurrence records and recompute first-record and `NEW` values.
-4. Implement dictionary and utterance history.
-5. Test duplicate approval, concurrent approval, and late approval of older recordings.
+文字起こしと構造化単語抽出を実装する。ユーザーデータを命令から分離し、JSON Schema検証、`store: false`、SDK再試行無効化、background mode不使用、有限Workflow再試行、`partial`、試行/上限記録を確認する。実APIは固定サンプルだけで検証する。
 
-## Phase 4 — PC reference-client integration
+## Phase 6 — 日記・画像
 
-1. Productize the Phase 1A recorder and add the `tkinter` GUI, state/hold progress, and local spool.
-2. Add automatic upload, process start, bounded retry, recovery controls, and sample-audio sending.
-3. Repeat fixed-sample tests.
+承認済みデータから日記を非同期生成し、手動編集と明示的画像生成を追加する。有効画像は1枚だけとし、置換確認、失敗時保持、録音別/日別上限を実装する。
 
-## Phase 5 — OpenAI analysis
+## Phase 7 — セキュリティ・提出強化
 
-1. Integrate transcription and structured word extraction.
-2. Keep user data separate from instructions and validate JSON Schema.
-3. Enforce `store: false`, disable OpenAI SDK retries, and do not use background mode.
-4. Configure Workflow retries/terminal errors and `partial` fallback.
-5. Record AsyncJob/ProcessingAttempt data and enforce all cost caps.
-6. Verify the real API with fixed samples only after the mock vertical slice is secure and deterministic.
+認証・認可・IDOR・CSRF・XSS・入力上限・ホスト分離・Access JWT、コスト上限・有限再試行・期限・`DEMO_WRITE_ENABLED`を確認する。固定サンプル、復旧手順、`reference/`なしのデモ、審査手順、読み取り専用デモ、動画を準備する。README、Project Story、Testing instructionsにはOpenAIのデータ取り扱いを英語で記載する。
 
-## Phase 6 — Diary and images
+## Phase 8 — Atom VoiceS3R（任意）
 
-1. Generate diary text from approved data through a Workflow with `202 Accepted` plus polling.
-2. Provide manual diary editing and explicit image generation.
-3. Keep one active image, require replacement confirmation, and preserve it on failure.
-4. Enforce lifetime and daily image limits.
+PC/バックエンド/Webが安定した後に開始する。音声メモリ、専用リングバッファ、Wi-Fi、HTTPS、固定音声、長押し、Unit HEX表示、共通API接続、実機デモを確認する。
 
-## Phase 7 — Security and submission hardening
+## 自動検証計画
 
-1. Check authentication, authorization, IDOR, CSRF, XSS, input limits, host routing, and Access JWT validation.
-2. Check cost caps, bounded retries, expiry, and `DEMO_WRITE_ENABLED`.
-3. Prepare fixed samples, automated core-flow tests, retention/deletion, recovery instructions, and a `reference/`-free demo.
-4. Prepare judge instructions, demo-data initialization, protected/read-only demo environment, and video.
-5. Add the required English OpenAI data-handling disclosure to README, Project Story, and Testing instructions.
-
-## Phase 8 — Atom VoiceS3R (optional)
-
-Begin only after PC, Cloudflare, and web flows are stable. Check audio memory; prototype the dedicated ring buffer; add Wi-Fi, HTTPS upload, fixed-audio upload, and hold action; display Unit HEX states; connect to the same API; verify a hardware demo.
-
-## Automated verification plan
-
-Run the smallest applicable subset after each change; run the complete relevant suite at each phase boundary. Python commands, once the source layout is aligned, are:
+変更ごとに最小範囲を、Phase境界で該当スイート全体を実行する。Pythonの対象はPCクライアント配置に統一する。
 
 ```powershell
-uv run ruff check <target>
-uv run ruff format --check <target>
-uv run mypy <target>
-uv run pyright <target>
+uv run ruff check main/apps/pc-client/src/
+uv run ruff format --check main/apps/pc-client/src/
+uv run mypy main/apps/pc-client/src/
+uv run pyright main/apps/pc-client/src/
 uv run pytest
 ```
 
-### Unit coverage
+- 単体: リングバッファ、同時スナップショット、前後録り、長押し、48→24 kHz、WAV、スプール、状態、冪等性、ロック、日時、辞典、削除、上限、期限。
+- 結合: 固定WAV→`202`→Workflowポーリング→モック解析、世帯/デバイス分離、非公開R2再生、承認→日記→画像、非同期削除。
+- 安全性/再現性: 不正JWT・失効トークン・IDOR・CSRF・CORS・不正WAV/JSON・プロンプト注入・XSS・ログ漏えいを拒否。固定3音声（明瞭な単語、短文、不明瞭な発話）を使う。
 
-- Ring-buffer boundaries, concurrent snapshots, pre/post-roll, hold gesture, 48-to-24 kHz conversion, WAV validation, and spool retention.
-- API validation, legal/illegal state transitions, idempotency, locking, timestamp rules, dictionary first-record recomputation, and deletion.
-- Workflow job deduplication, explicit retry limits, terminal errors, `UPSTREAM_RESULT_UNKNOWN`, stale-job reconciliation, and no sensitive Workflow payload/state.
-- Cost caps, expiry/kill switch, `store: false`, and no implicit SDK retry.
+## デモ・提出
 
-### Integration coverage
+提出期限は **2026-07-21 17:00 PDT（2026-07-22 09:00 JST）**。カテゴリは **Apps for Your Life**。提出直前にDevpostの最新要件を再確認する。動画は公開YouTubeで3分未満、音声ナレーション付きとする。日本語会話を使う場合は英語字幕と英語（または英語TTS）のナレーションを付ける。開発者本人または合成データだけを使い、PCリングバッファ→録音→保存/非同期処理→スマートフォン確認→承認→日記/画像→辞典を示す。Atomは実装・検証できた場合だけ追加する。
 
-- Fixed WAV upload through `202 Accepted`, Workflow polling, and mock analysis.
-- Device ownership, cross-household denial, authorized private-R2 playback, and management/device host separation.
-- Approval through diary Workflow, image replacement behavior, concurrent image requests, and asynchronous deletion.
-- Real transcription only after Phase 5 preconditions are met.
+公開前には、英語のProject Story、公開動画、Codex/GPT-5.6の利用説明、ソースへのアクセス、固定サンプル、審査手順、秘密情報がないこと、Accessを名指しアドレスだけにすること、英語のTesting instructions、`DEMO_WRITE_ENABLED`と2026-09-01までの失効、OpenAIデータ開示3箇所、`reference/`なしの再現、公開/非公開共有方針、OSSライセンス、`/feedback` Session IDを確認する。
 
-### Security and reproducibility coverage
+### 提出前チェックリスト
 
-- Reject invalid/expired device tokens, incorrect Access JWTs, IDOR, CSRF, unwanted CORS, invalid WAV/JSON, prompt injection, and XSS.
-- Verify logs/responses/Workflow state do not expose tokens, audio, transcripts, notes, or R2 keys.
-- Use three fixed samples: clear word, short sentence, and unclear speech.
-- Verify normal/partial flows reach human editing and failures show a recovery action.
+- [ ] 公開リポジトリと公開READMEのどこにもトークン・秘密情報がない。
+- [ ] Cloudflare Accessは完全一致の名指しアドレスだけを許可し、ドメイン単位の許可をしない。この事実をTesting instructionsへ英語で書く。
+- [ ] 審査用Testing instructionsに、許可済みアドレス、ワンタイムPIN手順、デバイストークン入力方法と有効期限、別アドレスの場合の連絡先を英語で書く。
+- [ ] デモ書込み期限（遅くとも2026-09-01 00:00 JST）と`DEMO_WRITE_ENABLED`キルスイッチが動く。
+- [ ] 機能別の送信データ、既定の学習非利用、最大30日の不正利用監視保持可能性、`store: false`の範囲、実在児童データを使わないことを、README・Project Story・Testing instructionsの英語3箇所へ書く。
+- [ ] `reference/`なしでビルド、テスト、デモを再現できる。公開、または非公開で`testing@devpost.com`と`build-week-event@openai.com`へ共有する方針を実行する。
 
-## Demo and submission tasks
+### 詳細な検証観点
 
-**Submission deadline: 2026-07-21 17:00 PDT (2026-07-22 09:00 JST). Reconfirm on Devpost before final submission.** Category: Apps for Your Life. The demo video must be a public YouTube video under 3 minutes with spoken narration; Japanese dialogue is acceptable with English subtitles and English (or English TTS) narration.
+- Workflowのジョブ重複排除、明示的再試行上限、終端エラー、`UPSTREAM_RESULT_UNKNOWN`、古いジョブの収束、Workflow状態に機密データを置かないことを検証する。
+- OpenAI SDKの暗黙再試行を無効にし、上限・失効・キルスイッチ・`store: false`を検証する。
+- 承認から日記Workflow、画像置換、並行画像要求、非同期削除を結合テストする。
+- 正常、`partial`、`failed`の各経路で、人が編集・手動入力・有限再試行などの回復操作へ到達できることを確認する。
+- 不正/失効デバイストークン、誤ったAccess JWT、IDOR、CSRF、不要なCORS、不正WAV/JSON、プロンプト注入、XSSを拒否し、ログ・応答・Workflow状態へトークン、音声、文字起こし、メモ、R2キーを出さないことを確認する。
 
-Use only the developer's voice and synthetic/sample data. Show the PC ring buffer, record a sample phrase, show saving/upload/asynchronous processing, review it on mobile, approve with a scene, explicitly generate a diary/image, and show the dictionary. Add Atom only if actually complete and verified.
+## スキルとカスタムエージェント
 
-Before submission, recheck current Devpost requirements and prepare the English Project Story, public video, Codex/GPT-5.6 explanation, source access, OSS license, samples, judge instructions, and `/feedback` Session ID. Keep tokens out of public material. Include named-address Access instructions, token expiry, route separation, and the OpenAI data-handling disclosure required by `SPEC.md`.
+- `little-echoes-phase`: Phase実行、仕様/計画同期、レビュー手順。
+- `sk-python-quality`: Pythonの静的解析。
+- `ag-little-echoes-architecture-review`: セキュリティ、有限コスト、UX、状態、非同期の横断レビュー。
 
-### Pre-publication checklist
+反復的・壊れやすい作業が生じた場合のみ、ユーザー承認の範囲でスキルまたはカスタムエージェントを追加し、発火条件・検証方法を本書へ記録する。
 
-- [ ] No tokens or secrets anywhere in the public repository or public README.
-- [ ] Cloudflare Access allows only the named addresses (no domain-wide rules); state this in Testing instructions and do not claim otherwise.
-- [ ] Judge Testing instructions cover: allowed addresses, one-time PIN steps, device-token entry method and expiry, and a contact for other addresses (all in English).
-- [ ] Demo write expiry (2026-09-01 00:00 JST at the latest) and `DEMO_WRITE_ENABLED` kill switch verified working.
-- [ ] The OpenAI data-handling disclosure (data sent per feature, no training by default, up-to-30-day abuse-monitoring retention, `store: false` scope, no real children's data) appears in all three artifacts: README, Project Story, and Testing instructions, in English.
-- [ ] `reference/`-free build, test, and demo verified; repository visibility decision executed (public, or private shared with `testing@devpost.com` and `build-week-event@openai.com`).
+### 追加判断の目安
 
-## Skills and custom agents
-
-### Available project tools
-
-- `little-echoes-phase`: project-local phase runner for Phase execution, `SPEC.md`/`tasks.md` synchronization, and the Agentic review loop.
-- `ag-little-echoes-architecture-review`: read-only cross-component reviewer for requirements, security, bounded cost, user experience, and test gaps.
-- Existing Python Quality/Review agents and `sk-python-quality`: use for Python implementation and static analysis.
-
-Claude Code mirrors (deployed 2026-07-20): the phase runner is available as the `little-echoes-phase` skill at `.claude/skills/little-echoes-phase/SKILL.md`, and the reviewer as the `Little Echoes Architecture Review` agent at `.claude/agents/ag-little-echoes-architecture-review.agent.md`. The Codex-only `agents/openai.yaml` interface file has no Claude equivalent. When the source under `.agents/` or `.github/agents/` changes, update the `.claude/` mirror in the same commit.
-
-### When to add more
-
-Create a skill only for a repeated or fragile workflow. Create a custom agent only for a clearly distinct role.
-
-| Trigger | Candidate | Do not create before |
+| 発火条件 | 候補 | 作成してよい段階 |
 | --- | --- | --- |
-| Repeated Cloudflare deployment/configuration | Cloudflare deployment skill | Phase 2 has a real Wrangler configuration and approved deployment workflow |
-| Repeated browser E2E checks | Browser E2E agent/skill | a stable web UI and reproducible test data exist |
-| Atom hardware debugging becomes active | Atom hardware review agent | Phase 8 starts and device-specific failures recur |
+| Cloudflareデプロイ/設定を繰り返す | Cloudflareデプロイスキル | Phase 2で実際のWrangler設定と承認済みデプロイ手順ができてから |
+| ブラウザE2E確認を繰り返す | ブラウザE2Eエージェント/スキル | 安定したWeb UIと再現可能なテストデータができてから |
+| Atom実機デバッグが反復する | Atomハードウェアレビューエージェント | Phase 8開始後に機器固有の失敗が繰り返されてから |
 
-New skills belong in `.agents/skills`, must use the skill-creator workflow, and must be validated. New custom agents belong in `.github/agents`, must have a narrow role, and must not duplicate an existing agent. Tools intended for Claude Code are mirrored under `.claude/skills` and `.claude/agents` in Claude Code format. Record the trigger, owner, and validation command here when a tool is introduced.
+新スキルは`.agents/skills`へ置き、skill-creator手順で作成・検証する。新カスタムエージェントは`.github/agents`へ置き、役割を狭くして既存エージェントと重複させない。Claude Code用に提供するものは`.claude/skills`と`.claude/agents`へ対応形式でミラーし、`.agents/`または`.github/agents/`の更新と同じコミットで同期する。
 
-## Working rules
+## 作業規則と未決事項
 
-- Present a short plan before a major implementation.
-- Keep changes small and commit by coherent feature.
-- Do not weaken security, privacy, cost, or user-experience requirements for schedule reasons.
-- Use proven libraries for external formats; obtain approval before adding a dependency.
-- Never import, include, or access `reference/` at runtime.
-- Keep the `/feedback` Session ID and record major implementation sessions for submission.
-
-## Open implementation decisions
-
-- Choose the final Python source/test layout before Phase 1 configuration work.
-- Select `tkinter` and direct-24-kHz versus 48-kHz fallback after the Phase 1A spike.
-- Finalize the D1 schema during Phase 1.
-- Define public-demo data initialization during Phase 7.
-- Decide Atom PSRAM placement only if Phase 8 begins.
-- Choose an OSS license before submission; this is a legal/product decision and must not be assumed by an agent.
+- 大きな実装の前に短い計画を示し、変更は小さく機能単位でコミットする。
+- 予定を理由に安全性、プライバシー、コスト、UX要件を弱めない。外部形式は実績あるライブラリを優先し、依存追加には承認を得る。
+- `reference/`を実行時に読み込み、同梱、参照しない。提出用の`/feedback` Session IDと主要実装セッションを保存する。
+- Python製品コードとテストは`main/apps/pc-client/src/`へ置く。旧`main/src/`はベースラインの空スキャフォールドであり、新規コードを置かない。
+- `tkinter`、24 kHz直接取得と48 kHzフォールバックの最終選択はPhase 1A後に行う。公開デモの初期データはPhase 7で定義する。Atom PSRAM配置はPhase 8開始時だけ判断する。
+- OSSライセンスは法務・製品判断であり、エージェントが仮定しない。提出前にユーザーが決定する。

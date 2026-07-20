@@ -1,46 +1,39 @@
-# Phase 1 implementation contracts
+# Phase 1 実装契約
 
-`SPEC.md` is the normative source for product behaviour. This document fixes the
-storage, route, and test-level representations needed to implement that behaviour.
-It must not weaken `SPEC.md`; a conflict is resolved by updating `SPEC.md` first.
+製品の振る舞いは `SPEC.md` を正とする。本書は、その振る舞いを実装する際に必要な保存形式、経路、テスト水準の表現を具体化する。`SPEC.md` の要件を弱めてはならず、矛盾した場合は先に `SPEC.md` を更新する。
 
-## Threat model and data flow
+## 脅威モデルとデータフロー
 
-| Asset / boundary | Threat | Required control |
+| 資産・境界 | 脅威 | 必須の対策 |
 | --- | --- | --- |
-| PC / Atom to device API | Token theft, replay, oversized audio | TLS; bearer token is HMAC-verified in constant time and bound to one `household_id` and `source_id`; validate WAV before R2 write; `client_capture_id` idempotency |
-| Device API | Device reaches management data | Separate host and route allow-list; device scope is create/upload/process/read-own-status only |
-| Management host | Forged or expired Access assertion | Verify Access JWT signature from JWKS, `iss`, application `aud`, and `exp`; derive household server-side |
-| Worker to D1/R2/OpenAI | Cross-household read, leaked object key or key material | Authorization predicate in every query; private R2 only through authorized stream; secrets only in Worker bindings; logs never contain content, keys, or tokens |
-| Workflow persistence | Audio, transcript, note, or token retained in workflow state | Start and persist only `AsyncJob.id`; read all content transiently from D1/R2 after authorization |
-| Concurrent requests / retry | Duplicate charge, duplicate occurrence, stale overwrite | D1 unique constraints, `version` compare-and-swap, one active job per operation, and atomic quota reservation |
-| AI / model output | Prompt injection, unsafe output persistence | Treat all customer text as tagged data, use schema-validated allowed values only, and HTML-escape on output |
-| Demo operation | Unlimited spend or writes after review | D1 daily/lifetime caps, fixed retry limits, `DEMO_WRITE_ENABLED`, and deadline check before every write/AI reservation |
+| PC / AtomからデバイスAPI | トークン窃取、再送、大きすぎる音声 | TLS、一定時間比較のHMACトークン、`household_id`と`source_id`への束縛、R2書込み前のWAV検証、`client_capture_id`冪等性 |
+| デバイスAPI | デバイスが管理データへ到達 | ホスト/経路の許可表を分離。デバイス権限は作成、アップロード、解析開始、自身の状態取得だけ |
+| 管理ホスト | 偽造または失効したAccessアサーション | JWKSによるAccess JWT署名、`iss`、アプリケーション`aud`、`exp`の検証。世帯はサーバー側で導出 |
+| WorkerからD1/R2/OpenAI | 他世帯読取、オブジェクトキー/鍵素材の漏えい | 全クエリの認可条件、認可済みストリームだけの非公開R2、Worker bindingだけの秘密情報、内容/鍵/トークンを含まないログ |
+| Workflow永続状態 | 音声、文字起こし、メモ、トークンの保持 | `AsyncJob.id`だけを開始・永続化し、認可後にD1/R2から一時的に読む |
+| 同時要求/再試行 | 二重課金、二重発話、古い画面による上書き | D1ユニーク制約、`version`比較更新、操作ごとに1つの有効ジョブ、原子的な上限予約 |
+| AI/モデル出力 | プロンプト注入、安全でない出力保存 | 全顧客テキストをタグ付きデータとし、スキーマ検証済み許可値だけを使用し、出力時にHTMLエスケープ |
+| デモ運用 | 審査後の無制限利用/書込み | D1の日次/生涯上限、固定再試行上限、`DEMO_WRITE_ENABLED`、全書込み/AI予約前の期限確認 |
 
 ```mermaid
 flowchart LR
-    C[PC client or Atom] -->|device token + WAV| D[device host]
-    D -->|validated private object| R[(private R2)]
-    D -->|metadata, quota, AsyncJob| DB[(D1)]
-    M[management browser] -->|Access JWT| A[management host]
+    C[PCクライアントまたはAtom] -->|デバイストークン + WAV| D[デバイスホスト]
+    D -->|検証済みの非公開オブジェクト| R[(非公開R2)]
+    D -->|メタデータ・上限・AsyncJob| DB[(D1)]
+    M[管理ブラウザ] -->|Access JWT| A[管理ホスト]
     A --> DB
-    A -->|authorized stream only| R
-    D --> W[Workflow: AsyncJob.id only]
+    A -->|認可済みストリームだけ| R
+    D --> W[Workflow: AsyncJob.idだけ]
     A --> W
     W --> DB
-    W -->|minimum necessary data| O[OpenAI API]
+    W -->|必要最小限のデータ| O[OpenAI API]
 ```
 
-The route state exposed to clients is the state tables and Mermaid diagram in
-`SPEC.md` sections "処理フロー" and "API案". Every endpoint below returns the
-current resource state, so an unknown dispatch result can converge through polling
-instead of a blind resend.
+クライアントに公開する状態は、`SPEC.md` の「処理フロー」「API案」にある状態表とMermaid図を正とする。以下の各エンドポイントは現在のリソース状態を返すため、ディスパッチ結果が不明でも、盲目的な再送ではなくポーリングで収束できる。
 
-## D1 relational contract
+## D1のリレーショナル契約
 
-Timestamps are UTC ISO-8601 strings. IDs are opaque, server-generated strings;
-they never contain a name, transcript, email address, or R2 key. SQLite foreign
-keys must be enabled for every D1 connection before a transaction.
+時刻はUTCのISO 8601文字列で保存する。IDはサーバー発行の不透明な文字列とし、氏名、文字起こし、メールアドレス、R2キーを含めない。各D1接続ではトランザクション前にSQLiteの外部キーを有効化する。
 
 ```sql
 CREATE TABLE households (
@@ -189,114 +182,66 @@ CREATE TABLE recording_tombstones (
 );
 ```
 
-`counter_key` is `demo-global:{scope}` for the environment-wide quota,
-`household:{household_id}:{scope}` for a household quota, or
-`recording:{recording_id}:image` for the five-image lifetime quota. Reservation
-increments are conditional on their applicable cap in the same transaction.
-The D1 migration also creates the needed status/expiry indexes. It must not add a
-content-bearing `details` column to attempts, jobs, audit events, or logs.
+`counter_key`は、デモ環境全体の上限では`demo-global:{scope}`、世帯上限では`household:{household_id}:{scope}`、画像の生涯5回上限では`recording:{recording_id}:image`とする。予約カウントの加算は、同一トランザクション内で該当上限以下である場合だけ許可する。D1マイグレーションでは状態・期限用の必要なインデックスも作成する。試行、ジョブ、監査イベント、ログへ内容を含む`details`列を追加してはならない。
 
-## Atomic transaction boundaries
+## 原子的トランザクション境界
 
-| Operation | One D1 transaction must include |
+| 操作 | 1つのD1トランザクションに含める内容 |
 | --- | --- |
-| Upload create/deduplicate | reserve the unique capture key and deterministic opaque R2 key in D1 first; write only matching SHA-256 bytes; atomically mark `upload_status = ready`, or mark failed and enqueue bounded orphan cleanup |
-| Process/diary/image dispatch | optimistic version / active-job check; expiry and `DEMO_WRITE_ENABLED`; quota and attempt reservation; job create-or-return-existing; resource state update |
-| Before each OpenAI call | recheck expiry/kill switch and active attempt; create/update exactly one `ProcessingAttempt`; reserve counted usage; never call OpenAI if the transaction fails |
-| Review save/approve | `UPDATE ... WHERE id=? AND household_id=? AND version=?`; transcript/occurrences/dictionary aggregate recomputation/audit event/version increment together |
-| Image replacement | version check; quota/job reservation; only after R2 success atomically activate the new image and deactivate the former image |
-| Delete | immediately hide/invalidate active attempts; later delete workflow deletes all content-bearing child rows and the `Recording`, then inserts only `recording_tombstones(recording_id, household_id, review_status, deleted_at)` |
+| アップロード作成/重複排除 | 先にD1で一意の取得キーと決定的・不透明なR2キーを予約し、同じSHA-256のバイト列だけを書き込む。原子的に`upload_status = ready`にするか、失敗を記録して有限回の孤児後始末へ積む |
+| 解析/日記/画像のディスパッチ | 楽観バージョン/有効ジョブ、期限、`DEMO_WRITE_ENABLED`、上限/試行予約、ジョブ作成または既存返却、リソース状態更新 |
+| OpenAI呼出し直前 | 期限/キルスイッチ/有効試行を再確認し、`ProcessingAttempt`をちょうど1件作成または更新し、利用量を予約する。トランザクション失敗時はOpenAIを呼ばない |
+| 確認保存/承認 | `UPDATE ... WHERE id=? AND household_id=? AND version=?`、文字起こし/発話/辞典集計の再計算、監査イベント、バージョン加算をまとめる |
+| 画像置換 | バージョン確認、上限/ジョブ予約、R2成功後にだけ新画像を有効化し旧画像を無効化 |
+| 削除 | 直ちに非表示化し有効試行を無効化。削除Workflowは内容を持つ子行と`Recording`を削除し、`recording_tombstones(recording_id, household_id, review_status, deleted_at)`だけを挿入 |
 
-`DictionaryWord` first fields and every `WordOccurrence.is_first` are recomputed in
-the approval/date-edit transaction by `(spoken_at, recordings.created_at, recording_id)`.
-No client-supplied `is_first`, quota, status, household, or R2 key is trusted.
+`DictionaryWord`の初出項目と各`WordOccurrence.is_first`は、承認または日時編集のトランザクションで`(spoken_at, recordings.created_at, recording_id)`により再計算する。クライアントが送る`is_first`、上限、状態、世帯、R2キーは信用しない。
 
-## Object storage and retention
+## オブジェクト保存と保持
 
-Private R2 keys use opaque IDs only:
+非公開R2キーは不透明IDだけで構成する:
 
 ```text
 recordings/{recording_id}/audio.wav
 diary-images/{diary_entry_id}/{diary_image_id}.png
 ```
 
-R2 has no public binding, public bucket URL, or client-issued signed URL. A Worker
-authorizes each stream and does not disclose these keys. A successful new image is
-stored before it becomes active. Deleted/old objects are queued through a bounded
-delete job; an inaccessible object is never re-enabled.
+R2には公開バインディング、公開バケットURL、クライアント発行の署名URLを設けない。Workerはストリームごとに認可し、これらのキーを開示しない。新しい画像は有効化前に保存する。削除済み・旧オブジェクトは有限回の削除ジョブへ積み、アクセス不能なものを再有効化しない。
 
-Each live record has a server-set `retention_delete_after = created_at + 30 days`.
-A scheduled Worker finds due records through an indexed timestamp, starts the same
-bounded delete job, and retries deletion failures at most three times. It must not
-leave a due record merely "eligible" for a manual operation. Client spools retain at most 20 clips / 25 MiB / 7 days, deleting WAV
-after the R2 recording ID is confirmed and retaining only minimal process metadata
-until `202 Accepted` is confirmed. Operational logs retain only state, duration,
-correlation ID, and error code for 7 days.
+有効な記録にはサーバーが`retention_delete_after = created_at + 30 days`を設定する。スケジュールWorkerはインデックス付き時刻で期限到来記録を探し、同じ有限削除ジョブを開始する。削除失敗の再試行は最大3回であり、期限到来記録を手動操作待ちの「削除可能」な状態で放置しない。クライアントスプールは最大20クリップ、25 MiB、7日とし、R2記録IDの確認後にWAVを削除し、`202 Accepted`確認までは最小処理メタデータだけを保持する。運用ログは状態、所要時間、相関ID、エラーコードだけを7日保持する。
 
-## Host, authorization, and job contract
+## ホスト・認可・ジョブ契約
 
-| Host | Allowed route family | Required identity |
+| ホスト | 許可する経路群 | 必要な本人確認 |
 | --- | --- | --- |
-| management host | review, diary, dictionary, authorized audio/image, management record APIs | Verified Access JWT; household derived server-side |
-| device host | upload, own-record process, own-record status | Valid non-expired device token bound to the source |
+| 管理ホスト | 確認、日記、辞典、認可済み音声/画像、管理用記録API | 検証済みAccess JWT。世帯はサーバー側で導出 |
+| デバイスホスト | アップロード、自身の記録の解析開始、自身の状態取得 | 対象ソースへ束縛された、有効期限内のデバイストークン |
 
-All unmatched host/method/path/Content-Type combinations fail before application
-logic. Both hosts deny CORS by default. The management host rejects a device token;
-the device host rejects a management JWT for device operations. The API always
-uses the same not-found/unauthorized response shape for out-of-scope IDs.
+ホスト、HTTPメソッド、パス、Content-Typeの組合せが許可表にない要求は、アプリケーション処理前に失敗させる。両ホストはCORSを既定拒否する。管理ホストはデバイストークンを、デバイスホストは管理用JWTをデバイス操作に使う要求を拒否する。範囲外IDには、存在確認につながらない同一形状の未検出/未認可応答を返す。
 
-For every accepted asynchronous operation, create a stable opaque `AsyncJob.id`.
-The Workflow instance ID is that job ID (or a deterministic non-sensitive derived
-value), the input is `{ "async_job_id": "job_xxx" }`, and its persistent state is
-limited to opaque IDs and status. `dispatch_pending` is recoverable by attempting
-"create or confirm existing" with the same ID. Workers/D1, not workflow history,
-are authoritative. Each `step.do()` explicitly sets the finite retry limit in
-`SPEC.md`; SDK retries are disabled (`maxRetries: 0`). A post-send timeout becomes
-`UPSTREAM_RESULT_UNKNOWN`, consumes its reservation, and requires polling before a
-manual retry.
+受理する非同期操作ごとに、安定した不透明IDの`AsyncJob.id`を作る。WorkflowインスタンスIDはそのジョブID（または決定的で機密でない派生値）とし、入力は`{ "async_job_id": "job_xxx" }`だけ、永続状態は不透明IDと状態だけに限定する。`dispatch_pending`は同じIDで「作成または既存確認」を試みて復旧する。正はWorkflow履歴ではなくWorkers/D1である。各`step.do()`には`SPEC.md`の有限再試行上限を明示し、SDK再試行は`maxRetries: 0`で無効化する。送信後タイムアウトは`UPSTREAM_RESULT_UNKNOWN`として予約を消費し、手動再試行前にポーリングを要求する。
 
-The Worker maps the verified Access JWT `sub` to an allow-listed server-side
-`management_principals(sub, household_id)` row; email is a display/Access-policy
-attribute, never the authorization key. A device `GET /recordings/{id}` response is
-limited to `recording_id`, `analysis_status`, `review_status`, `version`, safe
-error fields, and the caller's own `AsyncJob` summary. It excludes transcript,
-word candidates, diary data, R2 fields, attempts, and all management metadata.
+Workerは、検証済みAccess JWTの`sub`を、サーバー側の許可済み`management_principals(sub, household_id)`行へ対応付ける。メールアドレスは表示・Accessポリシー用であり、認可キーではない。デバイスの`GET /recordings/{id}`は`recording_id`、`analysis_status`、`review_status`、`version`、安全なエラー項目、呼出元自身の`AsyncJob`概要だけを返す。文字起こし、単語候補、日記、R2項目、試行、管理メタデータは返さない。
 
-| Route family | State precondition | Success effect |
+| 経路群 | 状態の前提 | 成功時の効果 |
 | --- | --- | --- |
-| `POST /recordings` | valid owned source and valid WAV | `Recording.analysis_status = pending`, review `pending` |
-| `POST /recordings/{id}/process` | owner; not deleting/deleted; analysis retry budget | create/return analysis job and return `202`; worker advances `pending → transcribing → extracting_words → ready/partial/failed` |
-| `PATCH /recordings/{id}/review` | management identity; matching recording version | draft data and optional timestamp audit saved; version increments |
-| `POST /recordings/{id}/approve` | management identity; matching version; analysis `ready`, `partial`, or `failed` | atomic approval and `WordOccurrence` update; create/return diary job and return `202` |
-| `POST /diary/{id}/regenerate` | management identity; matching diary version and retry budget | create/return diary job; `diary_status = generating` |
-| `POST /diary/{id}/image` | management identity; matching diary version; explicit replacement confirmation if needed | create/return image job; `image_status = generating` without deleting active image |
-| `DELETE /recordings/{id}` | management identity; matching version | hide immediately, invalidate attempts, create/return delete job and return `202` |
+| `POST /recordings` | 所有する有効ソースと有効WAV | `Recording.analysis_status = pending`、確認状態`pending` |
+| `POST /recordings/{id}/process` | 所有者、削除中/削除済みでない、解析再試行枠あり | 解析ジョブを作成/返却して`202`。Workerが`pending → transcribing → extracting_words → ready/partial/failed`へ遷移 |
+| `PATCH /recordings/{id}/review` | 管理本人確認と一致する記録バージョン | 下書きと任意の日時監査を保存し、バージョン加算 |
+| `POST /recordings/{id}/approve` | 管理本人確認、一致するバージョン、解析が`ready`/`partial`/`failed` | 承認と`WordOccurrence`を原子的更新し、日記ジョブを作成/返却して`202` |
+| `POST /diary/{id}/regenerate` | 管理本人確認、一致する日記バージョン、再試行枠あり | 日記ジョブを作成/返却し、`diary_status = generating` |
+| `POST /diary/{id}/image` | 管理本人確認、一致する日記バージョン、必要時の置換確認 | 画像ジョブを作成/返却し、有効画像を消さずに`image_status = generating` |
+| `DELETE /recordings/{id}` | 管理本人確認と一致するバージョン | 即時非表示化・試行無効化、削除ジョブ作成/返却、`202` |
 
-## OpenAI data boundary
+## OpenAIへ送るデータの境界
 
-Only the analysis Workflow sends the subject WAV to `/v1/audio/transcriptions`;
-the word-extraction Workflow sends the resulting transcript as tagged data; the
-diary Workflow sends approved transcript, scene, and parent note as tagged data;
-the image Workflow sends only the approved diary text and fixed style instruction.
-No other household history, token, R2 key, internal error, or audit detail is sent.
-Responses requests set `store: false`, OpenAI background mode is never used, and
-the OpenAI SDK has `maxRetries: 0`. The Phase 7 public artifacts must disclose the
-sent data, no-training default, possible abuse-monitoring retention, the limited
-meaning of `store: false`, and the ban on real children's data, as required by
-`SPEC.md`.
+解析Workflowだけが対象WAVを`/v1/audio/transcriptions`へ送る。単語抽出Workflowは結果の文字起こしをタグ付きデータとして、日記Workflowは承認済み文字起こし・場面・親メモをタグ付きデータとして、画像Workflowは承認済み日記文と固定スタイル指示だけを送る。他世帯の履歴、トークン、R2キー、内部エラー、監査詳細は送らない。Responses API要求には`store: false`を付け、OpenAI background modeは使わず、SDKの`maxRetries`は0にする。Phase 7の公開物には、送信データ、既定の学習非利用、不正利用監視での保持可能性、`store: false`の限定的な意味、実在児童データを使わないことを`SPEC.md`どおり開示する。
 
-## HTTP contract and error shape
+## HTTP契約とエラー形式
 
-The machine-readable source is [openapi.json](../packages/shared/api/openapi.json).
-It defines every Phase 1 route, identity scheme, request body, common error, and
-state enum. Human-readable rules in this document and `SPEC.md` remain required
-where OpenAPI cannot express authorization predicates or transaction boundaries.
+機械可読な正本は [openapi.json](../packages/shared/api/openapi.json) である。Phase 1の全経路、認証方式、要求本文、共通エラー、状態列挙を定義する。OpenAPIだけでは認可条件やトランザクション境界を表せないため、本書と`SPEC.md`の人間向け規則も必須である。
 
-All JSON API success responses include `correlation_id`. Mutations require JSON
-`Content-Type`, bounded bodies, and `version` when modifying an existing resource;
-the multipart WAV upload is the explicit exception, with its non-file fields
-validated by the shared OpenAPI contract.
-Times are RFC 3339 UTC values in 2000--2099; `captured_timezone` is an IANA zone.
+全JSON API成功応答には`correlation_id`を含める。更新操作はJSONのContent-Type、上限付き本文、既存リソース更新時の`version`を必須とする。multipartのWAVアップロードだけは明示的な例外であり、ファイル以外の項目は共有OpenAPI契約で検証する。時刻は2000〜2099年のRFC 3339 UTC値、`captured_timezone`はIANAタイムゾーンとする。
 
 ```json
 {
@@ -308,14 +253,10 @@ Times are RFC 3339 UTC values in 2000--2099; `captured_timezone` is an IANA zone
 }
 ```
 
-The error `message` never contains user input, a token, SQL, a stack trace, an R2
-key, or a provider response. Required codes include `UNAUTHORIZED`, `FORBIDDEN`,
-`NOT_FOUND`, `VALIDATION_ERROR`, `VERSION_CONFLICT`, `COST_LIMIT_REACHED`,
-`DEMO_WRITE_DISABLED`, `UPSTREAM_RESULT_UNKNOWN`, and
-`IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED`.
+エラーの`message`にはユーザー入力、トークン、SQL、スタックトレース、R2キー、プロバイダー応答を含めない。必須コードには`UNAUTHORIZED`、`FORBIDDEN`、`NOT_FOUND`、`VALIDATION_ERROR`、`VERSION_CONFLICT`、`COST_LIMIT_REACHED`、`DEMO_WRITE_DISABLED`、`UPSTREAM_RESULT_UNKNOWN`、`IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED`がある。
 
 ```json
-// POST /api/v1/recordings (device host): multipart fields plus WAV
+// POST /api/v1/recordings（デバイスホスト）: multipart項目とWAV
 {
   "client_capture_id": "019f0000-0000-7000-8000-000000000000",
   "captured_at": "2026-07-20T01:00:00Z",
@@ -324,48 +265,41 @@ key, or a provider response. Required codes include `UNAUTHORIZED`, `FORBIDDEN`,
   "post_roll_seconds": 5,
   "post_roll_truncated": false
 }
-// 201/200 deduplicated response
+// 201/200: 重複排除済みの応答
 { "recording_id": "rec_xxx", "analysis_status": "pending", "review_status": "pending", "version": 1, "deduplicated": false, "correlation_id": "corr_xxx" }
 ```
 
 ```json
-// POST /api/v1/recordings/rec_xxx/process, POST /approve, diary/image generation
-// 202 response
+// POST /api/v1/recordings/rec_xxx/process、POST /approve、日記/画像生成
+// 202応答
 { "async_job_id": "job_xxx", "status": "dispatched", "correlation_id": "corr_xxx" }
 ```
 
-`POST /approve` accepts the fields and empty-text/empty-word semantics in `SPEC.md`.
-`POST /diary/{id}/image` requires `{ "version": 5, "replace_image_id": "image_xxx" }`
-when an active image exists. A missing replacement confirmation returns the named
-409 error without consuming a quota or creating a job.
+`POST /approve`は`SPEC.md`の項目と空文字/空単語の意味論を受け入れる。有効画像がある`POST /diary/{id}/image`は`{ "version": 5, "replace_image_id": "image_xxx" }`を必須とする。置換確認がなければ、上限を消費せずジョブも作らずに指定の409エラーを返す。
 
-## Contract-test matrix
+## 契約テスト表
 
-Before endpoint code is added, convert these rows into deterministic contract tests
-against the shared JSON Schema/OpenAPI source. Mock OpenAI; no test calls real APIs.
+エンドポイント実装前に、以下を共有JSON Schema/OpenAPIに対する決定的な契約テストへ変換する。OpenAIはモック化し、実APIを呼ばない。
 
-| Case | Expected invariant |
+| ケース | 期待する不変条件 |
 | --- | --- |
-| Same `client_capture_id` replay | Same recording ID, no second R2 write or quota/job consumption |
-| Wrong host/token/JWT/household | Identical denial shape; no data, object key, or existence leak |
-| Invalid WAV, oversized body, invalid time/enum | `VALIDATION_ERROR`, no R2 object or D1 row |
-| Same capture ID with different SHA-256 | `IDEMPOTENCY_CONFLICT`; no second object/record/job |
-| Stale review/image version | `409 VERSION_CONFLICT`, no overwrite or quota/job reservation |
-| Concurrent process/image request | One job and one quota reservation only |
-| Expiry or kill switch before/resumed Workflow call | No OpenAI call; terminal recoverable state and safe error |
-| 429/5xx vs permanent/provider-unknown error | Only explicit finite retry; unknown result never automatically resent |
-| Late result after delete/new attempt | No restored/deleted data and no stale overwrite |
-| Image replacement failure | Existing active image remains active |
-| Approval/date edit | Unique occurrence; deterministic first word and dictionary aggregates recomputed |
-| Workflow payload/state inspection | Contains only opaque job/attempt identifiers and status |
-| Error serialization/log capture | No secret, transcript, note, audio, R2 key, SQL, or stack trace |
-| Access and device authentication | Reject invalid signature, `iss`, `aud`, `exp`, unknown `sub`, expired/revoked token, and cross-source token |
-| Browser and host protections | Reject cross-origin CORS, missing/invalid CSRF on cookie mutations, and identity/route mismatch |
-| Global cap and lifecycle | Concurrent households cannot exceed demo-global cap; total operation attempts stop at three; due 30-day records start bounded deletion |
+| 同じ`client_capture_id`の再送 | 同じ記録ID。R2再書込み、上限/ジョブ消費をしない |
+| 誤ったホスト/トークン/JWT/世帯 | 同一形状の拒否。データ、オブジェクトキー、存在有無を漏らさない |
+| 不正WAV、大きすぎる本文、不正時刻/列挙値 | `VALIDATION_ERROR`。R2オブジェクトもD1行も作らない |
+| 同じ取得IDで異なるSHA-256 | `IDEMPOTENCY_CONFLICT`。2個目のオブジェクト/記録/ジョブを作らない |
+| 古い確認/画像バージョン | `409 VERSION_CONFLICT`。上書き、上限/ジョブ予約をしない |
+| 同時の解析/画像要求 | ジョブと上限予約は各1件だけ |
+| Workflow再開時を含む、失効/キルスイッチ | OpenAIを呼ばず、安全なエラーと復旧可能な終端状態 |
+| 429/5xxと恒久/結果不明エラー | 明示した有限再試行だけ。結果不明を自動再送しない |
+| 削除/新試行後に遅れて届く結果 | 削除済みデータを復活させず、新しい結果を上書きしない |
+| 画像置換の失敗 | 既存の有効画像を維持 |
+| 承認/日時編集 | 発話は一意。決定的な初出と辞典集計を再計算 |
+| Workflow入力/状態の検査 | 不透明なジョブ/試行IDと状態だけを含む |
+| エラー直列化/ログ収集 | 秘密情報、文字起こし、メモ、音声、R2キー、SQL、スタックトレースを含まない |
+| Access/デバイス認証 | 不正署名、`iss`、`aud`、`exp`、未知`sub`、失効/撤回済み/別ソースのトークンを拒否 |
+| ブラウザ/ホスト保護 | クロスオリジンCORS、Cookie更新時のCSRF欠落/不正、本人確認と経路の不一致を拒否 |
+| 全体上限とライフサイクル | 同時世帯でもデモ全体上限を超えず、総試行は3回で停止し、30日期限記録は有限削除を開始 |
 
-## Phase 1 implementation gate
+## Phase 1の実装入口
 
-The next Phase 1 increment is executable schema/API-contract testing. It requires
-one approved Python source/test layout because the repository currently has
-`main/src/` while the quality configuration targets `src/`. This document adds no
-runtime dependency and does not alter that configuration.
+次のPhase 1作業は、スキーマ/API契約の実行可能テストである。Pythonのソース/テスト配置は`main/apps/pc-client/src/`へ確定し、品質設定も同じ場所へ更新済みである。本書は実行時依存を追加しない。
