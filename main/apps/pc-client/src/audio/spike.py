@@ -22,6 +22,11 @@ CHANNELS: Final[int] = 1
 PRE_ROLL_SECONDS: Final[int] = 10
 POST_ROLL_SECONDS: Final[int] = 5
 HOLD_SECONDS: Final[float] = 1.5
+STATUS_MESSAGE_LIMIT: Final[int] = 16
+
+
+class InputStreamStoppedError(RuntimeError):
+    """例外を伴わずに入力ストリームが停止したことを示す。"""
 
 
 @dataclass(frozen=True)
@@ -84,11 +89,6 @@ class ByteRingBuffer:
         return data[-maximum_bytes:]
 
 
-def held_long_enough(pressed_at: float, released_at: float) -> bool:
-    """長押しが成立したかを判定する。"""
-    return released_at - pressed_at >= HOLD_SECONDS
-
-
 def downsample_48k_to_24k(pcm: bytes) -> bytes:
     """16-bit mono PCMを隣接サンプル平均で1/2ダウンサンプリングする。"""
     if len(pcm) % 4 != 0:
@@ -132,7 +132,7 @@ def parse_device(value: str) -> int | str:
 
 
 def record_once(output_path: Path, device: int | str | None = None, sleep: Callable[[float], None] = time.sleep) -> None:
-    """Enterの押下/解放で長押しを模擬し、15秒クリップを保存する手動スパイク。"""
+    """Enter押下から1.5秒保持で確定する長押しを模擬し、15秒クリップを保存する手動スパイク。"""
     capture_format: CaptureFormat = select_capture_format(device)
     # 再接続しても、切断直前に得た音声を失わないよう生存期間を関数全体にする。
     pre_roll: ByteRingBuffer = ByteRingBuffer(capture_format)
@@ -142,7 +142,7 @@ def record_once(output_path: Path, device: int | str | None = None, sleep: Calla
         post_roll: ByteRingBuffer = ByteRingBuffer(capture_format, POST_ROLL_SECONDS)
         collecting_post_roll = threading.Event()
         stream_finished = threading.Event()
-        status_messages: list[str] = []
+        status_messages: deque[str] = deque(maxlen=STATUS_MESSAGE_LIMIT)
         pre_pcm: bytes | None = None
         try:
 
@@ -155,13 +155,13 @@ def record_once(output_path: Path, device: int | str | None = None, sleep: Calla
                 pre_roll: ByteRingBuffer = pre_roll,
                 post_roll: ByteRingBuffer = post_roll,
                 collecting_post_roll: threading.Event = collecting_post_roll,
-                status_messages: list[str] = status_messages,
+                status_messages: deque[str] = status_messages,
             ) -> None:
                 del frames, time_info
                 # コールバックではメモリ上のappend以外をせず、I/Oは呼び出し元へ委ねる。
+                # statusは欠落の通知であり、届いたブロック自体は有効な音声なので破棄しない。
                 if status:
                     status_messages.append(str(status))
-                    return
                 pre_roll.append(indata)
                 if collecting_post_roll.is_set():
                     post_roll.append(indata)
@@ -179,11 +179,21 @@ def record_once(output_path: Path, device: int | str | None = None, sleep: Calla
                 finished_callback=finished_callback,
             ):
                 input('Enterで押下を開始します。')
-                pressed_at: float = time.monotonic()
-                input('Enterで解放します。')
-                if not held_long_enough(pressed_at, time.monotonic()):
+                if stream_finished.is_set():
+                    raise InputStreamStoppedError('input stream stopped before capture')
+                released = threading.Event()
+
+                def wait_release(*, released: threading.Event = released) -> None:
+                    input('解放するにはEnterを押します（1.5秒保持で記録が確定します）。')
+                    released.set()
+
+                threading.Thread(target=wait_release, daemon=True).start()
+                if released.wait(HOLD_SECONDS):
                     print('長押しで記録します。')
                     return
+                if stream_finished.is_set():
+                    raise InputStreamStoppedError('input stream stopped before capture')
+                # 長押し成立時点で操作前音声を確定し、解放を待たずに後録りへ進む。以降の押下は無視する。
                 pre_pcm = pre_roll.snapshot(PRE_ROLL_SECONDS * capture_format.bytes_per_second)
                 post_roll.clear()
                 collecting_post_roll.set()
@@ -194,7 +204,7 @@ def record_once(output_path: Path, device: int | str | None = None, sleep: Calla
                 if status_messages or stream_finished.is_set():
                     print('入力が中断されたため、取得済みの操作後音声までを保存しました。')
                 return
-        except sd.PortAudioError as error:
+        except (sd.PortAudioError, InputStreamStoppedError) as error:
             collecting_post_roll.clear()
             if pre_pcm is not None:
                 pcm = pre_pcm + post_roll.snapshot(POST_ROLL_SECONDS * capture_format.bytes_per_second)

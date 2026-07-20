@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pytest
 from audio.spike import (
+    HOLD_SECONDS,
+    POST_ROLL_SECONDS,
+    PRE_ROLL_SECONDS,
     ByteRingBuffer,
     CaptureFormat,
     downsample_48k_to_24k,
-    held_long_enough,
     parse_device,
     save_baseline_clip,
     write_wav,
@@ -47,10 +49,9 @@ def test_ring_buffer_clear_discards_previous_audio() -> None:
     assert buffer.snapshot(4) == b''
 
 
-def test_hold_threshold_is_inclusive() -> None:
-    """1.5秒ちょうどの長押しを成立とする。"""
-    assert held_long_enough(10.0, 11.5)
-    assert not held_long_enough(10.0, 11.499)
+def test_recording_constants_match_spec() -> None:
+    """長押し・前後録りの秒数はSPECの固定値と一致する。"""
+    assert (HOLD_SECONDS, PRE_ROLL_SECONDS, POST_ROLL_SECONDS) == (1.5, 10, 5)
 
 
 def test_parse_device_converts_numeric_id_only() -> None:
