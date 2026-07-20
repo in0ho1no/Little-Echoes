@@ -862,6 +862,8 @@ Workflowsの`step.do()`は既定で複数回試行されるため、既定値を
   "analysis_status": "ready",
   "active_attempt_id": null,
   "review_status": "pending",
+  "draft_scene": null,
+  "draft_parent_note": null,
   "diary_status": "not_started",
   "image_status": "not_requested",
   "version": 1,
@@ -1200,6 +1202,8 @@ Content-Type: application/json
 - captured_timezone
 - scene
 - parent_note
+
+下書きの`scene`と`parent_note`は録音レコードの下書き列（`draft_`接頭辞）へ保存し、確認待ち一覧・詳細の応答に含めて往復を閉じる。承認時に確定値を`DiaryEntry`へコピーする。将来追加する下書き項目も同じ`draft_`列規則に従う。
 
 録音日時変更時は`captured_at_source`を`manual`へ変更し、監査イベントを保存する。承認済み記録を編集する場合は、影響する辞典単語の初回記録を同一トランザクションで再計算する。
 
@@ -1724,6 +1728,9 @@ Phase 1の実装で必要なD1制約、R2キー形式、ジョブ・認可・エ
 | 記録秒数の可変化とD1/API上限の矛盾 | MVPは操作前10秒・操作後5秒の固定とし、可変化を将来対応へ変更。D1/OpenAPIの検証上限（`pre_roll` 0〜10、`post_roll` 0〜5）を維持 |
 | 記録作成の送信内容 | `source_type`、`source_id`、`captured_at_source`を送信項目から削除し、デバイストークンからのサーバー導出に統一（openapi.jsonと一致） |
 | 旧`main/src/`スキャフォールド | 削除。Python配置は`main/apps/pc-client/src/`のみ |
+| 下書きの往復（第2回レビュー） | `recordings`へ`draft_scene`/`draft_parent_note`列を追加し、確認待ち応答（`ReviewQueueItem`）へ`scene`/`parent_note`を含める。承認時に`DiaryEntry`へコピー。将来の下書き項目も`draft_`接頭辞で拡張する |
+| 確認画面の失敗表示（第2回レビュー） | `ManagementRecording`へ`error`と`async_job`概要を追加 |
+| 契約テストの検証器（第2回レビュー） | 依存追加せず、openapi.jsonが検証器の理解するキーワードだけを使うことを強制するガードテストを追加する方式を採用 |
 
 ---
 

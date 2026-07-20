@@ -166,6 +166,10 @@ def test_management_response_schemas_are_bounded_and_correlated() -> None:
     assert schemas['ReviewQueueItem']['properties']['word_candidates']['maxItems'] == 30
     assert schemas['DictionaryWord']['properties']['history']['maxItems'] == 100
     assert schemas['ReviewQueueItem']['properties']['recording']['$ref'] == '#/components/schemas/ManagementRecording'
+    assert {'scene', 'parent_note'}.issubset(schemas['ReviewQueueItem']['required'])
+    assert schemas['ReviewQueueItem']['properties']['scene']['maxLength'] == 300
+    assert schemas['ReviewQueueItem']['properties']['parent_note']['maxLength'] == 2000
+    assert {'async_job', 'error'}.issubset(schemas['ManagementRecording']['properties'])
     management_required: list[str] = schemas['ManagementRecording']['required']
     assert {'captured_at', 'captured_timezone', 'captured_at_source', 'source_type', 'audio_endpoint'}.issubset(management_required)
     assert {'recording_id', 'surface', 'utterance_text', 'spoken_at', 'audio_endpoint'}.issubset(schemas['WordOccurrence']['required'])
@@ -179,6 +183,56 @@ def test_device_recording_schema_does_not_expose_management_content() -> None:
     recording_properties: dict[str, Any] = document['components']['schemas']['Recording']['properties']
 
     assert {'raw_text', 'reviewed_text', 'word_candidates', 'diary_text', 'audio_object_key', 'image_object_key'}.isdisjoint(recording_properties)
+
+
+ALLOWED_SCHEMA_KEYWORDS: frozenset[str] = frozenset(
+    {
+        '$ref',
+        'type',
+        'properties',
+        'required',
+        'additionalProperties',
+        'items',
+        'maxItems',
+        'minLength',
+        'maxLength',
+        'pattern',
+        'format',
+        'enum',
+        'minimum',
+        'maximum',
+        'exclusiveMinimum',
+        'contentMediaType',
+        'default',
+    }
+)
+ALLOWED_FORMATS: frozenset[str] = frozenset({'date-time', 'uuid', 'binary'})
+
+
+def iter_schema_nodes(schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """スキーマとその子孫のスキーマノードを列挙する。"""
+    nodes: list[dict[str, Any]] = [schema]
+    for property_schema in schema.get('properties', {}).values():
+        nodes.extend(iter_schema_nodes(property_schema))
+    items: dict[str, Any] | None = schema.get('items')
+    if items is not None:
+        nodes.extend(iter_schema_nodes(items))
+    return nodes
+
+
+def test_openapi_uses_only_keywords_the_test_validator_understands() -> None:
+    """契約スキーマは本テストの検証器が解釈するキーワードだけを使う。"""
+    document: dict[str, Any] = load_openapi()
+    schema_roots: list[tuple[str, dict[str, Any]]] = list(document['components']['schemas'].items())
+    schema_roots.extend((f'parameter:{name}', parameter['schema']) for name, parameter in document['components']['parameters'].items())
+
+    for name, root in schema_roots:
+        for node in iter_schema_nodes(root):
+            unknown_keywords: set[str] = set(node) - ALLOWED_SCHEMA_KEYWORDS
+            assert not unknown_keywords, f'{name}: validator does not understand {sorted(unknown_keywords)}'
+            declared_format: str | None = node.get('format')
+            if declared_format is not None:
+                assert declared_format in ALLOWED_FORMATS, f'{name}: unknown format {declared_format}'
 
 
 def test_upload_and_error_contracts_keep_server_derived_and_idempotency_rules() -> None:

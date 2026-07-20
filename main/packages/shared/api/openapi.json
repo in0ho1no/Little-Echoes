@@ -891,7 +891,9 @@
           "post_roll_seconds": {"type": "integer", "minimum": 0, "maximum": 5},
           "version": {"type": "integer", "minimum": 1},
           "correlation_id": {"type": "string", "pattern": "^corr_[A-Za-z0-9_-]+$"},
-          "audio_endpoint": {"type": "string", "pattern": "^/api/v1/recordings/rec_[A-Za-z0-9_-]+/audio$"}
+          "audio_endpoint": {"type": "string", "pattern": "^/api/v1/recordings/rec_[A-Za-z0-9_-]+/audio$"},
+          "async_job": {"$ref": "#/components/schemas/AcceptedJob"},
+          "error": {"$ref": "#/components/schemas/Error"}
         }
       },
       "ReviewQueueItem": {
@@ -900,7 +902,9 @@
         "required": [
           "recording",
           "transcript",
-          "word_candidates"
+          "word_candidates",
+          "scene",
+          "parent_note"
         ],
         "properties": {
           "recording": {
@@ -915,6 +919,14 @@
             "items": {
               "$ref": "#/components/schemas/WordCandidate"
             }
+          },
+          "scene": {
+            "type": ["string", "null"],
+            "maxLength": 300
+          },
+          "parent_note": {
+            "type": ["string", "null"],
+            "maxLength": 2000
           }
         }
       },

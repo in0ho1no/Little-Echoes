@@ -80,6 +80,8 @@ CREATE TABLE recordings (
   upload_status TEXT NOT NULL CHECK (upload_status IN ('reserved','ready','failed')),
   analysis_status TEXT NOT NULL CHECK (analysis_status IN ('pending','transcribing','extracting_words','ready','partial','failed')),
   review_status TEXT NOT NULL CHECK (review_status IN ('pending','approved','deleting','delete_failed','deleted')),
+  draft_scene TEXT CHECK (draft_scene IS NULL OR length(draft_scene) <= 300),
+  draft_parent_note TEXT CHECK (draft_parent_note IS NULL OR length(draft_parent_note) <= 2000),
   diary_status TEXT NOT NULL CHECK (diary_status IN ('not_started','generating','ready','failed')),
   image_status TEXT NOT NULL CHECK (image_status IN ('not_requested','generating','ready','failed','limit_reached')),
   active_attempt_id TEXT,
@@ -191,7 +193,7 @@ CREATE TABLE recording_tombstones (
 | アップロード作成/重複排除 | 先にD1で一意の取得キーと決定的・不透明なR2キーを予約し、同じSHA-256のバイト列だけを書き込む。原子的に`upload_status = ready`にするか、失敗を記録して有限回の孤児後始末へ積む |
 | 解析/日記/画像のディスパッチ | 楽観バージョン/有効ジョブ、期限、`DEMO_WRITE_ENABLED`、上限/試行予約、ジョブ作成または既存返却、リソース状態更新 |
 | OpenAI呼出し直前 | 期限/キルスイッチ/有効試行を再確認し、`ProcessingAttempt`をちょうど1件作成または更新し、利用量を予約する。トランザクション失敗時はOpenAIを呼ばない |
-| 確認保存/承認 | `UPDATE ... WHERE id=? AND household_id=? AND version=?`、文字起こし/発話/辞典集計の再計算、監査イベント、バージョン加算をまとめる |
+| 確認保存/承認 | `UPDATE ... WHERE id=? AND household_id=? AND version=?`、文字起こし/発話/辞典集計の再計算、監査イベント、バージョン加算をまとめる。下書きの`scene`/`parent_note`は`recordings.draft_scene`/`draft_parent_note`へ保存し、承認時に確定値を`DiaryEntry`へコピーする。将来の下書き項目も`draft_`接頭辞の列として同じ規則で扱う |
 | 画像置換 | バージョン確認、上限/ジョブ予約、R2成功後にだけ新画像を有効化し旧画像を無効化 |
 | 削除 | 直ちに非表示化し有効試行を無効化。削除Workflowは内容を持つ子行と`Recording`を削除し、`recording_tombstones(recording_id, household_id, review_status, deleted_at)`だけを挿入 |
 
