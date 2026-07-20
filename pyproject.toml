@@ -5,6 +5,8 @@ description = "Capture your child’s first words and turn them into lasting ill
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "openai[realtime]>=2.45.0",
+    "pyserial>=3.5",
 ]
 
 [dependency-groups]
@@ -108,6 +110,8 @@ exclude = [
 [tool.pyright]
 # 型チェックの対象ディレクトリ
 include = ["src"]
+# scripts配下からsrcのモジュールをimportする手動確認スクリプトも解決可能にする
+extraPaths = ["src"]
 # 既存の除外ルールと同期
 exclude = [
     "**/.*",
