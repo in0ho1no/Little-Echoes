@@ -85,14 +85,14 @@
 
 ### コード品質チェック
 
-- Ruff（lint）: `uv run ruff check src/`
-- Ruff（format）: `uv run ruff format src/`
-- mypy: `uv run mypy src/`
-- pyright: `uv run pyright src/`
+- Ruff（lint）: `uv run ruff check main/apps/pc-client/src/`
+- Ruff（format）: `uv run ruff format main/apps/pc-client/src/`
+- mypy: `uv run mypy main/apps/pc-client/src/`
+- pyright: `uv run pyright main/apps/pc-client/src/`
 - コード変更後は必ず上記を実行してエラーがないことを確認する
 
 ### テスト
 
 - テストフレームワークは pytest を使用する
-- テストファイルは `src/tests/` ディレクトリに配置し、`test_*.py` の命名規則に従う
+- テストファイルは `main/apps/pc-client/src/tests/` ディレクトリに配置し、`test_*.py` の命名規則に従う
 - 実行: `uv run pytest`
