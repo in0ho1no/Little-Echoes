@@ -369,6 +369,7 @@ PC参照クライアントとAtom VoiceS3Rは、同一のCloudflare APIおよび
 MVPではWorkers、Workflows、D1、R2を使用する。録音アップロードとAI解析を2つのAPI要求へ分け、PCクライアントが自動で順番に実行する。HTTP要求はWorkflowの受付完了後に`202 Accepted`を返し、OpenAI API呼び出し、日記・画像生成、削除はWorkflow内で継続する。
 
 - 耐久実行基盤はWorkflowsだけとし、Queuesは追加しない
+- 縮退経路: Phase 2でWorkflows統合の問題解決に半日以上を要する場合は、`ctx.waitUntil()`+`AsyncJob`収束処理による非同期実行へ縮退してよい。縮退時も`202 Accepted`+状態ポーリング、`AsyncJob`と`ProcessingAttempt`による試行・コスト上限、結果不明時の終端収束は維持し、切り替え前に本書を更新する。Worker退避で処理が中断し得るため、縮退時は手動再試行による復旧を前提とする
 - WorkflowはAPIと同じWorkerスクリプトへバインドし、別サービスのアプリケーションコードを増やさない
 - Wranglerの`compatibility_date`はWorkflows要件を満たす2024-10-22以降の実装日へ固定し、暗黙に追従させない
 - Workflowの起動ペイロードには`AsyncJob.id`だけを渡し、永続ステップ出力も不透明なIDと状態だけに限定する。音声バイト、R2オブジェクトキー、文字起こし、親メモ、トークンを保持しない
@@ -689,6 +690,7 @@ Workflowsの`step.do()`は既定で複数回試行されるため、既定値を
 | 画像生成 | 1 | 自動再試行なし |
 | R2/D1削除 | 3 | AI呼び出しなし。有限な再試行だけ許可 |
 
+- `retries.limit`が「合計試行回数」か「初回を除く再試行回数」かは、実装開始時に必ず <https://developers.cloudflare.com/workflows/build/sleeping-and-retrying/> の最新記載と1個のテストWorkflowの実測で確認する。確認結果をユーザーへ提示し、承認を得てから上表の各値を確定する。1回分のずれは許容するが、無確認で実装しない
 - 認証、認可、入力検証、ポリシー拒否、コスト上限などの恒久エラーは`NonRetryableError`相当として即時停止する
 - AI処理は処理単位ごとに1つの耐久ステップとして扱い、単語抽出失敗時の自動再試行でも文字起こしから再実行する
 - OpenAI APIを呼ぶ直前に、Workflowの再開・再試行時もD1で試行回数と日次利用量を原子的に予約する
@@ -1070,6 +1072,8 @@ APIパスは実装時に調整してよいが、責務は維持する。
 
 同じWorkerスクリプトを2つのホストへルーティングし、認証境界をホスト単位で分離する。
 
+前提条件: この構成にはCloudflareゾーンへ登録済みのカスタムドメインが必要である。`workers.dev`にはCloudflare Accessを適用できず、2ホスト分離もできない。ドメインの登録とゾーン設定はPhase 2開始前に完了させる。
+
 | ホスト | 公開機能 | 認証 |
 | --- | --- | --- |
 | 管理用ホスト（例: `app.example.com`） | Hono SSR、確認、音声再生、承認、日記、辞典、削除 | Cloudflare Access |
@@ -1147,7 +1151,7 @@ POST /api/v1/recordings/{recording_id}/process
 - 完了不明のタイムアウト時は、再度このAPIを呼ぶ前に状態取得APIを確認する
 - `dispatch_pending`のままWorkflow作成結果が不明な場合は、同じ`AsyncJob.id`で作成または既存確認を再実行し、別IDのジョブを作らない
 - 遅れて完了した古い試行は`active_attempt_id`を照合し、新しい試行結果を上書きしない
-- 耐久実行基盤はWorkflowsだけとし、Queuesや`ctx.waitUntil()`によるAI処理は採用しない
+- 耐久実行基盤はWorkflowsだけとし、Queuesや`ctx.waitUntil()`によるAI処理は採用しない。ただしPhase 2で詰まった場合は「Cloudflareバックエンド」に定義した縮退経路に従う
 
 ### 状態取得
 
@@ -2039,6 +2043,15 @@ PC版とCloudflare/Web版が安定してから着手する。
 | 審査用アクセスの期限 | 名指し2アドレスだけを許可し、審査用デバイストークンとAccess許可は結果発表後に前倒し失効する。最終期限は2026-09-01 00:00 JSTとする |
 | OpenAI APIのデータ取り扱い | [OpenAI APIのデータ制御](https://developers.openai.com/api/docs/guides/your-data#default-usage-policies-by-endpoint)を確認し、Responses APIは`store: false`、OpenAI background modeは不使用とする。既定で学習へ使われないことと、適用される不正利用監視ログでは最大30日保持され得ることを提出物へ明記し、ゼロ保持とは表現しない |
 | OpenAI SDKの再試行 | [公式TypeScript SDK](https://github.com/openai/openai-node#retries)は対象エラーを既定で2回再試行する。Workflowの再試行と重ねないため`maxRetries: 0`とし、結果不明タイムアウトを自動再送しない |
+
+### 2026-07-20 GPT-5.6 Sol更新の追認と補足
+
+| 項目 | 決定 |
+| --- | --- |
+| Workflows必須化の追認と縮退経路 | Workflows採用を追認する。ただしPhase 2で統合の問題解決に半日以上を要する場合は、`ctx.waitUntil()`+`AsyncJob`収束処理へ縮退してよい（202+ポーリング、試行・コスト上限、終端収束は維持し、本書を先に更新する） |
+| `retries.limit`の意味論 | 「合計試行回数」か「初回を除く再試行回数」かを実装開始時に公式ドキュメントと実測で確認し、結果をユーザーへ提示して承認を得てから確定する。1回分のずれは許容する |
+| カスタムドメイン | 2ホスト分離+Cloudflare Accessの前提としてカスタムドメインを用意する（ユーザー対応）。Phase 2開始前に登録とゾーン設定を完了させる |
+| Accessポリシーの絞り込み | 名指しアドレスのみ・ドメイン許可なしへの変更は、入り口を狭く保つ意図的な決定として追認する |
 
 ---
 
