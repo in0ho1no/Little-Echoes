@@ -55,4 +55,5 @@ returned by the API will be stored in private application storage with
 restricted access and defined deletion handling.
 
 See [SPEC.md](SPEC.md) for the current requirements, security controls, and
-development phases.
+acceptance criteria. See [tasks.md](tasks.md) for development phases, validation,
+and review status.
