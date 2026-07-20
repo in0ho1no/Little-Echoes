@@ -1,6 +1,6 @@
 ---
 name: Python Quality
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 description: >-
   Pythonコードの静的解析と自動修正を行うエージェント。
   「品質チェックして直して」「ruffとmypyで修正まで」「エラーを全部直して」
