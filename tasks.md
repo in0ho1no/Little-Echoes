@@ -173,9 +173,20 @@ uv run pytest
 
 ## Demo and submission tasks
 
+**Submission deadline: 2026-07-21 17:00 PDT (2026-07-22 09:00 JST). Reconfirm on Devpost before final submission.** Category: Apps for Your Life. The demo video must be a public YouTube video under 3 minutes with spoken narration; Japanese dialogue is acceptable with English subtitles and English (or English TTS) narration.
+
 Use only the developer's voice and synthetic/sample data. Show the PC ring buffer, record a sample phrase, show saving/upload/asynchronous processing, review it on mobile, approve with a scene, explicitly generate a diary/image, and show the dictionary. Add Atom only if actually complete and verified.
 
-Before submission, recheck current Devpost requirements and prepare the English Project Story, public video, Codex/GPT-5.6 explanation, source access, OSS license, samples, judge instructions, and `/feedback` Session ID. Keep tokens out of public material. Include named-address Access instructions, token expiry, route separation, and the OpenAI data-handling disclosure in `SPEC.md`.
+Before submission, recheck current Devpost requirements and prepare the English Project Story, public video, Codex/GPT-5.6 explanation, source access, OSS license, samples, judge instructions, and `/feedback` Session ID. Keep tokens out of public material. Include named-address Access instructions, token expiry, route separation, and the OpenAI data-handling disclosure required by `SPEC.md`.
+
+### Pre-publication checklist
+
+- [ ] No tokens or secrets anywhere in the public repository or public README.
+- [ ] Cloudflare Access allows only the named addresses (no domain-wide rules); state this in Testing instructions and do not claim otherwise.
+- [ ] Judge Testing instructions cover: allowed addresses, one-time PIN steps, device-token entry method and expiry, and a contact for other addresses (all in English).
+- [ ] Demo write expiry (2026-09-01 00:00 JST at the latest) and `DEMO_WRITE_ENABLED` kill switch verified working.
+- [ ] The OpenAI data-handling disclosure (data sent per feature, no training by default, up-to-30-day abuse-monitoring retention, `store: false` scope, no real children's data) appears in all three artifacts: README, Project Story, and Testing instructions, in English.
+- [ ] `reference/`-free build, test, and demo verified; repository visibility decision executed (public, or private shared with `testing@devpost.com` and `build-week-event@openai.com`).
 
 ## Skills and custom agents
 
@@ -184,6 +195,8 @@ Before submission, recheck current Devpost requirements and prepare the English 
 - `little-echoes-phase`: project-local phase runner for Phase execution, `SPEC.md`/`tasks.md` synchronization, and the Agentic review loop.
 - `ag-little-echoes-architecture-review`: read-only cross-component reviewer for requirements, security, bounded cost, user experience, and test gaps.
 - Existing Python Quality/Review agents and `sk-python-quality`: use for Python implementation and static analysis.
+
+Claude Code mirrors (deployed 2026-07-20): the phase runner is available as the `little-echoes-phase` skill at `.claude/skills/little-echoes-phase/SKILL.md`, and the reviewer as the `Little Echoes Architecture Review` agent at `.claude/agents/ag-little-echoes-architecture-review.agent.md`. The Codex-only `agents/openai.yaml` interface file has no Claude equivalent. When the source under `.agents/` or `.github/agents/` changes, update the `.claude/` mirror in the same commit.
 
 ### When to add more
 
@@ -195,7 +208,7 @@ Create a skill only for a repeated or fragile workflow. Create a custom agent on
 | Repeated browser E2E checks | Browser E2E agent/skill | a stable web UI and reproducible test data exist |
 | Atom hardware debugging becomes active | Atom hardware review agent | Phase 8 starts and device-specific failures recur |
 
-New skills belong in `.agents/skills`, must use the skill-creator workflow, and must be validated. New custom agents belong in `.github/agents`, must have a narrow role, and must not duplicate an existing agent. Record the trigger, owner, and validation command here when a tool is introduced.
+New skills belong in `.agents/skills`, must use the skill-creator workflow, and must be validated. New custom agents belong in `.github/agents`, must have a narrow role, and must not duplicate an existing agent. Tools intended for Claude Code are mirrored under `.claude/skills` and `.claude/agents` in Claude Code format. Record the trigger, owner, and validation command here when a tool is introduced.
 
 ## Working rules
 
