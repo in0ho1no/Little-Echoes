@@ -594,7 +594,7 @@ app.get('/api/v1/recordings/:id/audio', async (c) => {
       'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
       'Referrer-Policy': 'no-referrer',
       'X-Content-Type-Options': 'nosniff',
-      CORRELATION_ID_HEADER: c.get('correlationId'),
+      [CORRELATION_ID_HEADER]: c.get('correlationId'),
     },
   });
 });
@@ -699,5 +699,14 @@ app.get('/assets/review.js', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
   const script = `fetch('/api/v1/review-queue').then(r=>{if(!r.ok)throw new Error('request failed');return r.json()}).then(data=>{const list=document.getElementById('recordings');document.getElementById('status').textContent=data.items.length?'確認待ちの録音です。':'確認待ちの録音はありません。';for(const item of data.items){const recording=item.recording;if(!/^rec_[a-z0-9]{32}$/.test(recording.recording_id))continue;const li=document.createElement('li');const link=document.createElement('a');link.href='/recordings/'+encodeURIComponent(recording.recording_id);link.textContent=recording.captured_at+' — '+recording.analysis_status;li.append(link);list.append(li)}}).catch(()=>{document.getElementById('status').textContent='読み込みに失敗しました。再読み込みしてください。'});`;
-  return new Response(script, { headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store', CORRELATION_ID_HEADER: c.get('correlationId') } });
+  return new Response(script, {
+    headers: {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+      'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff',
+      [CORRELATION_ID_HEADER]: c.get('correlationId'),
+    },
+  });
 });

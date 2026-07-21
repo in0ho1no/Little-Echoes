@@ -135,6 +135,36 @@ describe('ルーターと録音API', () => {
     expect(response.status).toBe(401);
   });
 
+  it('DEMO_WRITE_ENABLED=falseは録音作成と解析要求を認証後に拒否する', async () => {
+    const supplied = env((sql) => {
+      if (sql.includes('FROM device_tokens')) return deviceRow();
+      throw new Error('書き込み無効時はD1の録音参照へ到達してはならない');
+    });
+    supplied.DEMO_WRITE_ENABLED = 'false';
+    const create = await requestWithForm(wav(), supplied);
+    expect(create.status).toBe(403);
+    await expect(create.json()).resolves.toMatchObject({ code: 'DEMO_WRITE_DISABLED', retryable: false });
+    const process = await app.fetch(
+      new Request(`https://ingest.example.test/api/v1/recordings/${RECORDING_ID}/process`, { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}` } }),
+      supplied,
+    );
+    expect(process.status).toBe(403);
+    await expect(process.json()).resolves.toMatchObject({ code: 'DEMO_WRITE_DISABLED' });
+  });
+
+  it('review.jsの生Responseにも相関IDとnosniffヘッダーを付ける', async () => {
+    const supplied = env((sql) => (sql.includes('FROM management_principals') ? { household_id: 'household_1' } : null));
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request('https://app.example.test/assets/review.js', { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+      supplied,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('X-Correlation-Id')).toMatch(/^cor_/);
+    expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(response.headers.get('Content-Security-Policy')).toContain("default-src 'self'");
+  });
+
   it('不正WAVをR2保存前に拒否する', async () => {
     const response = await requestWithForm(new Uint8Array([1, 2, 3]), env((sql) => (sql.includes('FROM device_tokens') ? deviceRow() : null)));
     expect(response.status).toBe(422);

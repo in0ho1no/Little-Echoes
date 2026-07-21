@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { normalizeUtcRfc3339, retentionDeleteAfter } from '../src/limits';
+import { isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter } from '../src/limits';
+
+describe('デモ書き込み期限', () => {
+  it('2026-09-01 00:00 JST以降はフラグが有効でも書き込みを拒否する', () => {
+    expect(isDemoWriteAllowed('true', new Date('2026-08-31T14:59:59.999Z'))).toBe(true);
+    expect(isDemoWriteAllowed('true', new Date('2026-08-31T15:00:00.000Z'))).toBe(false);
+    expect(isDemoWriteAllowed('false', new Date('2026-07-21T00:00:00.000Z'))).toBe(false);
+    expect(isDemoWriteAllowed('TRUE', new Date('2026-07-21T00:00:00.000Z'))).toBe(false);
+  });
+});
 
 describe('時刻境界', () => {
   it('RFC 3339 UTCだけを受理してミリ秒精度へ正規化する', () => {

@@ -15,39 +15,129 @@ def apply_migration() -> sqlite3.Connection:
     return connection
 
 
-def test_initial_migration_creates_required_phase2_tables() -> None:
-    """録音、非同期処理、利用量の永続化テーブルを作成する。"""
-    connection = apply_migration()
-    rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-    table_names = {row[0] for row in rows}
-    assert {'recordings', 'async_jobs', 'usage_counters', 'device_tokens'}.issubset(table_names)
+def insert_recording(
+    connection: sqlite3.Connection,
+    recording_id: str,
+    capture_id: str,
+    *,
+    received_at: str = '2026-07-21T00:00:00Z',
+    duration_seconds: float = 15.0,
+) -> None:
+    """最小の必須列で録音1件を挿入する。"""
+    connection.execute(
+        """
+        INSERT INTO recordings (
+          id, household_id, source_id, client_capture_id, captured_at, captured_at_original,
+          captured_at_source, captured_timezone, received_at, pre_roll_seconds, post_roll_seconds,
+          post_roll_truncated, duration_seconds, upload_status, analysis_status, review_status,
+          diary_status, image_status, created_at, updated_at
+        ) VALUES (
+          ?, 'household_demo', 'source_demo', ?, '2026-07-21T00:00:00Z',
+          '2026-07-21T00:00:00Z', 'client_clock', 'Asia/Tokyo', ?, 10, 5,
+          0, ?, 'reserved', 'pending', 'pending', 'not_started', 'not_requested',
+          '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z'
+        )
+        """,
+        (recording_id, capture_id, received_at, duration_seconds),
+    )
 
 
-def test_initial_migration_enforces_recording_duration_limit() -> None:
-    """20秒を超える録音メタデータをD1制約で拒否する。"""
-    connection = apply_migration()
+def seed_household(connection: sqlite3.Connection) -> None:
+    """テスト用の世帯とPCソースを1組作成する。"""
     connection.executescript(
         """
         INSERT INTO households VALUES ('household_demo', '2026-07-21T00:00:00Z');
         INSERT INTO sources VALUES ('source_demo', 'household_demo', 'pc', '2026-07-21T00:00:00Z');
         """
     )
-    with pytest.raises(sqlite3.IntegrityError):
-        connection.execute(
-            """
-            INSERT INTO recordings (
-              id, household_id, source_id, client_capture_id, captured_at, captured_at_original,
-              captured_at_source, captured_timezone, received_at, pre_roll_seconds, post_roll_seconds,
-              post_roll_truncated, duration_seconds, upload_status, analysis_status, review_status,
-              diary_status, image_status, created_at, updated_at
-            ) VALUES (
-              'rec_demo', 'household_demo', 'source_demo', 'capture_demo', '2026-07-21T00:00:00Z',
-              '2026-07-21T00:00:00Z', 'client_clock', 'Asia/Tokyo', '2026-07-21T00:00:00Z', 10, 5,
-              0, 20.1, 'reserved', 'pending', 'pending', 'not_started', 'not_requested',
-              '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z'
-            )
-            """
-        )
+
+
+def test_initial_migration_creates_required_phase2_tables() -> None:
+    """録音、非同期処理、利用量の永続化テーブルを作成し、外部キー検査を有効にする。"""
+    connection = apply_migration()
+    rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    table_names = {row[0] for row in rows}
+    assert {'recordings', 'async_jobs', 'usage_counters', 'device_tokens'}.issubset(table_names)
+    assert connection.execute('PRAGMA foreign_keys').fetchone() == (1,)
+
+
+def test_initial_migration_enforces_recording_duration_limit() -> None:
+    """20秒ちょうどを受理し、20秒超をduration制約で拒否する。"""
+    connection = apply_migration()
+    seed_household(connection)
+    insert_recording(connection, 'rec_boundary', 'capture_boundary', duration_seconds=20.0)
+    with pytest.raises(sqlite3.IntegrityError, match='duration_seconds'):
+        insert_recording(connection, 'rec_demo', 'capture_demo', duration_seconds=20.1)
+
+
+def test_initial_migration_enforces_capture_idempotency_key() -> None:
+    """同一世帯・ソース・client_capture_idの二重挿入をユニーク制約で拒否する。"""
+    connection = apply_migration()
+    seed_household(connection)
+    insert_recording(connection, 'rec_first', 'capture_same')
+    with pytest.raises(sqlite3.IntegrityError, match='client_capture_id'):
+        insert_recording(connection, 'rec_second', 'capture_same')
+
+
+def test_initial_migration_enforces_single_nonterminal_analysis_job() -> None:
+    """同一録音の非終端解析ジョブ二重作成を部分ユニークインデックスで拒否する。"""
+    connection = apply_migration()
+    seed_household(connection)
+    insert_recording(connection, 'rec_job', 'capture_job')
+    job_insert = """
+        INSERT INTO async_jobs (
+          id, household_id, recording_id, job_type, status, operation_number,
+          correlation_id, created_at, updated_at
+        ) VALUES (?, 'household_demo', 'rec_job', 'analysis', ?, ?, ?, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z')
+    """
+    connection.execute(job_insert, ('job_active', 'running', 1, 'cor_1'))
+    connection.execute(job_insert, ('job_done', 'failed', 2, 'cor_2'))
+    with pytest.raises(sqlite3.IntegrityError, match=r'async_jobs\.recording_id, async_jobs\.job_type'):
+        connection.execute(job_insert, ('job_duplicate', 'dispatch_pending', 3, 'cor_3'))
+
+
+def test_daily_recording_limit_trigger_rejects_31st_and_resets_next_utc_day() -> None:
+    """日次30件の31件目をUTC日単位で拒否し、翌日はリセットする。"""
+    connection = apply_migration()
+    seed_household(connection)
+    for index in range(30):
+        insert_recording(connection, f'rec_{index:02d}', f'capture_{index:02d}')
+    with pytest.raises(sqlite3.IntegrityError, match='recording_daily_limit_reached'):
+        insert_recording(connection, 'rec_30', 'capture_30')
+    assert connection.execute("SELECT used_count FROM usage_counters WHERE usage_day = '2026-07-21'").fetchone() == (30,)
+    insert_recording(connection, 'rec_next', 'capture_next', received_at='2026-07-22T00:00:00Z')
+    assert connection.execute("SELECT used_count FROM usage_counters WHERE usage_day = '2026-07-22'").fetchone() == (1,)
+
+
+def test_analysis_attempt_trigger_rejects_concurrent_running_attempt() -> None:
+    """runningなactive attemptがある間は新しい解析attemptを拒否する。"""
+    connection = apply_migration()
+    seed_household(connection)
+    insert_recording(connection, 'rec_active', 'capture_active')
+    connection.execute("UPDATE recordings SET upload_status = 'ready' WHERE id = 'rec_active'")
+    connection.execute(
+        """
+        INSERT INTO async_jobs (
+          id, household_id, recording_id, job_type, status, operation_number,
+          correlation_id, created_at, updated_at
+        ) VALUES ('job_run', 'household_demo', 'rec_active', 'analysis', 'running', 1,
+                  'cor_run', '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z')
+        """
+    )
+    attempt_insert = """
+        INSERT INTO processing_attempts (
+          id, household_id, recording_id, job_id, processing_kind, stage, attempt_number,
+          status, retryable, correlation_id, started_at
+        ) VALUES (?, 'household_demo', 'rec_active', 'job_run', 'analysis', 'mock_analysis',
+                  ?, 'running', 0, 'cor_run', '2026-07-21T00:00:00Z')
+    """
+    connection.execute(attempt_insert, ('attempt_1', 1))
+    assert connection.execute("SELECT analysis_status, active_attempt_id FROM recordings WHERE id = 'rec_active'").fetchone() == (
+        'transcribing',
+        'attempt_1',
+    )
+    with pytest.raises(sqlite3.IntegrityError, match='analysis_attempt_not_active'):
+        connection.execute(attempt_insert, ('attempt_2', 2))
 
 
 def test_delete_order_preserves_foreign_keys_and_recalculates_dictionary() -> None:
