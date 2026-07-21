@@ -368,7 +368,8 @@ app.post('/api/v1/recordings', async (c) => {
     if ((counter?.used_count ?? 0) >= 30) return responseError(c, 429, 'COST_LIMIT_REACHED', '本日のデモ上限に達しました。', false, '翌UTC日に再度お試しください。');
     return responseError(c, 500, 'RECORDING_RESERVATION_FAILED', '録音の予約に失敗しました。', true, '状態を確認してから再試行してください。');
   }
-  if ((insert.meta.changes ?? 0) !== 1) {
+  // D1のmeta.changesはBEFORE INSERTトリガー（日次上限カウンター）の書き込みを含むため、1との厳密比較はしない。
+  if ((insert.meta.changes ?? 0) === 0) {
     const raced = await envRecordingByCapture(c.env, identity, clientCaptureId);
     if (raced && raced.audio_sha256 === wav.sha256 && raced.upload_status === 'ready') return c.json(recordingResponse(raced, true, c.get('correlationId')), 200);
     if (raced && raced.audio_sha256 === wav.sha256) {

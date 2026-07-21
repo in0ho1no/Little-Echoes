@@ -392,7 +392,8 @@ export async function runDeleteWorkflow(
       )
         .bind(attemptId, job.household_id, job.recording_id, job.id, job.correlation_id, startedAt, job.recording_id, job.recording_id, DELETE_BUDGET_LIMIT)
         .run();
-      if ((reservation.meta.changes ?? 0) !== 1) throw new Error('delete attempt limit reached');
+      // トリガーがattempt挿入へ波及してもmeta.changesの厳密一致に依存しないよう、未挿入(0)だけを失敗とする。
+      if ((reservation.meta.changes ?? 0) === 0) throw new Error('delete attempt limit reached');
       try {
         const removed = await deleteDataInD1(env, job, attemptId);
         if (!removed) throw new Error('delete did not remove recording');

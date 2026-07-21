@@ -119,7 +119,8 @@ export async function runMockAnalysis(
         )
           .bind(attemptId, job.household_id, job.recording_id, job.id, job.correlation_id, attemptStartedAt, job.recording_id)
           .run();
-        reserved = (result.meta.changes ?? 0) === 1;
+        // D1のmeta.changesはBEFORE INSERTトリガー（activate_analysis_attempt）の書き込みを含むため、1との厳密比較はしない。
+        reserved = (result.meta.changes ?? 0) >= 1;
       } catch (error) {
         try {
           const committed = await env.DB.prepare('SELECT status FROM processing_attempts WHERE id = ?').bind(attemptId).first<AttemptRow>();

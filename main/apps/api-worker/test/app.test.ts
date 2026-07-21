@@ -250,6 +250,24 @@ describe('ルーターと録音API', () => {
     await expect(response.json()).resolves.toMatchObject({ code: 'UPLOAD_IN_PROGRESS' });
   });
 
+  it('録音INSERTのmeta.changesがトリガー書き込みを含んでも新規作成を成功させる', async () => {
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('FROM device_tokens')) return deviceRow();
+        if (sql.includes('client_capture_id')) return null;
+        if (sql.includes('FROM recordings r JOIN sources')) return { ...recordingRow('pending'), upload_status: 'ready' };
+        return null;
+      },
+      (sql) => {
+        if (sql.startsWith('INSERT INTO recordings')) return { meta: { changes: 2 } } as D1Result<unknown>;
+        return { meta: { changes: 1 } } as D1Result<unknown>;
+      },
+    );
+    const response = await requestWithForm(wav(), supplied);
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({ recording_id: RECORDING_ID, deduplicated: false });
+  });
+
   it('期限を超えたreserved予約をfailedへ収束させ、同じ録音を再保存する', async () => {
     const valid = wav();
     const hash = (await validateCanonicalWav(valid)).sha256;

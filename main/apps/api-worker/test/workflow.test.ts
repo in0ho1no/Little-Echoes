@@ -159,6 +159,31 @@ describe('モック解析Workflow', () => {
     expect(runs[finalizeIndex]).toContain("status IN ('dispatch_pending', 'dispatched', 'running')");
   });
 
+  it('attempt挿入のmeta.changesがトリガー書き込みを含んでも予約成功と判定する', async () => {
+    const batches: BoundStatement[][] = [];
+    const database = workflowDatabase(batches) as unknown as {
+      prepare: (sql: string) => { bind: (...values: unknown[]) => { run: () => Promise<unknown>; first: () => Promise<unknown> } };
+    };
+    const originalPrepare = database.prepare.bind(database);
+    database.prepare = (sql: string) => {
+      const statement = originalPrepare(sql);
+      if (sql.includes('INSERT INTO processing_attempts')) {
+        const originalBind = statement.bind.bind(statement);
+        statement.bind = (...values: unknown[]) => {
+          const bound = originalBind(...values);
+          bound.run = async () => ({ meta: { changes: 2 } });
+          return bound;
+        };
+      }
+      return statement;
+    };
+    const env = { DB: database as unknown as D1Database, DEMO_WRITE_ENABLED: 'true' } as Env;
+    await runMockAnalysis(env, 'job_1', async (_name, _limit, operation) => {
+      await operation();
+    });
+    expect(batches.some((batch) => batch.some((statement) => statement.sql.includes('INSERT INTO transcripts')))).toBe(true);
+  });
+
   it('全ての内容更新をactive_attempt_idとpending条件でguardする', async () => {
     const batches: BoundStatement[][] = [];
     const env = {
