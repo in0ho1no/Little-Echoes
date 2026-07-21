@@ -460,7 +460,7 @@ export async function scheduleRetentionCleanup(env: Env): Promise<void> {
     .all<DeleteTarget>();
   for (const target of due.results) {
     try {
-      await reserveDeleteJob(env, target, target.version, 'system', 'retention_scheduler', `cor_${crypto.randomUUID().replaceAll('-', '')}`);
+      await reserveDeleteJob(env, target, target.version, 'system', 'retention_scheduler', `corr_${crypto.randomUUID().replaceAll('-', '')}`);
     } catch {
       // 次回の低頻度スケジュールで同じ上限内の候補を再確認する。
     }

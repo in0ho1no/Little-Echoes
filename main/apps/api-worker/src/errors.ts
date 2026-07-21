@@ -3,7 +3,7 @@ import type { ApiErrorBody } from './types';
 export const CORRELATION_ID_HEADER = 'X-Correlation-Id';
 
 export function newCorrelationId(): string {
-  return `cor_${crypto.randomUUID().replaceAll('-', '')}`;
+  return `corr_${crypto.randomUUID().replaceAll('-', '')}`;
 }
 
 export function errorBody(

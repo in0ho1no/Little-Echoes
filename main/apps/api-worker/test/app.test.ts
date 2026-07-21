@@ -166,7 +166,7 @@ describe('ルーターと録音API', () => {
       supplied,
     );
     expect(response.status).toBe(200);
-    expect(response.headers.get('X-Correlation-Id')).toMatch(/^cor_/);
+    expect(response.headers.get('X-Correlation-Id')).toMatch(/^corr_/);
     expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(response.headers.get('Content-Security-Policy')).toContain("default-src 'self'");
   });
@@ -210,7 +210,7 @@ describe('ルーターと録音API', () => {
       }),
     );
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({ recording_id: RECORDING_ID, deduplicated: true, correlation_id: expect.stringMatching(/^cor_/) });
+    await expect(response.json()).resolves.toMatchObject({ recording_id: RECORDING_ID, deduplicated: true, correlation_id: expect.stringMatching(/^corr_/) });
   });
 
   it('同じ録音がR2保存中の場合は成功を返さない', async () => {
@@ -377,7 +377,7 @@ describe('ルーターと録音API', () => {
     expect(body).toEqual({
       async_job_id: expect.stringMatching(/^job_/),
       status: 'dispatched',
-      correlation_id: expect.stringMatching(/^cor_/),
+      correlation_id: expect.stringMatching(/^corr_/),
     });
   });
 
@@ -418,7 +418,7 @@ describe('ルーターと録音API', () => {
       supplied,
     );
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ items: [], failed_deletions: [], correlation_id: expect.stringMatching(/^cor_/) });
+    await expect(response.json()).resolves.toEqual({ items: [], failed_deletions: [], correlation_id: expect.stringMatching(/^corr_/) });
   });
 
   it('削除失敗の録音を再試行に必要なversionつきで一覧へ返す', async () => {
