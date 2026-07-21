@@ -884,7 +884,7 @@ Workflowsの`step.do()`は既定で複数回試行されるため、既定値を
 
 `client_capture_id`はクライアントがクリップ確定時に生成し、`household_id + source_id + client_capture_id`を一意にする。同じスプールデータを再送しても録音を重複作成しない。
 
-アップロード時はD1で同じ一意キーと不透明なR2キーを`reserved`として先に予約し、同じSHA-256のWAVだけを受理する。キーの再利用でハッシュが異なる場合は`IDEMPOTENCY_CONFLICT`とし、上書きしない。R2保存が成功してから`upload_status = ready`にし、失敗時は予約行を`failed`として有限回の後始末対象にする。`upload_status`が`ready`以外の録音は通常の取得・解析対象にしない。
+アップロード時はD1で同じ一意キーと不透明なR2キーを`reserved`として先に予約し、同じSHA-256のWAVだけを受理する。キーの再利用でハッシュが異なる場合は`IDEMPOTENCY_CONFLICT`とし、上書きしない。R2保存が成功してから`upload_status = ready`にし、失敗時は予約行を`failed`として有限回の後始末対象にする。`upload_status`が`ready`以外の録音は通常の取得・解析対象にしない。処理中断などで`reserved`のまま10分を超えて更新がない予約行は、次に同じ`client_capture_id`を受信した時点で`failed`へ原子的に収束させ、既存の有限回（合計3回）の再保存経路だけを許可する。収束前の予約行には`UPLOAD_IN_PROGRESS`を返す。
 
 録音日時は次の規則を守る。
 
@@ -1164,6 +1164,7 @@ POST /api/v1/recordings/{recording_id}/process
 - 完了不明のタイムアウト時は、再度このAPIを呼ぶ前に状態取得APIを確認する
 - `dispatch_pending`のままWorkflow作成結果が不明な場合は、同じ`AsyncJob.id`で作成または既存確認を再実行し、別IDのジョブを作らない
 - 遅れて完了した古い試行は`active_attempt_id`を照合し、新しい試行結果を上書きしない
+- Workflowステップは再実行され得るため、同じ`AsyncJob`の前回attemptが`running`のまま残っている場合は、ジョブが非終端であること（結果トランザクションはジョブの終端化を同一原子バッチに含むため、未コミットと同値）を条件に前回attemptを失敗として終端してから、試行予算内でのみ新しいattemptを開始する。予算枯渇時は`analysis_status = failed`へ収束させる
 - 耐久実行基盤はWorkflowsだけとし、Queuesや`ctx.waitUntil()`によるAI処理は採用しない。ただしPhase 2で詰まった場合は「Cloudflareバックエンド」に定義した縮退経路に従う
 
 ### 状態取得
@@ -1174,7 +1175,7 @@ GET /api/v1/recordings/{recording_id}
 
 PC用デバイストークンは、自身の`source_id`で作成した録音の状態だけを取得できる。管理Webユーザーは同一`household_id`の録音だけを取得できる。
 
-非終端の`AsyncJob.updated_at`が処理種別ごとの想定時間を超えて古い場合だけ、サーバーが対応するWorkflowインスタンスの状態を照合する。正常に実行中なら処理中表示を維持し、終了済みまたは存在しない場合はD1を収束させ、再試行可能性と相関IDを返す。
+非終端の`AsyncJob.updated_at`が処理種別ごとの想定時間を超えて古い場合だけ、サーバーが対応するWorkflowインスタンスの状態を照合する。想定時間は解析15分、削除24時間とする。正常に実行中なら`updated_at`を更新して処理中表示を維持し、Workflowが終了済み（ジョブが非終端のままなら結果は未コミット）の場合は実行中attemptを失敗として終端し、ジョブと`analysis_status`を`failed`へ収束させて、再試行可能性と相関IDを返す。照合自体が不明な場合は状態を変更せず、次回ポーリングで再照合する。
 
 ### 音声取得
 

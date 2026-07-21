@@ -15,22 +15,28 @@ let tokenHmac = '';
 type FirstHandler = (sql: string) => unknown;
 type RunHandler = (sql: string) => D1Result<unknown>;
 
-function fakeDatabase(first: FirstHandler, run: RunHandler = () => ({ meta: { changes: 1 } }) as D1Result<unknown>): D1Database {
+type AllHandler = (sql: string) => unknown[];
+
+function fakeDatabase(
+  first: FirstHandler,
+  run: RunHandler = () => ({ meta: { changes: 1 } }) as D1Result<unknown>,
+  allRows: AllHandler = () => [],
+): D1Database {
   return {
     prepare: (sql: string) => ({
       bind: (..._values: unknown[]) => ({
         first: async () => first(sql),
         run: async () => run(sql),
-        all: async () => ({ results: [] }),
+        all: async () => ({ results: allRows(sql) }),
       }),
     }),
     batch: async () => [],
   } as unknown as D1Database;
 }
 
-function env(first: FirstHandler, run?: RunHandler): Env {
+function env(first: FirstHandler, run?: RunHandler, allRows?: AllHandler): Env {
   return {
-    DB: fakeDatabase(first, run),
+    DB: fakeDatabase(first, run, allRows),
     PRIVATE_MEDIA: { put: async () => null } as unknown as R2Bucket,
     ANALYSIS_WORKFLOW: {
       create: async () => ({}),
@@ -212,30 +218,63 @@ describe('ルーターと録音API', () => {
     const hash = (await validateCanonicalWav(valid)).sha256;
     const response = await requestWithForm(
       valid,
-      env((sql) => {
-        if (sql.includes('FROM device_tokens')) return deviceRow();
-        if (sql.includes('client_capture_id')) {
-          return {
-            id: RECORDING_ID,
-            household_id: 'household_1',
-            source_id: 'source_1',
-            audio_sha256: hash,
-            audio_object_key: `recordings/${RECORDING_ID}.wav`,
-            analysis_status: 'pending',
-            review_status: 'pending',
-            version: 1,
-            captured_at: '2026-07-21T00:00:00.000Z',
-            captured_timezone: 'Asia/Tokyo',
-            captured_at_source: 'client_clock',
-            received_at: '2026-07-21T00:00:00.000Z',
-            upload_status: 'reserved',
-          };
-        }
-        return null;
-      }),
+      env(
+        (sql) => {
+          if (sql.includes('FROM device_tokens')) return deviceRow();
+          if (sql.includes('client_capture_id')) {
+            return {
+              id: RECORDING_ID,
+              household_id: 'household_1',
+              source_id: 'source_1',
+              audio_sha256: hash,
+              audio_object_key: `recordings/${RECORDING_ID}.wav`,
+              analysis_status: 'pending',
+              review_status: 'pending',
+              version: 1,
+              captured_at: '2026-07-21T00:00:00.000Z',
+              captured_timezone: 'Asia/Tokyo',
+              captured_at_source: 'client_clock',
+              received_at: '2026-07-21T00:00:00.000Z',
+              upload_status: 'reserved',
+            };
+          }
+          return null;
+        },
+        (sql) => {
+          if (sql.includes('updated_at <=')) return { meta: { changes: 0 } } as D1Result<unknown>;
+          return { meta: { changes: 1 } } as D1Result<unknown>;
+        },
+      ),
     );
     expect(response.status).toBe(409);
     await expect(response.json()).resolves.toMatchObject({ code: 'UPLOAD_IN_PROGRESS' });
+  });
+
+  it('期限を超えたreserved予約をfailedへ収束させ、同じ録音を再保存する', async () => {
+    const valid = wav();
+    const hash = (await validateCanonicalWav(valid)).sha256;
+    const convergeSql: string[] = [];
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('FROM device_tokens')) return deviceRow();
+        if (sql.includes('client_capture_id')) {
+          return { ...recordingRow('pending'), audio_sha256: hash, upload_status: 'reserved' };
+        }
+        if (sql.includes('FROM recordings r JOIN sources')) {
+          return { ...recordingRow('pending'), audio_sha256: hash, upload_status: 'ready' };
+        }
+        return null;
+      },
+      (sql) => {
+        if (sql.includes('updated_at <=')) convergeSql.push(sql);
+        return { meta: { changes: 1 } } as D1Result<unknown>;
+      },
+    );
+    const response = await requestWithForm(valid, supplied);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ recording_id: RECORDING_ID, deduplicated: true });
+    expect(convergeSql).toHaveLength(1);
+    expect(convergeSql[0]).toContain("upload_status = ?");
   });
 
   it('日次録音上限に達した場合は作成を拒否する', async () => {
@@ -361,7 +400,73 @@ describe('ルーターと録音API', () => {
       supplied,
     );
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ items: [], correlation_id: expect.stringMatching(/^cor_/) });
+    await expect(response.json()).resolves.toEqual({ items: [], failed_deletions: [], correlation_id: expect.stringMatching(/^cor_/) });
+  });
+
+  it('削除失敗の録音を再試行に必要なversionつきで一覧へ返す', async () => {
+    const supplied = env(
+      (sql) => (sql.includes('FROM management_principals') ? { household_id: 'household_1' } : null),
+      undefined,
+      (sql) =>
+        sql.includes("review_status = 'delete_failed'")
+          ? [{ id: RECORDING_ID, captured_at: '2026-07-21T00:00:00.000Z', captured_timezone: 'Asia/Tokyo', version: 3 }]
+          : [],
+    );
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request('https://app.example.test/api/v1/review-queue', { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+      supplied,
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      failed_deletions: [{ recording_id: RECORDING_ID, captured_at: '2026-07-21T00:00:00.000Z', version: 3 }],
+    });
+  });
+
+  it('15分更新のない解析ジョブをGETで照合し、終了済みならfailedへ収束する', async () => {
+    const staleUpdatedAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    const supplied = env((sql) => {
+      if (sql.includes('FROM device_tokens')) return deviceRow();
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('transcribing');
+      if (sql.includes('ORDER BY operation_number DESC')) {
+        return { id: 'job_stale', status: 'running', correlation_id: 'cor_stale', last_error_code: null, updated_at: staleUpdatedAt };
+      }
+      return null;
+    });
+    supplied.ANALYSIS_WORKFLOW = {
+      get: async () => ({ status: async () => ({ status: 'errored' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    const response = await app.fetch(
+      new Request(`https://ingest.example.test/api/v1/recordings/${RECORDING_ID}`, { headers: { Authorization: `Bearer ${TOKEN}` } }),
+      supplied,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json<Record<string, unknown>>();
+    expect(body.async_job).toBeUndefined();
+    expect(body.error).toMatchObject({ code: 'UPSTREAM_RESULT_UNKNOWN', retryable: false });
+  });
+
+  it('実行中と確認できた解析ジョブは収束させず処理中を返す', async () => {
+    const staleUpdatedAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    const supplied = env((sql) => {
+      if (sql.includes('FROM device_tokens')) return deviceRow();
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('transcribing');
+      if (sql.includes('ORDER BY operation_number DESC')) {
+        return { id: 'job_stale', status: 'running', correlation_id: 'cor_stale', last_error_code: null, updated_at: staleUpdatedAt };
+      }
+      return null;
+    });
+    supplied.ANALYSIS_WORKFLOW = {
+      get: async () => ({ status: async () => ({ status: 'running' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    const response = await app.fetch(
+      new Request(`https://ingest.example.test/api/v1/recordings/${RECORDING_ID}`, { headers: { Authorization: `Bearer ${TOKEN}` } }),
+      supplied,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json<Record<string, unknown>>();
+    expect(body.error).toBeUndefined();
+    expect(body.async_job).toMatchObject({ async_job_id: 'job_stale', status: 'running' });
   });
 
   it('管理削除は楽観ロックのversion不一致を拒否する', async () => {

@@ -4,9 +4,10 @@ import { authenticateDevice, authenticateManagement } from './auth';
 import { verifyAccessJwt } from './access-jwt';
 import { reserveDeleteJob } from './delete';
 import { CORRELATION_ID_HEADER, errorBody, newCorrelationId } from './errors';
-import { isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter } from './limits';
+import { isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter, UPLOAD_RESERVED_STALE_MILLISECONDS } from './limits';
 import type { DeviceIdentity, Env, ManagementIdentity } from './types';
 import { validateCanonicalWav, WavValidationError } from './wav';
+import { reconcileStaleAnalysisJob } from './workflow';
 
 type Variables = {
   correlationId: string;
@@ -39,6 +40,7 @@ interface JobRow {
   status: string;
   correlation_id: string;
   last_error_code: string | null;
+  updated_at: string;
 }
 
 interface TranscriptRow {
@@ -186,7 +188,7 @@ function acceptedJobResponse(jobIdValue: string, status: string, correlationId: 
 
 async function latestJob(env: Env, recordingIdValue: string): Promise<JobRow | null> {
   return env.DB.prepare(
-    'SELECT id, status, correlation_id, last_error_code FROM async_jobs WHERE recording_id = ? AND job_type = ? ORDER BY operation_number DESC LIMIT 1',
+    'SELECT id, status, correlation_id, last_error_code, updated_at FROM async_jobs WHERE recording_id = ? AND job_type = ? ORDER BY operation_number DESC LIMIT 1',
   )
     .bind(recordingIdValue, 'analysis')
     .first<JobRow>();
@@ -282,7 +284,21 @@ app.post('/api/v1/recordings', async (c) => {
     }
     if (existing.upload_status === 'ready') return c.json(recordingResponse(existing, true, c.get('correlationId')), 200);
     if (existing.upload_status === 'reserved') {
-      return responseError(c, 409, 'UPLOAD_IN_PROGRESS', '同じ録音を保存中です。', true, 'しばらく待ってから状態を確認してください。');
+      const reconcileNow = new Date();
+      const converged = await c.env.DB.prepare(
+        'UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ? AND upload_status = ? AND updated_at <= ?',
+      )
+        .bind(
+          'failed',
+          reconcileNow.toISOString(),
+          existing.id,
+          'reserved',
+          new Date(reconcileNow.getTime() - UPLOAD_RESERVED_STALE_MILLISECONDS).toISOString(),
+        )
+        .run();
+      if ((converged.meta.changes ?? 0) !== 1) {
+        return responseError(c, 409, 'UPLOAD_IN_PROGRESS', '同じ録音を保存中です。', true, 'しばらく待ってから状態を確認してください。');
+      }
     }
     const retry = await c.env.DB.prepare(
       'UPDATE recordings SET upload_status = ?, upload_attempt_count = upload_attempt_count + 1, updated_at = ? WHERE id = ? AND upload_status = ? AND upload_attempt_count < 3',
@@ -525,9 +541,24 @@ app.get('/api/v1/recordings/:id', async (c) => {
   const host = requestHost(c.req.raw);
   const identity = host === c.env.INGEST_HOST ? await deviceIdentity(c) : await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  const recording = 'sourceId' in identity ? await findDeviceRecording(c.env, identity, c.req.param('id')) : await findManagementRecording(c.env, identity, c.req.param('id'));
+  let recording = 'sourceId' in identity ? await findDeviceRecording(c.env, identity, c.req.param('id')) : await findManagementRecording(c.env, identity, c.req.param('id'));
   if (!recording || !['pending', 'approved'].includes(recording.review_status)) return responseError(c, 404, 'NOT_FOUND', '対象の録音は見つかりません。');
-  const job = await latestJob(c.env, recording.id);
+  let job = await latestJob(c.env, recording.id);
+  if (job && ['dispatched', 'running'].includes(job.status)) {
+    const reconciled = await reconcileStaleAnalysisJob(c.env, {
+      id: job.id,
+      status: job.status,
+      updated_at: job.updated_at,
+      recording_id: recording.id,
+      household_id: recording.household_id,
+    });
+    if (reconciled === 'converged') {
+      job = { ...job, status: 'failed', last_error_code: 'UPSTREAM_RESULT_UNKNOWN' };
+      const refreshed =
+        'sourceId' in identity ? await findDeviceRecording(c.env, identity, recording.id) : await findManagementRecording(c.env, identity, recording.id);
+      recording = refreshed ?? recording;
+    }
+  }
   const body: Record<string, unknown> = {
     recording_id: recording.id,
     analysis_status: recording.analysis_status,
@@ -674,7 +705,23 @@ app.get('/api/v1/review-queue', async (c) => {
       parent_note: recording.draft_parent_note,
     };
   });
-  return c.json({ items, correlation_id: c.get('correlationId') });
+  const failedDeletions = await c.env.DB.prepare(
+    `SELECT id, captured_at, captured_timezone, version FROM recordings
+      WHERE household_id = ? AND review_status = 'delete_failed'
+      ORDER BY captured_at DESC, created_at DESC LIMIT 20`,
+  )
+    .bind(identity.householdId)
+    .all<{ id: string; captured_at: string; captured_timezone: string; version: number }>();
+  return c.json({
+    items,
+    failed_deletions: failedDeletions.results.map((recording) => ({
+      recording_id: recording.id,
+      captured_at: recording.captured_at,
+      captured_timezone: recording.captured_timezone,
+      version: recording.version,
+    })),
+    correlation_id: c.get('correlationId'),
+  });
 });
 
 app.get('/', async (c) => {
@@ -698,7 +745,7 @@ app.get('/recordings/:id', async (c) => {
 app.get('/assets/review.js', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  const script = `fetch('/api/v1/review-queue').then(r=>{if(!r.ok)throw new Error('request failed');return r.json()}).then(data=>{const list=document.getElementById('recordings');document.getElementById('status').textContent=data.items.length?'確認待ちの録音です。':'確認待ちの録音はありません。';for(const item of data.items){const recording=item.recording;if(!/^rec_[a-z0-9]{32}$/.test(recording.recording_id))continue;const li=document.createElement('li');const link=document.createElement('a');link.href='/recordings/'+encodeURIComponent(recording.recording_id);link.textContent=recording.captured_at+' — '+recording.analysis_status;li.append(link);list.append(li)}}).catch(()=>{document.getElementById('status').textContent='読み込みに失敗しました。再読み込みしてください。'});`;
+  const script = `fetch('/api/v1/review-queue').then(r=>{if(!r.ok)throw new Error('request failed');return r.json()}).then(data=>{const list=document.getElementById('recordings');document.getElementById('status').textContent=data.items.length?'確認待ちの録音です。':'確認待ちの録音はありません。';for(const item of data.items){const recording=item.recording;if(!/^rec_[a-z0-9]{32}$/.test(recording.recording_id))continue;const li=document.createElement('li');const link=document.createElement('a');link.href='/recordings/'+encodeURIComponent(recording.recording_id);link.textContent=recording.captured_at+' — '+recording.analysis_status;li.append(link);list.append(li)}const failed=data.failed_deletions||[];for(const target of failed){if(!/^rec_[a-z0-9]{32}$/.test(target.recording_id))continue;const li=document.createElement('li');li.textContent='削除に失敗した録音（'+target.captured_at+'）: ';const button=document.createElement('button');button.type='button';button.textContent='削除を再試行';button.addEventListener('click',()=>{button.disabled=true;fetch('/api/v1/recordings/'+encodeURIComponent(target.recording_id),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:target.version})}).then(r=>{if(!r.ok)throw new Error('delete failed');location.reload()}).catch(()=>{button.disabled=false;document.getElementById('status').textContent='削除の再試行に失敗しました。時間をおいて再度お試しください。'})});li.append(button);list.append(li)}}).catch(()=>{document.getElementById('status').textContent='読み込みに失敗しました。再読み込みしてください。'});`;
   return new Response(script, {
     headers: {
       'Content-Type': 'application/javascript; charset=utf-8',

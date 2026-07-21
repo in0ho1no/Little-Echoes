@@ -20,6 +20,7 @@ export async function verifyAccessJwtWithKeySet(
     const { payload } = await jwtVerify(assertion, jwks, {
       issuer,
       audience,
+      algorithms: ['RS256'],
       requiredClaims: ['iss', 'aud', 'exp', 'sub'],
     });
     const subject = typeof payload.sub === 'string' && payload.sub.length > 0 && payload.sub.length <= 256 ? payload.sub : null;

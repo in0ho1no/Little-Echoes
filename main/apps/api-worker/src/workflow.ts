@@ -1,6 +1,6 @@
 import { WorkflowEntrypoint } from 'cloudflare:workers';
 
-import { isDemoWriteAllowed } from './limits';
+import { ANALYSIS_STALE_MILLISECONDS, isDemoWriteAllowed } from './limits';
 import type { Env, WorkflowParams } from './types';
 
 const MOCK_TRANSCRIPT = 'りんご、たべたい';
@@ -96,6 +96,17 @@ export async function runMockAnalysis(
 
       const attemptId = `attempt_${crypto.randomUUID().replaceAll('-', '')}`;
       const attemptStartedAt = new Date().toISOString();
+      // ジョブ終端化は結果書き込みと同一の原子バッチに含まれるため、
+      // ジョブが非終端のまま残るrunning attemptは結果未コミットと判定してよい。
+      await env.DB.prepare(
+        `UPDATE processing_attempts SET status = 'failed', error_code = 'STEP_REEXECUTED', retryable = 0, finished_at = ?
+          WHERE job_id = ? AND processing_kind = 'analysis' AND status = 'running'
+            AND EXISTS (
+              SELECT 1 FROM async_jobs WHERE id = ? AND status IN ('dispatch_pending', 'dispatched', 'running')
+            )`,
+      )
+        .bind(attemptStartedAt, job.id, job.id)
+        .run();
       let reserved = false;
       try {
         const result = await env.DB.prepare(
@@ -223,6 +234,58 @@ export async function runMockAnalysis(
     } else {
       await failBeforeAttempt(env, job, 'MOCK_ANALYSIS_FAILED', failedAt);
     }
+  }
+}
+
+export interface StaleJobRow {
+  id: string;
+  status: string;
+  updated_at: string;
+  recording_id: string;
+  household_id: string;
+}
+
+export async function reconcileStaleAnalysisJob(env: Env, job: StaleJobRow, now = new Date()): Promise<'active' | 'converged' | 'unknown'> {
+  if (!['dispatched', 'running'].includes(job.status)) return 'active';
+  const updatedAtMilliseconds = Date.parse(job.updated_at);
+  if (!Number.isFinite(updatedAtMilliseconds) || now.getTime() - updatedAtMilliseconds < ANALYSIS_STALE_MILLISECONDS) return 'active';
+  const nowText = now.toISOString();
+  try {
+    const instance = await env.ANALYSIS_WORKFLOW.get(job.id);
+    const observed = await instance.status();
+    const status = typeof observed?.status === 'string' ? observed.status : 'unknown';
+    if (['queued', 'running', 'paused', 'waiting', 'waitingForPause'].includes(status)) {
+      await env.DB.prepare(`UPDATE async_jobs SET updated_at = ? WHERE id = ? AND status IN ('dispatched', 'running')`)
+        .bind(nowText, job.id)
+        .run()
+        .catch(() => undefined);
+      return 'active';
+    }
+    if (['complete', 'errored', 'terminated'].includes(status)) {
+      // Workflowが終了済みでジョブが非終端なら、結果バッチは未コミット（同一原子バッチのため）。
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE processing_attempts SET status = 'failed', error_code = 'UPSTREAM_RESULT_UNKNOWN', retryable = 0, finished_at = ?
+            WHERE job_id = ? AND processing_kind = 'analysis' AND status = 'running'`,
+        ).bind(nowText, job.id),
+        env.DB.prepare(
+          `UPDATE async_jobs SET status = 'failed', last_error_code = 'UPSTREAM_RESULT_UNKNOWN', finished_at = ?, updated_at = ?
+            WHERE id = ? AND status IN ('dispatched', 'running')`,
+        ).bind(nowText, nowText, job.id),
+        env.DB.prepare(
+          `UPDATE recordings SET analysis_status = 'failed', updated_at = ?
+            WHERE id = ? AND household_id = ? AND review_status = 'pending'
+              AND NOT EXISTS (
+                SELECT 1 FROM processing_attempts active
+                 WHERE active.id = recordings.active_attempt_id AND active.status = 'running'
+              )`,
+        ).bind(nowText, job.recording_id, job.household_id),
+      ]);
+      return 'converged';
+    }
+    return 'unknown';
+  } catch {
+    return 'unknown';
   }
 }
 
