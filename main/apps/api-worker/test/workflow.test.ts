@@ -38,7 +38,7 @@ function workflowDatabase(batches: BoundStatement[][]): D1Database {
   } as unknown as D1Database;
 }
 
-function staleEnv(options: { observedStatus?: string; statusThrows?: boolean } = {}): {
+function staleEnv(options: { observedStatus?: string; statusThrows?: boolean; jobAlreadyTerminal?: boolean } = {}): {
   env: Env;
   batches: string[][];
   runs: string[];
@@ -61,7 +61,9 @@ function staleEnv(options: { observedStatus?: string; statusThrows?: boolean } =
       }),
       batch: async (statements: { sql: string }[]) => {
         batches.push(statements.map((statement) => statement.sql));
-        return statements.map(() => ({ meta: { changes: 1 } }));
+        return statements.map((statement) => ({
+          meta: { changes: options.jobAlreadyTerminal && statement.sql.includes("UPDATE async_jobs SET status = 'failed'") ? 0 : 1 },
+        }));
       },
     } as unknown as D1Database,
     ANALYSIS_WORKFLOW: {
@@ -102,6 +104,14 @@ describe('解析ジョブの収束', () => {
     expect(sql).toContain("UPDATE processing_attempts SET status = 'failed'");
     expect(sql).toContain("UPDATE async_jobs SET status = 'failed'");
     expect(sql).toContain("UPDATE recordings SET analysis_status = 'failed'");
+    const recordingsSql = batches.flat().find((statement) => statement.includes('UPDATE recordings')) ?? '';
+    expect(recordingsSql).toContain("EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed')");
+  });
+
+  it('ジョブ終端化が成立しなかった場合はconvergedを返さない', async () => {
+    const { env } = staleEnv({ observedStatus: 'errored', jobAlreadyTerminal: true });
+    const stale = { ...STALE_JOB, updated_at: new Date(Date.now() - 16 * 60 * 1000).toISOString() };
+    await expect(reconcileStaleAnalysisJob(env, stale)).resolves.toBe('active');
   });
 
   it('実行中を確認したらupdated_atだけを更新して処理中を維持する', async () => {
@@ -122,6 +132,36 @@ describe('解析ジョブの収束', () => {
 });
 
 describe('モック解析Workflow', () => {
+  it('実行前失敗でも同一ジョブのrunning attemptを同時に終端する', async () => {
+    const batches: string[][] = [];
+    const database = {
+      prepare: (sql: string) => ({
+        bind: () => ({
+          sql,
+          first: async () => {
+            if (sql.includes('FROM async_jobs WHERE id')) {
+              return { id: 'job_1', recording_id: 'rec_1', household_id: 'household_1', correlation_id: 'corr_1', operation_number: 1, status: 'dispatched' };
+            }
+            return null;
+          },
+          run: async () => ({ meta: { changes: 1 } }),
+        }),
+      }),
+      batch: async (statements: { sql: string }[]) => {
+        batches.push(statements.map((statement) => statement.sql));
+        return statements.map(() => ({ meta: { changes: 1 } }));
+      },
+    } as unknown as D1Database;
+    const env = { DB: database, DEMO_WRITE_ENABLED: 'false' } as Env;
+    await runMockAnalysis(env, 'job_1', async () => {
+      throw new Error('ステップは呼ばれない想定');
+    });
+    const sql = batches.flat().join('\n');
+    expect(sql).toContain("UPDATE processing_attempts SET status = 'failed'");
+    expect(sql).toContain("job_id = ?");
+    expect(sql).toContain("UPDATE async_jobs SET status = 'failed'");
+  });
+
   it('ステップ再実行時は前回のrunning attemptを終端してから新attemptを予約する', async () => {
     const runs: string[] = [];
     const database = {

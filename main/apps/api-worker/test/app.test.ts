@@ -30,7 +30,7 @@ function fakeDatabase(
         all: async () => ({ results: allRows(sql) }),
       }),
     }),
-    batch: async () => [],
+    batch: async (statements: unknown[]) => statements.map(() => ({ meta: { changes: 1 } })),
   } as unknown as D1Database;
 }
 
@@ -462,6 +462,47 @@ describe('ルーターと録音API', () => {
     const body = await response.json<Record<string, unknown>>();
     expect(body.async_job).toBeUndefined();
     expect(body.error).toMatchObject({ code: 'UPSTREAM_RESULT_UNKNOWN', retryable: false });
+  });
+
+  it('15分停止したdispatch_pendingジョブは同一IDでWorkflow作成を再確認する', async () => {
+    const staleUpdatedAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    const createdIds: string[] = [];
+    const supplied = env((sql) => {
+      if (sql.includes('FROM device_tokens')) return deviceRow();
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('pending');
+      if (sql.includes('ORDER BY operation_number DESC')) {
+        return { id: 'job_pending', status: 'dispatch_pending', correlation_id: 'corr_pending', last_error_code: null, updated_at: staleUpdatedAt };
+      }
+      return null;
+    });
+    supplied.ANALYSIS_WORKFLOW = {
+      create: async (options: { id?: string }) => {
+        createdIds.push(options.id ?? '');
+      },
+    } as unknown as Workflow<{ async_job_id: string }>;
+    const response = await app.fetch(
+      new Request(`https://ingest.example.test/api/v1/recordings/${RECORDING_ID}`, { headers: { Authorization: `Bearer ${TOKEN}` } }),
+      supplied,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json<Record<string, unknown>>();
+    expect(createdIds).toEqual(['job_pending']);
+    expect(body.async_job).toMatchObject({ async_job_id: 'job_pending', status: 'dispatched' });
+  });
+
+  it('review.jsスクリプトが削除再試行に必要な要素を含む', async () => {
+    const supplied = env((sql) => (sql.includes('FROM management_principals') ? { household_id: 'household_1' } : null));
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request('https://app.example.test/assets/review.js', { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+      supplied,
+    );
+    const script = await response.text();
+    expect(script).toContain('failed_deletions');
+    expect(script).toContain("method:'DELETE'");
+    expect(script).toContain('JSON.stringify({version:target.version})');
+    expect(script).toContain('/^rec_[a-z0-9]{32}$/');
+    expect(script).toContain('button.disabled=false');
   });
 
   it('実行中と確認できた解析ジョブは収束させず処理中を返す', async () => {

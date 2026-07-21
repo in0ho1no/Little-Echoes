@@ -24,6 +24,12 @@ interface AttemptRow {
 
 async function failBeforeAttempt(env: Env, job: JobRow, code: string, at: string): Promise<void> {
   await env.DB.batch([
+    // 同一ジョブのrunning attemptはこのジョブの失敗と同時に終端しないと、
+    // recordingsのactive attemptガードが恒久的に成立し続けて収束経路がなくなる。
+    env.DB.prepare(
+      `UPDATE processing_attempts SET status = 'failed', error_code = ?, retryable = 0, finished_at = ?
+        WHERE job_id = ? AND processing_kind = 'analysis' AND status = 'running'`,
+    ).bind(code, at, job.id),
     env.DB.prepare(
       `UPDATE async_jobs SET status = 'failed', last_error_code = ?, finished_at = ?, updated_at = ?
         WHERE id = ? AND status IN ('dispatch_pending', 'dispatched', 'running')`,
@@ -264,11 +270,14 @@ export async function reconcileStaleAnalysisJob(env: Env, job: StaleJobRow, now 
     }
     if (['complete', 'errored', 'terminated'].includes(status)) {
       // Workflowが終了済みでジョブが非終端なら、結果バッチは未コミット（同一原子バッチのため）。
-      await env.DB.batch([
+      // recordings更新はこのバッチでのジョブ終端化成立に連動させ、並行して着地した
+      // succeeded結果を`failed`で上書きしないようにする。
+      const results = await env.DB.batch([
         env.DB.prepare(
           `UPDATE processing_attempts SET status = 'failed', error_code = 'UPSTREAM_RESULT_UNKNOWN', retryable = 0, finished_at = ?
-            WHERE job_id = ? AND processing_kind = 'analysis' AND status = 'running'`,
-        ).bind(nowText, job.id),
+            WHERE job_id = ? AND processing_kind = 'analysis' AND status = 'running'
+              AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status IN ('dispatched', 'running'))`,
+        ).bind(nowText, job.id, job.id),
         env.DB.prepare(
           `UPDATE async_jobs SET status = 'failed', last_error_code = 'UPSTREAM_RESULT_UNKNOWN', finished_at = ?, updated_at = ?
             WHERE id = ? AND status IN ('dispatched', 'running')`,
@@ -276,13 +285,14 @@ export async function reconcileStaleAnalysisJob(env: Env, job: StaleJobRow, now 
         env.DB.prepare(
           `UPDATE recordings SET analysis_status = 'failed', updated_at = ?
             WHERE id = ? AND household_id = ? AND review_status = 'pending'
+              AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed')
               AND NOT EXISTS (
                 SELECT 1 FROM processing_attempts active
                  WHERE active.id = recordings.active_attempt_id AND active.status = 'running'
               )`,
-        ).bind(nowText, job.recording_id, job.household_id),
+        ).bind(nowText, job.recording_id, job.household_id, job.id),
       ]);
-      return 'converged';
+      return (results[1]?.meta.changes ?? 0) === 1 ? 'converged' : 'active';
     }
     return 'unknown';
   } catch {

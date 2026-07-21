@@ -4,7 +4,7 @@ import { authenticateDevice, authenticateManagement } from './auth';
 import { verifyAccessJwt } from './access-jwt';
 import { reserveDeleteJob } from './delete';
 import { CORRELATION_ID_HEADER, errorBody, newCorrelationId } from './errors';
-import { isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter, UPLOAD_RESERVED_STALE_MILLISECONDS } from './limits';
+import { ANALYSIS_STALE_MILLISECONDS, isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter, UPLOAD_RESERVED_STALE_MILLISECONDS } from './limits';
 import type { DeviceIdentity, Env, ManagementIdentity } from './types';
 import { validateCanonicalWav, WavValidationError } from './wav';
 import { reconcileStaleAnalysisJob } from './workflow';
@@ -311,11 +311,11 @@ app.post('/api/v1/recordings', async (c) => {
     try {
       await c.env.PRIVATE_MEDIA.put(existing.audio_object_key, wav.bytes, { httpMetadata: { contentType: 'audio/wav' } });
       const completedAt = new Date().toISOString();
-      await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ?').bind('ready', completedAt, existing.id).run();
+      await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ? AND upload_status = ?').bind('ready', completedAt, existing.id, 'reserved').run();
       const retried = await findDeviceRecording(c.env, identity, existing.id);
       return retried ? c.json(recordingResponse(retried, true, c.get('correlationId')), 200) : responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '録音状態を取得できません。', true);
     } catch {
-      await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ?').bind('failed', new Date().toISOString(), existing.id).run();
+      await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ? AND upload_status = ?').bind('failed', new Date().toISOString(), existing.id, 'reserved').run();
       return responseError(c, 500, 'MEDIA_STORAGE_FAILED', '音声の保存に失敗しました。', true, '接続を確認して同じ録音を再送してください。');
     }
   }
@@ -386,9 +386,9 @@ app.post('/api/v1/recordings', async (c) => {
       .run();
     if ((reserveAttempt.meta.changes ?? 0) !== 1) throw new Error('upload attempt reservation failed');
     await c.env.PRIVATE_MEDIA.put(key, wav.bytes, { httpMetadata: { contentType: 'audio/wav' } });
-    await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ?').bind('ready', new Date().toISOString(), id).run();
+    await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ? AND upload_status = ?').bind('ready', new Date().toISOString(), id, 'reserved').run();
   } catch {
-    await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ?').bind('failed', new Date().toISOString(), id).run();
+    await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ? AND upload_status = ?').bind('failed', new Date().toISOString(), id, 'reserved').run();
     return responseError(c, 500, 'MEDIA_STORAGE_FAILED', '音声の保存に失敗しました。', true, '接続を確認して同じ録音を再送してください。');
   }
   const created = await findDeviceRecording(c.env, identity, id);
@@ -545,6 +545,14 @@ app.get('/api/v1/recordings/:id', async (c) => {
   let recording = 'sourceId' in identity ? await findDeviceRecording(c.env, identity, c.req.param('id')) : await findManagementRecording(c.env, identity, c.req.param('id'));
   if (!recording || !['pending', 'approved'].includes(recording.review_status)) return responseError(c, 404, 'NOT_FOUND', '対象の録音は見つかりません。');
   let job = await latestJob(c.env, recording.id);
+  if (job && job.status === 'dispatch_pending') {
+    const pendingSince = Date.parse(job.updated_at);
+    if (Number.isFinite(pendingSince) && Date.now() - pendingSince >= ANALYSIS_STALE_MILLISECONDS) {
+      const dispatch = await ensureAnalysisWorkflow(c.env, job.id);
+      if (dispatch === 'dispatched') job = { ...job, status: 'dispatched' };
+      else if (dispatch === 'failed') job = { ...job, status: 'failed', last_error_code: job.last_error_code ?? 'WORKFLOW_DISPATCH_FAILED' };
+    }
+  }
   if (job && ['dispatched', 'running'].includes(job.status)) {
     const reconciled = await reconcileStaleAnalysisJob(c.env, {
       id: job.id,
