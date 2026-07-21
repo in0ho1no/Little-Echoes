@@ -144,6 +144,8 @@ CREATE TABLE async_jobs (
   job_type TEXT NOT NULL CHECK (job_type IN ('analysis','diary','image','delete')),
   status TEXT NOT NULL CHECK (status IN ('dispatch_pending','dispatched','running','succeeded','failed')),
   workflow_instance_id TEXT, operation_number INTEGER NOT NULL CHECK (operation_number > 0),
+  dispatch_reconcile_count INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_reconcile_count BETWEEN 0 AND 3),
+  dispatch_lease_until TEXT,
   correlation_id TEXT NOT NULL, last_error_code TEXT, created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
   UNIQUE (recording_id, job_type, operation_number), UNIQUE (household_id, id),
@@ -195,9 +197,11 @@ CREATE TABLE recording_tombstones (
 | OpenAI呼出し直前 | 期限/キルスイッチ/有効試行を再確認し、`ProcessingAttempt`をちょうど1件作成または更新し、利用量を予約する。トランザクション失敗時はOpenAIを呼ばない |
 | 確認保存/承認 | `UPDATE ... WHERE id=? AND household_id=? AND version=?`、文字起こし/発話/辞典集計の再計算、監査イベント、バージョン加算をまとめる。下書きの`scene`/`parent_note`は`recordings.draft_scene`/`draft_parent_note`へ保存し、承認時に確定値を`DiaryEntry`へコピーする。将来の下書き項目も`draft_`接頭辞の列として同じ規則で扱う |
 | 画像置換 | バージョン確認、上限/ジョブ予約、R2成功後にだけ新画像を有効化し旧画像を無効化 |
-| 削除 | 直ちに非表示化し有効試行を無効化。削除Workflowは内容を持つ子行と`Recording`を削除し、`recording_tombstones(recording_id, household_id, review_status, deleted_at)`だけを挿入 |
+| 削除 | 直ちに非表示化し、実行中の解析・日記・画像試行を非再試行の失敗へ無効化する。削除Workflowは内容を持つ子行と`Recording`を削除し、`recording_tombstones(recording_id, household_id, review_status, deleted_at)`だけを挿入 |
 
-`DictionaryWord`の初出項目と各`WordOccurrence.is_first`は、承認または日時編集のトランザクションで`(spoken_at, recordings.created_at, recording_id)`により再計算する。クライアントが送る`is_first`、上限、状態、世帯、R2キーは信用しない。
+`DictionaryWord`の初出項目と各`WordOccurrence.is_first`は、承認、日時編集、削除のトランザクションで`(recordings.captured_at, recordings.created_at, recording_id)`により再計算する。クライアントが送る`is_first`、上限、状態、世帯、R2キーは信用しない。削除Workflowの起動結果が不明な場合は同じ`AsyncJob.id`だけを最大3回照合し、3回とも不明なら録音を非表示のまま隔離して自動操作を停止する。`DELETE_WORKFLOW_DISPATCH_QUARANTINED`を運用確認対象として残し、自動的に削除済みとは扱わない。連続照合回数と短い排他期限をD1へ保存する。`queued`/`running`などの非終端状態が24時間継続した削除Workflowは、旧インスタンスの終了を確認してから失敗へ収束させる。終了結果が不明ならleaseを保持して重複終了要求を防ぎ、3回で同様に隔離する。
+
+削除の総予算3回は、削除`ProcessingAttempt`数と、削除本体へ到達せず失敗した削除`AsyncJob`数の合計で原子的に判定する。予算枯渇後は新しいジョブを作らず、期限削除の候補クエリからも除外して後続候補を妨げない。日次処理は最大10件とし、そのうち既存ジョブの再調停を最大5件へ制限する。再調停した録音は同じ日次処理の期限候補から除外し、新たな期限削除へ毎回5件以上の枠を確保する。削除要求そのものは`AuditEvent`へ保存せず、録音日時変更だけを監査対象とする。
 
 ## オブジェクト保存と保持
 

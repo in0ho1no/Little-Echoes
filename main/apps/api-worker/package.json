@@ -1,0 +1,22 @@
+{
+  "name": "little-echoes-api-worker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "pnpm run types && tsc --noEmit",
+    "types": "wrangler types --config wrangler.template.toml --env-interface CloudflareBindings"
+  },
+  "dependencies": {
+    "hono": "4.12.7",
+    "jose": "6.1.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "4.1.0",
+    "wrangler": "4.112.0"
+  },
+  "packageManager": "pnpm@10.34.5"
+}

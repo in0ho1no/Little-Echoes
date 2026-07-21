@@ -27,6 +27,7 @@ CREATE TABLE recordings (
   duration_seconds REAL NOT NULL CHECK (duration_seconds > 0 AND duration_seconds <= 20),
   audio_object_key TEXT, audio_sha256 TEXT CHECK (audio_sha256 IS NULL OR length(audio_sha256) = 64),
   upload_status TEXT NOT NULL CHECK (upload_status IN ('reserved','ready','failed')),
+  upload_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (upload_attempt_count BETWEEN 0 AND 3),
   analysis_status TEXT NOT NULL CHECK (analysis_status IN ('pending','transcribing','extracting_words','ready','partial','failed')),
   review_status TEXT NOT NULL CHECK (review_status IN ('pending','approved','deleting','delete_failed','deleted')),
   draft_scene TEXT CHECK (draft_scene IS NULL OR length(draft_scene) <= 300),
@@ -83,6 +84,8 @@ CREATE TABLE async_jobs (
   job_type TEXT NOT NULL CHECK (job_type IN ('analysis','diary','image','delete')),
   status TEXT NOT NULL CHECK (status IN ('dispatch_pending','dispatched','running','succeeded','failed')),
   workflow_instance_id TEXT, operation_number INTEGER NOT NULL CHECK (operation_number > 0),
+  dispatch_reconcile_count INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_reconcile_count BETWEEN 0 AND 3),
+  dispatch_lease_until TEXT,
   correlation_id TEXT NOT NULL, last_error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   started_at TEXT, finished_at TEXT, UNIQUE (recording_id, job_type, operation_number), UNIQUE (household_id, id),
   FOREIGN KEY (household_id, recording_id) REFERENCES recordings(household_id, id)
@@ -106,6 +109,41 @@ CREATE TABLE usage_counters (
   updated_at TEXT NOT NULL, PRIMARY KEY (counter_key, usage_day),
   CHECK ((scope = 'image_lifetime' AND usage_day = 'lifetime') OR (scope <> 'image_lifetime' AND usage_day GLOB '????-??-??'))
 );
+CREATE TRIGGER reserve_demo_recording_limit
+BEFORE INSERT ON recordings
+BEGIN
+  INSERT INTO usage_counters (counter_key, household_id, scope, usage_day, used_count, reserved_count, updated_at)
+  VALUES ('demo-global:recording_create', NULL, 'recording_create', substr(NEW.received_at, 1, 10), 1, 0, NEW.created_at)
+  ON CONFLICT(counter_key, usage_day) DO UPDATE
+    SET used_count = used_count + 1, updated_at = excluded.updated_at
+    WHERE used_count < 30;
+  SELECT CASE WHEN changes() <> 1 THEN RAISE(ABORT, 'recording_daily_limit_reached') END;
+END;
+CREATE TRIGGER activate_analysis_attempt
+BEFORE INSERT ON processing_attempts
+WHEN NEW.processing_kind = 'analysis'
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1
+      FROM recordings r
+      JOIN async_jobs j
+        ON j.id = NEW.job_id
+       AND j.recording_id = NEW.recording_id
+       AND j.household_id = NEW.household_id
+     WHERE r.id = NEW.recording_id
+       AND r.household_id = NEW.household_id
+       AND r.upload_status = 'ready'
+       AND r.review_status = 'pending'
+       AND j.status IN ('dispatch_pending', 'dispatched', 'running')
+       AND NOT EXISTS (
+         SELECT 1 FROM processing_attempts active
+          WHERE active.id = r.active_attempt_id AND active.status = 'running'
+       )
+  ) THEN RAISE(ABORT, 'analysis_attempt_not_active') END;
+  UPDATE recordings
+     SET analysis_status = 'transcribing', active_attempt_id = NEW.id, updated_at = NEW.started_at
+   WHERE id = NEW.recording_id AND household_id = NEW.household_id AND review_status = 'pending';
+END;
 CREATE TABLE audit_events (
   id TEXT PRIMARY KEY, household_id TEXT NOT NULL REFERENCES households(id), recording_id TEXT,
   event_type TEXT NOT NULL, actor_type TEXT NOT NULL CHECK (actor_type IN ('management_user','device','system')),
