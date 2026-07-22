@@ -38,8 +38,11 @@ function allowedForApproval(target: ReviewTarget): boolean {
   return ['pending', 'approved'].includes(target.reviewStatus) && ['ready', 'partial', 'failed'].includes(target.analysisStatus);
 }
 
-function recordingGuard(reviewStates: string): string {
-  return `id = ? AND household_id = ? AND version = ? AND review_status IN (${reviewStates})`;
+// JOINを含む文ではalias必須。非修飾のid/household_idは結合相手と衝突して
+// "ambiguous column name"になる（実D1で顕在化）。
+function recordingGuard(reviewStates: string, alias = ''): string {
+  const prefix = alias ? `${alias}.` : '';
+  return `${prefix}id = ? AND ${prefix}household_id = ? AND ${prefix}version = ? AND ${prefix}review_status IN (${reviewStates})`;
 }
 
 // 楽観ロック不成立時にNOT NULL違反でバッチ全体を中止する番兵。後続文の
@@ -243,7 +246,7 @@ export async function approveReview(
         `INSERT INTO word_occurrences (id, household_id, recording_id, dictionary_word_id, surface, spoken_at, new_override, is_first, created_at, updated_at)
          SELECT ?, r.household_id, r.id, dw.id, ?, r.captured_at, ?, 0, ?, ?
            FROM recordings r JOIN dictionary_words dw ON dw.household_id = r.household_id AND dw.normalized = ?
-          WHERE ${updatedGuard}`,
+          WHERE ${recordingGuard("'approved'", 'r')}`,
       ).bind(opaqueId('occurrence'), word.displayName, word.newOverride, now, now, word.normalized, target.id, target.householdId, nextVersion),
     );
   }
