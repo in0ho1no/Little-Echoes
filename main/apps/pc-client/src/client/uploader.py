@@ -20,6 +20,10 @@ TransportResponse = tuple[int, bytes]
 Transport = Callable[[urllib.request.Request], TransportResponse]
 MAX_AUTOMATIC_ATTEMPTS = 2
 RECORDING_ID_PATTERN = re.compile(r'rec_[A-Za-z0-9_-]+')
+# 既定のPython-urllib UAはCloudflareのBrowser Integrity Check/Bot Fight Modeに
+# 既知のボットシグネチャとして遮断され、Workerへ到達する前に1010で拒否される
+# （実機確認2026-07-22で発覚）。固有のUAで到達を保証する。
+USER_AGENT = 'LittleEchoesPcClient/1.0'
 
 
 class UploadRejectedError(Exception):
@@ -82,7 +86,7 @@ class DeviceApiClient:
         self._transport = transport or _default_transport
 
     def _request(self, method: str, path: str, body: bytes | None, content_type: str | None) -> tuple[int, dict[str, object]]:
-        headers: dict[str, str] = {'Authorization': f'Bearer {self._token}'}
+        headers: dict[str, str] = {'Authorization': f'Bearer {self._token}', 'User-Agent': USER_AGENT}
         if content_type:
             headers['Content-Type'] = content_type
         if body is not None:

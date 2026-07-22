@@ -208,6 +208,20 @@ def test_token_only_in_authorization_header_and_https_enforced(tmp_path: Path) -
         DeviceApiClient('https://ingest.example.test/unexpected-path', TOKEN)
 
 
+def test_requests_carry_a_non_default_user_agent(tmp_path: Path) -> None:
+    """固有のUser-Agentを全要求へ付与する。
+
+    既定のPython-urllib UAはCloudflareのBrowser Integrity Checkに遮断される
+    (実機確認2026-07-22でエラーコード1010を確認)。
+    """
+    transport = FakeTransport([(201, b'{"recording_id":"rec_' + b'd' * 32 + b'"}')])
+    api = client_with(transport)
+    api.upload(b'RIFFwav', metadata())
+    user_agent = transport.requests[0].get_header('User-agent')
+    assert user_agent is not None
+    assert 'python-urllib' not in user_agent.lower()
+
+
 def test_retry_budget_survives_restart(tmp_path: Path) -> None:
     """通信途中で終了しても、自動アップロードは初回を含め合計2回を超えない。"""
     spool = Spool(tmp_path)
