@@ -1,0 +1,39 @@
+name = "little-echoes-api"
+main = "src/index.ts"
+compatibility_date = "2026-07-21"
+workers_dev = false
+
+# 実ID・ホスト名・Secretはこのテンプレートへ書き込まない。
+
+[[d1_databases]]
+binding = "DB"
+database_name = "little-echoes-demo"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "PRIVATE_MEDIA"
+bucket_name = "little-echoes-demo-media"
+
+[[workflows]]
+binding = "ANALYSIS_WORKFLOW"
+name = "little-echoes-analysis"
+class_name = "AnalysisWorkflow"
+
+[[workflows]]
+binding = "DELETE_WORKFLOW"
+name = "little-echoes-delete"
+class_name = "DeleteWorkflow"
+
+[triggers]
+# 1日1回、最大10件を処理する（既存ジョブの再調停は最大5件）。
+crons = ["17 3 * * *"]
+
+[vars]
+DEMO_WRITE_ENABLED = "false"
+ACCESS_TEAM_DOMAIN = "REPLACE_WITH_ACCESS_TEAM_DOMAIN"
+ACCESS_AUD = "REPLACE_WITH_ACCESS_AUD"
+ADMIN_HOST = "REPLACE_WITH_ADMIN_HOST"
+INGEST_HOST = "REPLACE_WITH_INGEST_HOST"
+
+# DEVICE_TOKEN_HMAC_SECRET は vars に書かず、デプロイ時にSecretとして設定する。

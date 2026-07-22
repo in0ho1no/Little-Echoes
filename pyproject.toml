@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "openai[realtime]>=2.45.0",
     "pyserial>=3.5",
+    "sounddevice>=0.5.5",
 ]
 
 [dependency-groups]
@@ -74,7 +75,7 @@ ignore = [
 # (APIの公開などでimportのみ行い、ファイル内で使用しない場合があるため)
 "__init__.py" = ["F401"]
 # テストコードではクラス/メソッドごとの docstring を必須にしない
-"src/tests/**/*.py" = ["D101", "D102", "D103", "D415"]
+"main/apps/pc-client/src/tests/**/*.py" = ["D101", "D102", "D103", "D415"]
 # docs/source/conf.py ファイルでは、E402 (モジュールレベルのimportがファイルの先頭にない) エラーを無視する
 # (sys.pathの変更後にimportを行う場合など)
 "docs/source/conf.py" = ["E402"]
@@ -109,9 +110,9 @@ exclude = [
 
 [tool.pyright]
 # 型チェックの対象ディレクトリ
-include = ["src"]
+include = ["main/apps/pc-client/src"]
 # scripts配下からsrcのモジュールをimportする手動確認スクリプトも解決可能にする
-extraPaths = ["src"]
+extraPaths = ["main/apps/pc-client/src"]
 # 既存の除外ルールと同期
 exclude = [
     "**/.*",
@@ -138,5 +139,5 @@ venvPath = "."
 venv = ".venv"
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["src/tests"]
+pythonpath = ["main/apps/pc-client/src"]
+testpaths = ["main/apps/pc-client/src/tests"]
