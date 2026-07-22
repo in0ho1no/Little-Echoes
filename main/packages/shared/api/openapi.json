@@ -186,6 +186,15 @@
           "200": {
             "$ref": "#/components/responses/Recording"
           },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
           "409": {
             "$ref": "#/components/responses/Error"
           }
@@ -209,10 +218,16 @@
           "$ref": "#/components/requestBodies/Review"
         },
         "responses": {
-          "202": {
-            "$ref": "#/components/responses/AcceptedJob"
+          "200": {
+            "$ref": "#/components/responses/Recording"
           },
-          "400": {
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
             "$ref": "#/components/responses/Error"
           },
           "409": {
@@ -692,8 +707,7 @@
           "captured_at": {"type": "string", "format": "date-time"},
           "captured_timezone": {"type": "string", "maxLength": 64},
           "scene": {"type": "string", "maxLength": 300},
-          "parent_note": {"type": "string", "maxLength": 2000},
-          "generate_image": {"type": "boolean"}
+          "parent_note": {"type": "string", "maxLength": 2000}
         }
       },
       "DiaryEdit": {
@@ -728,7 +742,9 @@
               "VERSION_CONFLICT",
               "IDEMPOTENCY_CONFLICT",
               "COST_LIMIT_REACHED",
-              "DEMO_WRITE_DISABLED",
+        "DEMO_WRITE_DISABLED",
+        "INVALID_REVIEW_INPUT",
+        "REVIEW_NOT_AVAILABLE",
               "UPSTREAM_RESULT_UNKNOWN",
               "IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED"
             ]
