@@ -9,19 +9,28 @@ import io
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 import wave
 from datetime import UTC, datetime
 from pathlib import Path
 from tkinter import simpledialog
 
-from audio.spike import POST_ROLL_SECONDS, PRE_ROLL_SECONDS, ByteRingBuffer, boost_quiet_pcm, select_capture_format
+from audio.spike import (
+    POST_ROLL_SECONDS,
+    PRE_ROLL_SECONDS,
+    ByteRingBuffer,
+    boost_quiet_pcm,
+    downsample_48k_to_24k,
+    select_capture_format,
+)
 
 from client.spool import ClipMetadata, Spool, SpoolFullError, new_capture_id
 from client.uploader import ClipWorker, DeviceApiClient
 
 DEFAULT_BASE_URL = 'https://ingest.in0ho1no.com'
 HOLD_SECONDS = 1.5
+OUTPUT_SAMPLE_RATE = 24_000
 
 
 def default_spool_root() -> Path:
@@ -56,21 +65,23 @@ def load_token() -> str:
 class ClientApp:
     """入力状態とクリップ送信を分離したGUI本体。
 
-    入力状態(buffering/hold_pending/collecting_post_roll/input_error/reopening)は
-    GUIスレッドで遷移させ、保存・送信はワーカースレッドで行いブロッキングI/Oを
-    GUIスレッドへ持ち込まない。
+    入力ストリームは常時リングバッファ(前録り10秒+後録り5秒)へ供給する。
+    ワーカースレッドはtkウィジェットへ直接触れず、イベントキュー経由で
+    GUIスレッドの_poll_eventsだけが画面と入力状態を更新する。
     """
 
     def __init__(self, root: tk.Tk, spool: Spool, worker: ClipWorker) -> None:
-        """ウィジェットを構築し、未完了クリップの再開をワーカーで開始する。"""
+        """ウィジェット構築、入力ストリーム開始、未完了クリップの再開を行う。"""
         self._root = root
         self._spool = spool
         self._worker = worker
-        self._events: queue.Queue[str] = queue.Queue()
+        self._events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._input_state = 'buffering'
         self._hold_timer: str | None = None
+        self._stream: object | None = None
+        self._stream_failed = False
         self._capture_format = select_capture_format()
-        self._ring = ByteRingBuffer(self._capture_format, PRE_ROLL_SECONDS)
+        self._ring = ByteRingBuffer(self._capture_format, PRE_ROLL_SECONDS + POST_ROLL_SECONDS)
         self._state_label = tk.Label(root, text='待機中', font=('', 14))
         self._state_label.pack(padx=16, pady=8)
         self._unsent_label = tk.Label(root, text='')
@@ -84,13 +95,38 @@ class ClientApp:
         sample = tk.Button(root, text='固定サンプルを送信', command=self.send_fixed_sample)
         sample.pack(pady=4)
         self._sample_path = Path(__file__).resolve().parents[1] / 'assets' / 'sample.wav'
+        self._open_input_stream()
         root.after(200, self._poll_events)
         self._refresh_unsent()
         threading.Thread(target=self._worker_resume, daemon=True).start()
 
+    def _open_input_stream(self) -> None:
+        """前録り用の入力ストリームを開始し、失敗はinput_errorとして表示する。"""
+        try:
+            import sounddevice
+
+            def callback(indata: bytes, _frames: int, _time_info: object, status: object) -> None:
+                if status:
+                    self._stream_failed = True
+                self._ring.append(bytes(indata))
+
+            stream = sounddevice.RawInputStream(
+                samplerate=self._capture_format.sample_rate,
+                channels=1,
+                dtype='int16',
+                blocksize=self._capture_format.sample_rate // 10,
+                callback=callback,
+                finished_callback=lambda: setattr(self, '_stream_failed', True),
+            )
+            stream.start()
+            self._stream = stream
+        except Exception:
+            self._input_state = 'input_error'
+            self._state_label.config(text='マイク入力を開始できません。デバイスを確認してください。')
+
     def _worker_resume(self) -> None:
         self._worker.resume()
-        self._events.put('resumed')
+        self._events.put(('refresh', ''))
 
     def _refresh_unsent(self) -> None:
         count = self._worker.unsent_count()
@@ -99,8 +135,13 @@ class ClientApp:
     def _poll_events(self) -> None:
         try:
             while True:
-                self._events.get_nowait()
-                self._refresh_unsent()
+                kind, payload = self._events.get_nowait()
+                if kind == 'message':
+                    self._state_label.config(text=payload)
+                if kind in ('message', 'refresh'):
+                    self._refresh_unsent()
+                if kind == 'input_ready':
+                    self._input_state = 'buffering'
         except queue.Empty:
             pass
         self._root.after(200, self._poll_events)
@@ -127,22 +168,15 @@ class ClientApp:
         threading.Thread(target=self._capture_clip, daemon=True).start()
 
     def _capture_clip(self) -> None:
-        pre_roll = self._ring.snapshot(self._capture_format.bytes_per_second * PRE_ROLL_SECONDS)
-        post_roll, truncated = self._collect_post_roll()
-        pcm = boost_quiet_pcm(pre_roll + post_roll)
+        # 後録りは常時稼働の同じ入力ストリームから取る。長押し成立の5秒後に
+        # 直近15秒を切り出すと、成立前10秒+成立後5秒のクリップになる。
+        time.sleep(POST_ROLL_SECONDS)
+        truncated = self._stream_failed
+        pcm = self._ring.snapshot(self._capture_format.bytes_per_second * (PRE_ROLL_SECONDS + POST_ROLL_SECONDS))
+        if self._capture_format.sample_rate == 48_000:
+            pcm = downsample_48k_to_24k(pcm)
+        pcm = boost_quiet_pcm(pcm)
         self._finish_clip(pcm, truncated)
-
-    def _collect_post_roll(self) -> tuple[bytes, bool]:
-        try:
-            import sounddevice
-
-            frames = self._capture_format.sample_rate * POST_ROLL_SECONDS
-            recorded = sounddevice.rec(frames, samplerate=self._capture_format.sample_rate, channels=1, dtype='int16')
-            sounddevice.wait()
-            return bytes(recorded.tobytes()), False
-        except Exception:
-            self._events.put('input_error')
-            return b'', True
 
     def _finish_clip(self, pcm: bytes, truncated: bool) -> None:
         now = datetime.now(UTC)
@@ -155,17 +189,16 @@ class ClientApp:
             post_roll_truncated=truncated,
         )
         try:
-            saved = self._spool.save(pcm_to_wav_bytes(pcm, self._capture_format.sample_rate), meta)
-        except SpoolFullError as error:
-            message = str(error)
-            self._events.put('spool_full')
-            self._state_label.after(0, lambda: self._state_label.config(text=message))
-            self._input_state = 'buffering'
+            saved = self._spool.save(pcm_to_wav_bytes(pcm, OUTPUT_SAMPLE_RATE), meta)
+        except (SpoolFullError, OSError) as error:
+            message = str(error) if isinstance(error, SpoolFullError) else 'ローカル保存に失敗しました。空き容量と権限を確認してください。'
+            self._events.put(('message', message))
+            self._events.put(('input_ready', ''))
             return
-        self._input_state = 'buffering'
-        self._state_label.after(0, lambda: self._state_label.config(text='保存しました。送信中…'))
-        self._worker.advance(saved)
-        self._events.put('advanced')
+        self._events.put(('input_ready', ''))
+        self._events.put(('message', '保存しました。送信中…'))
+        state = self._worker.advance(saved)
+        self._events.put(('message', '送信しました。' if state == 'process_accepted' else '送信に失敗しました。「未送信を再試行」で再送できます。'))
 
     def retry_unsent(self) -> None:
         """未送信クリップを明示操作としてワーカーで再送する。"""
@@ -173,7 +206,7 @@ class ClientApp:
         def run() -> None:
             for meta in self._spool.entries():
                 self._worker.advance(meta, manual=True)
-            self._events.put('retried')
+            self._events.put(('message', '再試行が完了しました。'))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -195,11 +228,11 @@ class ClientApp:
             )
             try:
                 saved = self._spool.save(self._sample_path.read_bytes(), meta)
-            except SpoolFullError:
-                self._events.put('spool_full')
+            except (SpoolFullError, OSError) as error:
+                self._events.put(('message', str(error) if isinstance(error, SpoolFullError) else 'ローカル保存に失敗しました。'))
                 return
-            self._worker.advance(saved)
-            self._events.put('advanced')
+            state = self._worker.advance(saved)
+            self._events.put(('message', '固定サンプルを送信しました。' if state == 'process_accepted' else '固定サンプルの送信に失敗しました。'))
 
         threading.Thread(target=run, daemon=True).start()
 

@@ -6,6 +6,7 @@
 
 import json
 import secrets
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -36,6 +37,9 @@ def _default_transport(request: urllib.request.Request) -> TransportResponse:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        # 接続不可・DNS失敗・タイムアウトは過渡障害として扱い、詳細をトークンなしで伝える。
+        raise UploadRetryableError('サーバーへ接続できませんでした。') from error
 
 
 @dataclass
@@ -125,11 +129,12 @@ class ClipWorker:
     """
 
     def __init__(self, spool: Spool, client: DeviceApiClient) -> None:
-        """スプールとAPIクライアントを束ねる。"""
+        """スプールとAPIクライアントを束ねる。advanceはロックで直列化する。"""
         self._spool = spool
         self._client = client
+        self._lock = threading.Lock()
 
-    def _upload_step(self, meta: ClipMetadata, audio: bytes) -> bool:
+    def _upload_step(self, meta: ClipMetadata, audio: bytes) -> str:
         meta.state = 'uploading'
         meta.upload_attempts += 1
         self._spool.update(meta)
@@ -138,53 +143,79 @@ class ClipWorker:
         except UploadRetryableError:
             meta.state = 'upload_failed'
             self._spool.update(meta)
-            return False
+            return 'retryable'
         except UploadRejectedError:
             meta.state = 'upload_failed'
             self._spool.update(meta)
-            return False
+            return 'rejected'
         self._spool.mark_uploaded(meta, result.recording_id)
-        return True
+        return 'ok'
 
-    def _process_step(self, meta: ClipMetadata) -> bool:
+    def _process_step(self, meta: ClipMetadata) -> str:
+        if not meta.recording_id:
+            meta.state = 'spool_failed'
+            self._spool.update(meta)
+            return 'rejected'
         meta.state = 'process_starting'
         meta.process_attempts += 1
         self._spool.update(meta)
         try:
-            self._client.start_processing(meta.recording_id or '')
-        except (UploadRetryableError, UploadRejectedError):
+            self._client.start_processing(meta.recording_id)
+        except UploadRetryableError:
             meta.state = 'process_start_failed'
             self._spool.update(meta)
-            return False
+            return 'retryable'
+        except UploadRejectedError:
+            meta.state = 'process_start_failed'
+            self._spool.update(meta)
+            return 'rejected'
         self._spool.mark_process_accepted(meta)
-        return True
+        return 'ok'
 
     def advance(self, meta: ClipMetadata, *, manual: bool = False) -> str:
-        """クリップを1段階以上進め、到達した状態を返す。"""
+        """クリップを1段階以上進め、到達した状態を返す。
+
+        自動再試行は過渡障害(retryable)だけに1回。4xx拒否は手動操作を待つ。
+        """
+        with self._lock:
+            return self._advance_locked(meta, manual)
+
+    def _advance_locked(self, meta: ClipMetadata, manual: bool) -> str:
         if meta.state in ('spooled', 'upload_failed', 'uploading'):
-            if meta.state == 'upload_failed' and not manual and meta.upload_attempts >= 2:
+            if meta.state == 'upload_failed' and not manual:
                 return meta.state
             audio = self._spool.read_audio(meta.client_capture_id)
             if audio is None:
                 meta.state = 'spool_failed'
                 self._spool.update(meta)
                 return meta.state
-            if not self._upload_step(meta, audio):
-                if not manual and meta.upload_attempts == 1 and not self._upload_step(meta, audio):
-                    return meta.state
-                if meta.state == 'upload_failed':
-                    return meta.state
-        if meta.state in ('uploaded', 'process_starting', 'process_start_failed'):
-            if meta.state == 'process_start_failed' and not manual and meta.process_attempts >= 2:
+            outcome = self._upload_step(meta, audio)
+            if outcome == 'retryable' and not manual:
+                outcome = self._upload_step(meta, audio)
+            if outcome != 'ok':
                 return meta.state
-            if self._process_step(meta):
+        if meta.state in ('uploaded', 'process_starting', 'process_start_failed'):
+            if meta.state == 'process_start_failed' and not manual:
+                return meta.state
+            outcome = self._process_step(meta)
+            if outcome == 'retryable' and not manual:
+                outcome = self._process_step(meta)
+            if outcome == 'ok':
                 return 'process_accepted'
         return meta.state
 
     def resume(self) -> list[str]:
-        """起動時に未完了クリップを保持メタデータから再開する。"""
-        return [self.advance(meta) for meta in self._spool.entries()]
+        """起動時に未完了クリップを再開する。
+
+        解析開始の再開はSPECの必須要件なので手動扱いで進め、アップロード失敗の
+        再送はユーザーの明示操作を待つ。
+        """
+        results: list[str] = []
+        for meta in self._spool.entries():
+            resume_as_manual = meta.state in ('uploaded', 'process_starting', 'process_start_failed')
+            results.append(self.advance(meta, manual=resume_as_manual))
+        return results
 
     def unsent_count(self) -> int:
-        """画面表示用の未送信件数。"""
-        return self._spool.pending_count()
+        """画面表示用の未送信件数（アップロード未完了のものだけを数える）。"""
+        return sum(1 for meta in self._spool.entries() if meta.state in ('spooled', 'uploading', 'upload_failed'))

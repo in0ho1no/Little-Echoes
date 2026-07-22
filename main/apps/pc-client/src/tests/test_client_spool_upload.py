@@ -121,6 +121,68 @@ def test_rejected_upload_keeps_spool_and_reports_code(tmp_path: Path) -> None:
     assert spool.read_audio(meta.client_capture_id) is not None
 
 
+def test_spool_rejects_when_byte_limit_reached(tmp_path: Path) -> None:
+    """総容量25 MiB到達で理由つきの拒否になる。"""
+    spool = Spool(tmp_path)
+    spool.save(b'x' * (25 * 1024 * 1024 - 10), metadata())
+    with pytest.raises(SpoolFullError, match='25 MiB'):
+        spool.save(b'x' * 100, metadata())
+
+
+def test_rejected_upload_is_not_auto_retried(tmp_path: Path) -> None:
+    """4xx拒否(認証・検証エラー)には自動再試行しない。要求は1回だけ。"""
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    rejecting = FakeTransport([(422, b'{"code":"INVALID_WAV","message":"bad","retryable":false}')])
+    ClipWorker(spool, client_with(rejecting)).advance(meta)
+    assert len(rejecting.requests) == 1
+
+
+def test_resume_does_not_auto_resend_failed_uploads(tmp_path: Path) -> None:
+    """起動時resumeはアップロード失敗クリップを勝手に再送しない。"""
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    meta.state = 'upload_failed'
+    meta.upload_attempts = 2
+    spool.update(meta)
+    transport = FakeTransport([(201, b'{}')])
+    results = ClipWorker(spool, client_with(transport)).resume()
+    assert results == ['upload_failed']
+    assert len(transport.requests) == 0
+
+
+def test_missing_wav_moves_clip_to_spool_failed(tmp_path: Path) -> None:
+    """WAVが欠落したクリップはspool_failedへ収束し、未送信件数から除外される。"""
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    (tmp_path / f'{meta.client_capture_id}.wav').unlink()
+    worker = ClipWorker(spool, client_with(FakeTransport([(201, b'{}')])))
+    assert worker.advance(meta, manual=True) == 'spool_failed'
+    assert worker.unsent_count() == 0
+
+
+def test_network_error_marks_upload_failed_without_crashing(tmp_path: Path) -> None:
+    """接続失敗(トランスポート例外)はupload_failedへ収束し、例外を漏らさない。"""
+    from client.uploader import UploadRetryableError
+
+    def broken(_request: urllib.request.Request) -> tuple[int, bytes]:
+        raise UploadRetryableError('サーバーへ接続できませんでした。')
+
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    worker = ClipWorker(spool, DeviceApiClient('https://ingest.example.test', TOKEN, broken))
+    assert worker.advance(meta) == 'upload_failed'
+    assert meta.upload_attempts == 2
+
+
+def test_token_never_written_to_spool_metadata(tmp_path: Path) -> None:
+    """トークンはスプールのメタデータJSONへ書かれない。"""
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    stored = (tmp_path / f'{meta.client_capture_id}.json').read_text(encoding='utf-8')
+    assert TOKEN not in stored
+
+
 def test_token_only_in_authorization_header_and_https_enforced(tmp_path: Path) -> None:
     """トークンはAuthorizationヘッダーだけに現れ、非HTTPSの実送信は拒否する。"""
     transport = FakeTransport([(201, b'{"recording_id":"rec_' + b'c' * 32 + b'"}')])
