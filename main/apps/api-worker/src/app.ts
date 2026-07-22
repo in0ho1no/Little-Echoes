@@ -5,6 +5,7 @@ import { verifyAccessJwt } from './access-jwt';
 import { reserveDeleteJob } from './delete';
 import { CORRELATION_ID_HEADER, errorBody, newCorrelationId } from './errors';
 import { ANALYSIS_STALE_MILLISECONDS, isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter, UPLOAD_RESERVED_STALE_MILLISECONDS } from './limits';
+import { approveReview, saveReview, type ReviewInput, type ReviewTarget } from './review';
 import type { DeviceIdentity, Env, ManagementIdentity } from './types';
 import { validateCanonicalWav, WavValidationError } from './wav';
 import { reconcileStaleAnalysisJob } from './workflow';
@@ -75,6 +76,9 @@ function requestHost(request: Request): string {
 
 function allowedRoute(host: string, method: string, path: string, env: Env): boolean {
   const recordingPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}$/;
+  const reviewPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/review$/;
+  const approvalPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/approve$/;
+  const dictionaryPath = /^\/api\/v1\/dictionary\/word_[a-z0-9]{32}$/;
   if (host === env.INGEST_HOST) {
     return (
       (method === 'POST' && path === '/api/v1/recordings') ||
@@ -84,7 +88,22 @@ function allowedRoute(host: string, method: string, path: string, env: Env): boo
   }
   if (host === env.ADMIN_HOST) {
     if (method === 'DELETE') return recordingPath.test(path);
-    return method === 'GET' && (path === '/' || path === '/assets/review.js' || path === '/api/v1/review-queue' || recordingPath.test(path) || /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/audio$/.test(path) || /^\/recordings\/rec_[a-z0-9]{32}$/.test(path));
+    if (method === 'PATCH') return reviewPath.test(path);
+    if (method === 'POST') return approvalPath.test(path);
+    return (
+      method === 'GET' &&
+      (path === '/' ||
+        path === '/dictionary' ||
+        /^\/dictionary\/word_[a-z0-9]{32}$/.test(path) ||
+        path === '/assets/review.js' ||
+        path === '/assets/review-detail.js' ||
+        path === '/api/v1/review-queue' ||
+        path === '/api/v1/dictionary' ||
+        dictionaryPath.test(path) ||
+        recordingPath.test(path) ||
+        /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/audio$/.test(path) ||
+        /^\/recordings\/rec_[a-z0-9]{32}$/.test(path))
+    );
   }
   return false;
 }
@@ -111,6 +130,64 @@ function validTimeZone(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function containsDisallowedControl(value: string): boolean {
+  return /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u.test(value);
+}
+
+function normalizedText(value: unknown, maximum: number, allowEmpty: boolean): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.normalize('NFKC');
+  if (normalized.length > maximum || containsDisallowedControl(normalized) || (!allowEmpty && normalized.trim().length === 0)) return null;
+  return normalized;
+}
+
+function parseReviewInput(body: unknown): ReviewInput | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null;
+  const value = body as Record<string, unknown>;
+  const allowedKeys = new Set(['version', 'reviewed_text', 'words', 'captured_at', 'captured_timezone', 'scene', 'parent_note']);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return null;
+  if (!Number.isSafeInteger(value.version) || typeof value.version !== 'number' || value.version < 1 || !Array.isArray(value.words)) return null;
+  const reviewedText = normalizedText(value.reviewed_text, 2000, true);
+  const capturedAt = typeof value.captured_at === 'string' ? normalizeUtcRfc3339(value.captured_at) : null;
+  const capturedTimezone = typeof value.captured_timezone === 'string' && validTimeZone(value.captured_timezone) ? value.captured_timezone : null;
+  const scene = value.scene === undefined || value.scene === null ? null : normalizedText(value.scene, 300, true);
+  const parentNote = value.parent_note === undefined || value.parent_note === null ? null : normalizedText(value.parent_note, 2000, true);
+  if (reviewedText === null || !capturedAt || !capturedTimezone || scene === null && value.scene !== undefined && value.scene !== null || parentNote === null && value.parent_note !== undefined && value.parent_note !== null || value.words.length > 30) {
+    return null;
+  }
+  const seen = new Set<string>();
+  const words: ReviewInput['words'] = [];
+  for (const item of value.words) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) return null;
+    const word = item as Record<string, unknown>;
+    const keys = Object.keys(word);
+    if (keys.length !== 3 || !['display_name', 'normalized', 'new_override'].every((key) => key in word)) return null;
+    const displayName = normalizedText(word.display_name, 100, false)?.trim();
+    const normalized = normalizedText(word.normalized, 100, false)?.trim().toLocaleLowerCase('ja-JP');
+    if (!displayName || !normalized || seen.has(normalized) || !['auto', 'force_new', 'force_not_new'].includes(word.new_override as string)) return null;
+    seen.add(normalized);
+    words.push({ displayName, normalized, newOverride: word.new_override as ReviewInput['words'][number]['newOverride'] });
+  }
+  return { version: value.version, reviewedText, words, capturedAt, capturedTimezone, scene, parentNote };
+}
+
+async function parseReviewRequest(c: { req: { raw: Request }; get: (key: 'correlationId') => string; json: (body: unknown, status: 400 | 401 | 403 | 404 | 409 | 411 | 413 | 415 | 422 | 429 | 500) => Response }): Promise<ReviewInput | Response> {
+  const contentLength = c.req.raw.headers.get('Content-Length');
+  if ((contentLength !== null && (!/^[0-9]+$/.test(contentLength) || Number(contentLength) > 16_384)) || !c.req.raw.headers.get('Content-Type')?.startsWith('application/json')) {
+    return responseError(c, 422, 'INVALID_REVIEW_INPUT', '確認内容の形式またはサイズが不正です。');
+  }
+  let body: unknown;
+  try {
+    const bytes = new Uint8Array(await c.req.raw.arrayBuffer());
+    if (bytes.byteLength > 16_384) return responseError(c, 422, 'INVALID_REVIEW_INPUT', '確認内容の形式またはサイズが不正です。');
+    body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch {
+    return responseError(c, 422, 'INVALID_REVIEW_INPUT', '確認内容の形式が不正です。');
+  }
+  const input = parseReviewInput(body);
+  return input ?? responseError(c, 422, 'INVALID_REVIEW_INPUT', '確認内容を確認してください。');
 }
 
 function recordingId(): string {
@@ -617,6 +694,69 @@ app.delete('/api/v1/recordings/:id', async (c) => {
   return c.json(acceptedJobResponse(reservation.asyncJobId, reservation.status, c.get('correlationId')), 202);
 });
 
+function reviewTarget(recording: RecordingRow): ReviewTarget {
+  return {
+    id: recording.id,
+    householdId: recording.household_id,
+    version: recording.version,
+    reviewStatus: recording.review_status,
+    analysisStatus: recording.analysis_status,
+    capturedAt: recording.captured_at,
+  };
+}
+
+function reviewedRecordingResponse(recording: RecordingRow, correlationId: string): Record<string, string | number> {
+  return {
+    recording_id: recording.id,
+    analysis_status: recording.analysis_status,
+    review_status: recording.review_status,
+    version: recording.version,
+    correlation_id: correlationId,
+  };
+}
+
+function reviewResultError(c: { json: (body: unknown, status: 400 | 401 | 403 | 404 | 409 | 411 | 413 | 415 | 422 | 429 | 500) => Response; get: (key: 'correlationId') => string }, result: 'version_conflict' | 'not_reviewable'): Response {
+  if (result === 'version_conflict') return responseError(c, 409, 'VERSION_CONFLICT', '録音は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+  return responseError(c, 409, 'REVIEW_NOT_AVAILABLE', '処理中または削除中の録音は確認できません。', false, '処理完了後に再度確認してください。');
+}
+
+app.patch('/api/v1/recordings/:id/review', async (c) => {
+  const identity = await managementIdentity(c);
+  if (isResponse(identity)) return identity;
+  if (!isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED)) {
+    return responseError(c, 403, 'DEMO_WRITE_DISABLED', 'デモ書き込みは現在停止しています。', false, '読み取り専用で確認してください。');
+  }
+  const input = await parseReviewRequest(c);
+  if (input instanceof Response) return input;
+  const recording = await findManagementRecording(c.env, identity, c.req.param('id'));
+  if (!recording) return responseError(c, 404, 'NOT_FOUND', '対象の録音は見つかりません。');
+  const result =
+    recording.review_status === 'approved'
+      ? await approveReview(c.env.DB, reviewTarget(recording), input, identity.accessSubject, c.get('correlationId'))
+      : await saveReview(c.env.DB, reviewTarget(recording), input, identity.accessSubject, c.get('correlationId'));
+  if (result !== 'saved') return reviewResultError(c, result);
+  const saved = await findManagementRecording(c.env, identity, recording.id);
+  if (!saved) return responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '録音状態を取得できません。', true);
+  return c.json(reviewedRecordingResponse(saved, c.get('correlationId')), 200);
+});
+
+app.post('/api/v1/recordings/:id/approve', async (c) => {
+  const identity = await managementIdentity(c);
+  if (isResponse(identity)) return identity;
+  if (!isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED)) {
+    return responseError(c, 403, 'DEMO_WRITE_DISABLED', 'デモ書き込みは現在停止しています。', false, '読み取り専用で確認してください。');
+  }
+  const input = await parseReviewRequest(c);
+  if (input instanceof Response) return input;
+  const recording = await findManagementRecording(c.env, identity, c.req.param('id'));
+  if (!recording) return responseError(c, 404, 'NOT_FOUND', '対象の録音は見つかりません。');
+  const result = await approveReview(c.env.DB, reviewTarget(recording), input, identity.accessSubject, c.get('correlationId'));
+  if (result !== 'saved') return reviewResultError(c, result);
+  const approved = await findManagementRecording(c.env, identity, recording.id);
+  if (!approved) return responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '録音状態を取得できません。', true);
+  return c.json(reviewedRecordingResponse(approved, c.get('correlationId')), 200);
+});
+
 app.get('/api/v1/recordings/:id/audio', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
@@ -637,6 +777,96 @@ app.get('/api/v1/recordings/:id/audio', async (c) => {
       [CORRELATION_ID_HEADER]: c.get('correlationId'),
     },
   });
+});
+
+interface DictionaryWordRow {
+  id: string;
+  display_name: string;
+  normalized: string;
+  first_spoken_at: string | null;
+  occurrence_count: number;
+}
+
+interface DictionaryOccurrenceRow {
+  recording_id: string;
+  surface: string;
+  utterance_text: string | null;
+  spoken_at: string;
+  is_first: number;
+  new_override: 'auto' | 'force_new' | 'force_not_new';
+  diary_id: string | null;
+}
+
+export function isNewForDisplay(occurrence: Pick<DictionaryOccurrenceRow, 'is_first' | 'new_override'>): boolean {
+  return occurrence.new_override === 'force_new' || (occurrence.new_override !== 'force_not_new' && occurrence.is_first === 1);
+}
+
+function dictionaryWordBody(word: DictionaryWordRow, history: DictionaryOccurrenceRow[], correlationId: string): Record<string, unknown> {
+  return {
+    word_id: word.id,
+    display_name: word.display_name,
+    normalized: word.normalized,
+    first_spoken_at: word.first_spoken_at,
+    occurrence_count: word.occurrence_count,
+    history: history.map((occurrence) => ({
+      recording_id: occurrence.recording_id,
+      surface: occurrence.surface,
+      utterance_text: occurrence.utterance_text ?? '',
+      spoken_at: occurrence.spoken_at,
+      is_first: isNewForDisplay(occurrence),
+      new_override: occurrence.new_override,
+      diary_id: occurrence.diary_id,
+      audio_endpoint: `/api/v1/recordings/${occurrence.recording_id}/audio`,
+    })),
+    correlation_id: correlationId,
+  };
+}
+
+app.get('/api/v1/dictionary', async (c) => {
+  const identity = await managementIdentity(c);
+  if (isResponse(identity)) return identity;
+  const requested = c.req.query('limit') ?? '20';
+  const limit = integerInRange(requested, 1, 100);
+  if (limit === null) return responseError(c, 422, 'INVALID_LIMIT', '一覧件数が不正です。');
+  const words = await c.env.DB.prepare(
+    `SELECT id, display_name, normalized, first_spoken_at, occurrence_count FROM dictionary_words
+      WHERE household_id = ? AND occurrence_count > 0
+      ORDER BY first_spoken_at DESC, id DESC LIMIT ?`,
+  )
+    .bind(identity.householdId, limit)
+    .all<DictionaryWordRow>();
+  return c.json({
+    items: words.results.map((word) => dictionaryWordBody(word, [], c.get('correlationId'))),
+    correlation_id: c.get('correlationId'),
+  });
+});
+
+app.get('/api/v1/dictionary/:id', async (c) => {
+  const identity = await managementIdentity(c);
+  if (isResponse(identity)) return identity;
+  const requested = c.req.query('limit') ?? '20';
+  const limit = integerInRange(requested, 1, 100);
+  if (limit === null) return responseError(c, 422, 'INVALID_LIMIT', '一覧件数が不正です。');
+  const word = await c.env.DB.prepare(
+    `SELECT id, display_name, normalized, first_spoken_at, occurrence_count FROM dictionary_words
+      WHERE id = ? AND household_id = ? AND occurrence_count > 0`,
+  )
+    .bind(c.req.param('id'), identity.householdId)
+    .first<DictionaryWordRow>();
+  if (!word) return responseError(c, 404, 'NOT_FOUND', '対象の単語は見つかりません。');
+  const history = await c.env.DB.prepare(
+    `SELECT wo.recording_id, wo.surface, COALESCE(t.reviewed_text, t.raw_text, '') AS utterance_text,
+            wo.spoken_at, wo.is_first, wo.new_override, d.id AS diary_id
+       FROM word_occurrences wo
+       JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id
+       LEFT JOIN transcripts t ON t.recording_id = wo.recording_id
+       LEFT JOIN diary_entries d ON d.recording_id = wo.recording_id
+      WHERE wo.dictionary_word_id = ? AND wo.household_id = ? AND r.review_status = 'approved'
+      ORDER BY r.captured_at DESC, r.created_at DESC, wo.recording_id DESC LIMIT ?`,
+  )
+    .bind(word.id, identity.householdId, limit)
+    .all<DictionaryOccurrenceRow>();
+  return c.json(dictionaryWordBody(word, history.results, c.get('correlationId')));
 });
 
 app.get('/api/v1/review-queue', async (c) => {
@@ -736,7 +966,53 @@ app.get('/api/v1/review-queue', async (c) => {
 app.get('/', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes</title></head><body><main><h1>Little Echoes</h1><p id="status">確認待ちの録音を読み込んでいます。</p><ul id="recordings"></ul></main><script src="/assets/review.js"></script></body></html>`);
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes</title></head><body><main><h1>Little Echoes</h1><p><a href="/dictionary">ことば辞典</a></p><p id="status">確認待ちの録音を読み込んでいます。</p><ul id="recordings"></ul></main><script src="/assets/review.js"></script></body></html>`);
+});
+
+app.get('/dictionary', async (c) => {
+  const identity = await managementIdentity(c);
+  if (isResponse(identity)) return identity;
+  const words = await c.env.DB.prepare(
+    `SELECT id, display_name, normalized, first_spoken_at, occurrence_count FROM dictionary_words
+      WHERE household_id = ? AND occurrence_count > 0 ORDER BY first_spoken_at DESC, id DESC LIMIT 100`,
+  )
+    .bind(identity.householdId)
+    .all<DictionaryWordRow>();
+  const list =
+    words.results
+      .map((word) => `<li><a href="/dictionary/${encodeURIComponent(word.id)}">${escapeHtml(word.display_name)}</a>（${word.occurrence_count}件）</li>`)
+      .join('') || '<li>承認済みの単語はまだありません。</li>';
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — ことば辞典</title></head><body><main><p><a href="/">確認待ち一覧へ戻る</a></p><h1>ことば辞典</h1><ul>${list}</ul></main></body></html>`);
+});
+
+app.get('/dictionary/:id', async (c) => {
+  const identity = await managementIdentity(c);
+  if (isResponse(identity)) return identity;
+  const word = await c.env.DB.prepare(
+    `SELECT id, display_name, normalized, first_spoken_at, occurrence_count FROM dictionary_words
+      WHERE id = ? AND household_id = ? AND occurrence_count > 0`,
+  )
+    .bind(c.req.param('id'), identity.householdId)
+    .first<DictionaryWordRow>();
+  if (!word) return responseError(c, 404, 'NOT_FOUND', '対象の単語は見つかりません。');
+  const history = await c.env.DB.prepare(
+    `SELECT wo.recording_id, wo.surface, COALESCE(t.reviewed_text, t.raw_text, '') AS utterance_text,
+            wo.spoken_at, wo.is_first, wo.new_override, d.id AS diary_id
+       FROM word_occurrences wo JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id
+       LEFT JOIN transcripts t ON t.recording_id = wo.recording_id LEFT JOIN diary_entries d ON d.recording_id = wo.recording_id
+      WHERE wo.dictionary_word_id = ? AND wo.household_id = ? AND r.review_status = 'approved'
+      ORDER BY r.captured_at DESC, r.created_at DESC, wo.recording_id DESC LIMIT 100`,
+  )
+    .bind(word.id, identity.householdId)
+    .all<DictionaryOccurrenceRow>();
+  const list =
+    history.results
+      .map(
+        (occurrence) =>
+          `<li>${isNewForDisplay(occurrence) ? '<strong>NEW</strong> ' : ''}${escapeHtml(occurrence.spoken_at)} — ${escapeHtml(occurrence.utterance_text ?? '')} <a href="/recordings/${encodeURIComponent(occurrence.recording_id)}">録音を開く</a></li>`,
+      )
+      .join('') || '<li>発話履歴はありません。</li>';
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — ${escapeHtml(word.display_name)}</title></head><body><main><p><a href="/dictionary">ことば辞典へ戻る</a></p><h1>${escapeHtml(word.display_name)}</h1><p>記録回数: ${word.occurrence_count}</p><h2>発話履歴</h2><ul>${list}</ul></main></body></html>`);
 });
 
 app.get('/recordings/:id', async (c) => {
@@ -745,16 +1021,54 @@ app.get('/recordings/:id', async (c) => {
   const recording = await findManagementRecording(c.env, identity, c.req.param('id'));
   if (!recording || !['pending', 'approved'].includes(recording.review_status)) return responseError(c, 404, 'NOT_FOUND', '対象の録音は見つかりません。');
   const transcript = await c.env.DB.prepare('SELECT raw_text, reviewed_text FROM transcripts WHERE recording_id = ?').bind(recording.id).first<{ raw_text: string | null; reviewed_text: string | null }>();
-  const candidates = await c.env.DB.prepare('SELECT surface, normalized FROM word_candidates WHERE recording_id = ? ORDER BY normalized').bind(recording.id).all<{ surface: string; normalized: string }>();
+  const editableWords =
+    recording.review_status === 'approved'
+      ? await c.env.DB.prepare(
+          `SELECT wo.surface, dw.normalized, wo.new_override
+             FROM word_occurrences wo JOIN dictionary_words dw ON dw.id = wo.dictionary_word_id AND dw.household_id = wo.household_id
+            WHERE wo.recording_id = ? AND wo.household_id = ? ORDER BY dw.normalized`,
+        )
+          .bind(recording.id, recording.household_id)
+          .all<{ surface: string; normalized: string; new_override: 'auto' | 'force_new' | 'force_not_new' }>()
+      : await c.env.DB.prepare('SELECT surface, normalized, ? AS new_override FROM word_candidates WHERE recording_id = ? ORDER BY normalized')
+          .bind('auto', recording.id)
+          .all<{ surface: string; normalized: string; new_override: 'auto' | 'force_new' | 'force_not_new' }>();
   const status = recording.analysis_status === 'ready' ? '確認待ちです。内容を確認してください。' : recording.analysis_status === 'failed' ? '処理に失敗しました。手動入力または再試行が必要です。' : '処理中です。少し待つと自動で更新されます。';
-  const candidateList = candidates.results.map((candidate) => `<li>${escapeHtml(candidate.surface)}（${escapeHtml(candidate.normalized)}）</li>`).join('') || '<li>候補はまだありません。</li>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 録音</title></head><body><main><p><a href="/">確認待ち一覧へ戻る</a></p><h1>録音の確認</h1><p><strong>状態:</strong> ${escapeHtml(recording.analysis_status)}</p><p>${status}</p><p><strong>録音日時:</strong> ${escapeHtml(recording.captured_at)} (${escapeHtml(recording.captured_timezone)})</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし（モック）</h2><p>${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? 'まだありません。')}</p><h2>単語候補（モック）</h2><ul>${candidateList}</ul></main></body></html>`);
+  const candidateList = editableWords.results.map((candidate) => `<li>${escapeHtml(candidate.surface)}（${escapeHtml(candidate.normalized)}）</li>`).join('') || '<li>候補はまだありません。</li>';
+  const editable = ['ready', 'partial', 'failed'].includes(recording.analysis_status);
+  const wordControls =
+    editableWords.results
+      .map(
+        (word, index) =>
+          `<fieldset data-review-word><label>表記<input data-word-display value="${escapeHtml(word.surface)}" maxlength="100" required></label><label>よみ<input data-word-normalized value="${escapeHtml(word.normalized)}" maxlength="100" required></label><label>NEW表示<select data-word-override aria-label="${index + 1}件目のNEW表示"><option value="auto"${word.new_override === 'auto' ? ' selected' : ''}>自動</option><option value="force_new"${word.new_override === 'force_new' ? ' selected' : ''}>常に表示</option><option value="force_not_new"${word.new_override === 'force_not_new' ? ' selected' : ''}>表示しない</option></select></label></fieldset>`,
+      )
+      .join('') || '<p>単語候補はありません。必要なら下の追加欄へ入力してください。</p>';
+  const editor = editable
+    ? `<h2>確認・承認</h2><p id="save-status" aria-live="polite"></p><form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><button type="button" data-action="save">下書きを保存</button><button type="button" data-action="approve">承認する</button></form><script src="/assets/review-detail.js"></script>`
+    : '<p>処理中は編集・承認できません。状態は自動的に更新されます。</p>';
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 録音</title></head><body><main><p><a href="/">確認待ち一覧へ戻る</a> · <a href="/dictionary">ことば辞典</a></p><h1>録音の確認</h1><p><strong>状態:</strong> ${escapeHtml(recording.analysis_status)}</p><p>${status}</p><p><strong>録音日時:</strong> ${escapeHtml(recording.captured_at)} (${escapeHtml(recording.captured_timezone)})</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし（モック）</h2><p>${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? 'まだありません。')}</p><h2>単語候補（モック）</h2><ul>${candidateList}</ul>${editor}</main></body></html>`);
 });
 
 app.get('/assets/review.js', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
   const script = `fetch('/api/v1/review-queue').then(r=>{if(!r.ok)throw new Error('request failed');return r.json()}).then(data=>{const list=document.getElementById('recordings');document.getElementById('status').textContent=data.items.length?'確認待ちの録音です。':'確認待ちの録音はありません。';for(const item of data.items){const recording=item.recording;if(!/^rec_[a-z0-9]{32}$/.test(recording.recording_id))continue;const li=document.createElement('li');const link=document.createElement('a');link.href='/recordings/'+encodeURIComponent(recording.recording_id);link.textContent=recording.captured_at+' — '+recording.analysis_status;li.append(link);list.append(li)}const failed=data.failed_deletions||[];for(const target of failed){if(!/^rec_[a-z0-9]{32}$/.test(target.recording_id))continue;const li=document.createElement('li');li.textContent='削除に失敗した録音（'+target.captured_at+'）: ';const button=document.createElement('button');button.type='button';button.textContent='削除を再試行';button.addEventListener('click',()=>{button.disabled=true;fetch('/api/v1/recordings/'+encodeURIComponent(target.recording_id),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:target.version})}).then(r=>{if(!r.ok)throw new Error('delete failed');location.reload()}).catch(()=>{button.disabled=false;document.getElementById('status').textContent='削除の再試行に失敗しました。時間をおいて再度お試しください。'})});li.append(button);list.append(li)}}).catch(()=>{document.getElementById('status').textContent='読み込みに失敗しました。再読み込みしてください。'});`;
+  return new Response(script, {
+    headers: {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+      'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff',
+      [CORRELATION_ID_HEADER]: c.get('correlationId'),
+    },
+  });
+});
+
+app.get('/assets/review-detail.js', async (c) => {
+  const identity = await managementIdentity(c);
+  if (isResponse(identity)) return identity;
+  const script = `(()=>{const form=document.getElementById('review-form');if(!form)return;const status=document.getElementById('save-status');const field=name=>form.elements.namedItem(name);const buttons=form.querySelectorAll('button');const submit=async action=>{const words=[];for(const row of form.querySelectorAll('[data-review-word]')){const display=row.querySelector('[data-word-display]').value.trim();const normalized=row.querySelector('[data-word-normalized]').value.trim();const override=row.querySelector('[data-word-override]').value;if(!display||!normalized){status.textContent='候補の表記とよみを入力してください。';return}words.push({display_name:display,normalized,new_override:override})}const lines=String(field('additional_words').value).split('\\n').map(line=>line.trim()).filter(Boolean);for(const line of lines){const parts=line.split('|');if(parts.length!==2||!parts[0].trim()||!parts[1].trim()){status.textContent='追加単語は「表記|よみ」の形式で入力してください。';return}words.push({display_name:parts[0].trim(),normalized:parts[1].trim(),new_override:'auto'})}if(words.length>30||new Set(words.map(word=>word.normalized.normalize('NFKC').trim().toLocaleLowerCase('ja-JP'))).size!==words.length){status.textContent='単語は30件以内で、同じよみを重複登録できません。';return}const body={version:Number(form.dataset.version),reviewed_text:String(field('reviewed_text').value),words,captured_at:String(field('captured_at').value),captured_timezone:String(field('captured_timezone').value),scene:String(field('scene').value),parent_note:String(field('parent_note').value)};buttons.forEach(button=>button.disabled=true);status.textContent=action==='approve'?'承認を保存しています。':'下書きを保存しています。';try{const response=await fetch('/api/v1/recordings/'+encodeURIComponent(form.dataset.recordingId)+'/'+(action==='approve'?'approve':'review'),{method:action==='approve'?'POST':'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok){const error=await response.json().catch(()=>null);throw new Error(error&&error.message?error.message:'保存に失敗しました。')}status.textContent=action==='approve'?'承認しました。':'下書きを保存しました。';location.reload()}catch(error){status.textContent=error instanceof Error?error.message:'保存に失敗しました。'}finally{buttons.forEach(button=>button.disabled=false)}};form.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;if(action==='save'||action==='approve'){event.preventDefault();void submit(action)}})})();`;
   return new Response(script, {
     headers: {
       'Content-Type': 'application/javascript; charset=utf-8',

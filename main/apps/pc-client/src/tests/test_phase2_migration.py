@@ -375,3 +375,174 @@ def test_retention_query_skips_exhausted_rows_before_limit() -> None:
         ('2026-07-21T00:00:00Z', 3, 10),
     ).fetchall()
     assert due == [('rec_eligible',)]
+
+
+def test_phase3_dictionary_reindex_keeps_chronology_and_nonapproved_history() -> None:
+    """承認済みだけを日時・登録順で再集計し、削除待ち行の発話日時は変更しない。"""
+    connection = apply_migration()
+    seed_household(connection)
+    for recording_id, capture_id in (
+        ('rec_same_a', 'capture_same_a'),
+        ('rec_same_b', 'capture_same_b'),
+        ('rec_same_c', 'capture_same_c'),
+        ('rec_deleting', 'capture_deleting'),
+    ):
+        insert_recording(connection, recording_id, capture_id)
+    connection.executescript(
+        """
+        UPDATE recordings SET review_status = 'approved', captured_at = '2020-01-02T00:00:00.000Z',
+          created_at = '2026-07-21T00:00:01.000Z' WHERE id = 'rec_same_a';
+        UPDATE recordings SET review_status = 'approved', captured_at = '2020-01-02T00:00:00.000Z',
+          created_at = '2026-07-21T00:00:02.000Z' WHERE id = 'rec_same_b';
+        UPDATE recordings SET review_status = 'approved', captured_at = '2020-01-02T00:00:00.000Z',
+          created_at = '2026-07-21T00:00:02.000Z' WHERE id = 'rec_same_c';
+        UPDATE recordings SET review_status = 'deleting', captured_at = '2019-01-01T00:00:00.000Z' WHERE id = 'rec_deleting';
+        INSERT INTO dictionary_words VALUES ('word_phase3', 'household_demo', 'りんご', 'りんご', NULL, NULL, 0);
+        INSERT INTO word_occurrences VALUES
+          ('occ_a', 'household_demo', 'rec_same_a', 'word_phase3', 'りんご', 'old-a', 'auto', 0, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z'),
+          ('occ_b', 'household_demo', 'rec_same_b', 'word_phase3', 'りんご', 'old-b',
+           'force_not_new', 0, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z'),
+          ('occ_c', 'household_demo', 'rec_same_c', 'word_phase3', 'りんご', 'old-c',
+           'force_new', 0, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z'),
+          ('occ_deleting', 'household_demo', 'rec_deleting', 'word_phase3', 'りんご',
+           'preserve-me', 'auto', 1, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z');
+        """
+    )
+    connection.execute(
+        """
+        WITH ranked AS (
+          SELECT wo.id,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY wo.dictionary_word_id
+                   ORDER BY r.captured_at, r.created_at, wo.recording_id
+                 ) AS rank,
+                 r.captured_at AS captured_at
+            FROM word_occurrences wo
+            JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id
+           WHERE wo.dictionary_word_id IN (
+             SELECT id FROM dictionary_words WHERE household_id = ? AND normalized IN (?)
+           ) AND r.review_status = 'approved'
+        )
+        UPDATE word_occurrences
+           SET is_first = CASE WHEN id IN (SELECT id FROM ranked WHERE rank = 1) THEN 1 ELSE 0 END,
+               spoken_at = (SELECT captured_at FROM ranked WHERE ranked.id = word_occurrences.id)
+         WHERE dictionary_word_id IN (
+           SELECT id FROM dictionary_words WHERE household_id = ? AND normalized IN (?)
+         )
+           AND EXISTS (
+             SELECT 1 FROM recordings approved
+              WHERE approved.id = word_occurrences.recording_id
+                AND approved.household_id = word_occurrences.household_id
+                AND approved.review_status = 'approved'
+           )
+        """,
+        ('household_demo', 'りんご', 'household_demo', 'りんご'),
+    )
+    connection.execute(
+        """
+        UPDATE dictionary_words
+           SET occurrence_count = (
+                 SELECT COUNT(*) FROM word_occurrences wo
+                  JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id
+                 WHERE wo.dictionary_word_id = dictionary_words.id AND r.review_status = 'approved'
+               ),
+               first_recording_id = (
+                 SELECT wo.recording_id FROM word_occurrences wo
+                  JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id
+                 WHERE wo.dictionary_word_id = dictionary_words.id AND r.review_status = 'approved'
+                 ORDER BY r.captured_at, r.created_at, wo.recording_id LIMIT 1
+               ),
+               first_spoken_at = (
+                 SELECT r.captured_at FROM word_occurrences wo
+                  JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id
+                 WHERE wo.dictionary_word_id = dictionary_words.id AND r.review_status = 'approved'
+                 ORDER BY r.captured_at, r.created_at, wo.recording_id LIMIT 1
+               )
+         WHERE id = 'word_phase3'
+        """
+    )
+    assert connection.execute('SELECT first_recording_id, first_spoken_at, occurrence_count FROM dictionary_words').fetchone() == (
+        'rec_same_a',
+        '2020-01-02T00:00:00.000Z',
+        3,
+    )
+    assert connection.execute("SELECT id, is_first, spoken_at FROM word_occurrences WHERE id != 'occ_deleting' ORDER BY id").fetchall() == [
+        ('occ_a', 1, '2020-01-02T00:00:00.000Z'),
+        ('occ_b', 0, '2020-01-02T00:00:00.000Z'),
+        ('occ_c', 0, '2020-01-02T00:00:00.000Z'),
+    ]
+    assert connection.execute("SELECT spoken_at FROM word_occurrences WHERE id = 'occ_deleting'").fetchone() == ('preserve-me',)
+
+
+def test_phase3_version_conflict_sentinel_aborts_whole_batch() -> None:
+    """楽観ロック不成立時は番兵のNOT NULL違反でバッチ全体をロールバックする。"""
+    connection = apply_migration()
+    seed_household(connection)
+    insert_recording(connection, 'rec_lock', 'capture_lock')
+    connection.commit()
+
+    sentinel = """
+        INSERT INTO recording_tombstones (recording_id, household_id, review_status, deleted_at)
+        SELECT NULL, NULL, NULL, NULL WHERE (SELECT changes()) = 0
+    """
+    connection.execute('BEGIN')
+    connection.execute("UPDATE recordings SET version = version + 1 WHERE id = 'rec_lock' AND version = 99")
+    with pytest.raises(sqlite3.IntegrityError, match='recording_tombstones'):
+        connection.execute(sentinel)
+    connection.rollback()
+    assert connection.execute("SELECT version, draft_scene FROM recordings WHERE id = 'rec_lock'").fetchone() == (1, None)
+    assert connection.execute('SELECT COUNT(*) FROM recording_tombstones').fetchone() == (0,)
+
+    connection.execute('BEGIN')
+    connection.execute("UPDATE recordings SET version = version + 1 WHERE id = 'rec_lock' AND version = 1")
+    connection.execute(sentinel)
+    connection.execute("UPDATE recordings SET draft_scene = 'winner-write' WHERE id = 'rec_lock' AND version = 2")
+    connection.commit()
+    assert connection.execute("SELECT version, draft_scene FROM recordings WHERE id = 'rec_lock'").fetchone() == (2, 'winner-write')
+
+
+def test_dictionary_word_delete_blocked_while_occurrence_references_it() -> None:
+    """発話参照が残る辞典単語の削除はFKで拒否され、参照消滅後にだけ削除できる。"""
+    connection = apply_migration()
+    seed_household(connection)
+    insert_recording(connection, 'rec_ref', 'capture_ref')
+    connection.executescript(
+        """
+        UPDATE recordings SET review_status = 'deleting' WHERE id = 'rec_ref';
+        INSERT INTO dictionary_words VALUES ('word_ref', 'household_demo', 'りんご', 'りんご', NULL, NULL, 0);
+        INSERT INTO word_occurrences VALUES
+          ('occ_ref', 'household_demo', 'rec_ref', 'word_ref', 'りんご', '2026-07-21T00:00:00Z',
+           'auto', 0, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z');
+        """
+    )
+    with pytest.raises(sqlite3.IntegrityError, match='FOREIGN KEY'):
+        connection.execute("DELETE FROM dictionary_words WHERE id = 'word_ref' AND occurrence_count = 0")
+    guarded_delete = """
+        DELETE FROM dictionary_words WHERE id = 'word_ref' AND occurrence_count = 0
+          AND NOT EXISTS (SELECT 1 FROM word_occurrences wo WHERE wo.dictionary_word_id = dictionary_words.id)
+    """
+    connection.execute(guarded_delete)
+    assert connection.execute('SELECT COUNT(*) FROM dictionary_words').fetchone() == (1,)
+    connection.execute("DELETE FROM word_occurrences WHERE id = 'occ_ref'")
+    connection.execute(guarded_delete)
+    assert connection.execute('SELECT COUNT(*) FROM dictionary_words').fetchone() == (0,)
+
+
+def test_phase3_schema_rejects_cross_household_and_duplicate_dictionary_words() -> None:
+    """Phase 3が依存する外部キー、NOT NULL、世帯内正規化一意性を実行する。"""
+    connection = apply_migration()
+    seed_household(connection)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            'INSERT INTO diary_entries (id, recording_id, version, created_at, updated_at) '
+            "VALUES ('diary_missing', 'rec_missing', 1, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z')"
+        )
+    connection.execute(
+        'INSERT INTO dictionary_words (id, household_id, normalized, display_name, occurrence_count) '
+        "VALUES ('word_one', 'household_demo', 'りんご', 'りんご', 0)"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match=r'dictionary_words\.household_id, dictionary_words\.normalized'):
+        connection.execute(
+            'INSERT INTO dictionary_words (id, household_id, normalized, display_name, occurrence_count) '
+            "VALUES ('word_two', 'household_demo', 'りんご', '別表記', 0)"
+        )

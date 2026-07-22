@@ -219,6 +219,8 @@ describe('削除Workflow', () => {
     ]);
     const sql = statements.map((statement) => statement.sql).join('\n');
     expect(sql).toContain('ROW_NUMBER() OVER');
+    expect(sql).toContain("r.review_status = 'approved'");
+    expect(sql).toContain('NOT EXISTS (SELECT 1 FROM word_occurrences wo WHERE wo.dictionary_word_id = dictionary_words.id)');
     expect(sql).toContain('DELETE FROM word_occurrences');
     expect(sql).toContain('DELETE FROM diary_images');
     expect(sql).toContain('DELETE FROM transcripts');
