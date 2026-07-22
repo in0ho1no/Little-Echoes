@@ -505,6 +505,26 @@ describe('ルーターと録音API', () => {
     expect(script).toContain('button.disabled=false');
   });
 
+  it('辞典HTMLではDB由来の表示名をエスケープする', async () => {
+    const supplied = env(
+      (sql) => (sql.includes('FROM management_principals') ? { household_id: 'household_1' } : null),
+      undefined,
+      (sql) =>
+        sql.includes('FROM dictionary_words')
+          ? [{ id: 'word_1', display_name: `<script>alert("x")</script>&'`, normalized: 'word', first_spoken_at: '2026-07-21T00:00:00.000Z', occurrence_count: 1 }]
+          : [],
+    );
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request('https://app.example.test/dictionary', { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+      supplied,
+    );
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(body).toContain('&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;&#39;');
+    expect(body).not.toContain('<script>alert');
+  });
+
   it('実行中と確認できた解析ジョブは収束させず処理中を返す', async () => {
     const staleUpdatedAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
     const supplied = env((sql) => {

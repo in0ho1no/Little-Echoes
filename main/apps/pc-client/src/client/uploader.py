@@ -47,7 +47,12 @@ class UploadRetryableError(Exception):
 
 
 def _default_transport(request: urllib.request.Request) -> TransportResponse:
+    parsed_url = urlsplit(request.full_url)
+    if parsed_url.scheme != 'https' or not parsed_url.hostname or parsed_url.username is not None or parsed_url.password is not None:
+        raise ValueError('デバイスAPIはHTTPSだけを使用します。')
     try:
+        # 送信直前にHTTPS・ホスト・userinfo不在を再検証するため、file://などのURLスキームには到達しない。
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         with urllib.request.urlopen(request, timeout=30) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:

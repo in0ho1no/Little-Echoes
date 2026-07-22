@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { html } from 'hono/html';
 
 import { authenticateDevice, authenticateManagement } from './auth';
 import { verifyAccessJwt } from './access-jwt';
@@ -203,7 +204,9 @@ function objectKey(id: string): string {
 }
 
 function escapeHtml(value: string | null | undefined): string {
-  return (value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+  const escaped = html`${value ?? ''}`;
+  if (escaped instanceof Promise) throw new TypeError('文字列のHTMLエスケープが同期完了しませんでした。');
+  return escaped.toString();
 }
 
 async function deviceIdentity(c: { req: { raw: Request }; env: Env; get: (key: 'correlationId') => string; json: (body: unknown, status: 401) => Response }): Promise<DeviceIdentity | Response> {

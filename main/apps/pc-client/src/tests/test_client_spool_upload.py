@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from client import uploader as uploader_module
 from client.spool import MAX_ITEMS, ClipMetadata, Spool, SpoolFullError, new_capture_id
 from client.uploader import ClipWorker, DeviceApiClient, UploadRejectedError
 
@@ -206,6 +207,13 @@ def test_token_only_in_authorization_header_and_https_enforced(tmp_path: Path) -
         DeviceApiClient('https://user@ingest.example.test', TOKEN)
     with pytest.raises(ValueError, match='HTTPS'):
         DeviceApiClient('https://ingest.example.test/unexpected-path', TOKEN)
+
+
+def test_default_transport_revalidates_https_before_opening_url() -> None:
+    """既定transportは呼び出し側を迂回したfile URLも送信前に拒否する。"""
+    request = urllib.request.Request('file:///not-read')
+    with pytest.raises(ValueError, match='HTTPS'):
+        uploader_module._default_transport(request)
 
 
 def test_requests_carry_a_non_default_user_agent(tmp_path: Path) -> None:
