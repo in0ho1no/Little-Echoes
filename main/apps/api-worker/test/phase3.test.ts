@@ -29,7 +29,12 @@ function recording(analysisStatus = 'ready', reviewStatus = 'pending'): Record<s
   };
 }
 
-function testEnv(sqlLog: string[], suppliedRecording: Record<string, string | number | null> | null = recording(), batchChanges = 1): Env {
+function testEnv(
+  sqlLog: string[],
+  suppliedRecording: Record<string, string | number | null> | null = recording(),
+  batchChanges = 1,
+  batchError?: Error,
+): Env {
   const database = {
     prepare: (sql: string) => {
       const bound = {
@@ -50,6 +55,7 @@ function testEnv(sqlLog: string[], suppliedRecording: Record<string, string | nu
     },
     batch: async (statements: unknown[]) => {
       sqlLog.push(...statements.map((statement) => (statement as { __sql?: string }).__sql ?? ''));
+      if (batchError) throw batchError;
       return statements.map(() => ({ meta: { changes: batchChanges } }));
     },
   } as unknown as D1Database;
@@ -154,6 +160,57 @@ describe('Phase 3 確認・承認API', () => {
     await expect(response.json()).resolves.toMatchObject({ code: 'VERSION_CONFLICT' });
   });
 
+  it('楽観ロック番兵の中止はVERSION_CONFLICTとして返し、他のD1障害は500にする', async () => {
+    const conflictResponse = await app.fetch(
+      reviewRequest(`/api/v1/recordings/${RECORDING_ID}/review`, 'PATCH', reviewBody()),
+      testEnv([], recording(), 1, new Error('D1_ERROR: NOT NULL constraint failed: recording_tombstones.recording_id')),
+    );
+    expect(conflictResponse.status).toBe(409);
+    await expect(conflictResponse.json()).resolves.toMatchObject({ code: 'VERSION_CONFLICT' });
+    const failureResponse = await app.fetch(
+      reviewRequest(`/api/v1/recordings/${RECORDING_ID}/approve`, 'POST', reviewBody()),
+      testEnv([], recording(), 1, new Error('D1_ERROR: database is locked')),
+    );
+    expect(failureResponse.status).toBe(500);
+    await expect(failureResponse.json()).resolves.toMatchObject({ code: 'INTERNAL_ERROR' });
+  });
+
+  it('番兵を先頭UPDATE直後に置き、後続文よりも先に競合を中止させる', async () => {
+    const sqlLog: string[] = [];
+    await app.fetch(reviewRequest(`/api/v1/recordings/${RECORDING_ID}/approve`, 'POST', reviewBody()), testEnv(sqlLog));
+    const updateIndex = sqlLog.findIndex((sql) => sql.includes('UPDATE recordings'));
+    const sentinelIndex = sqlLog.findIndex((sql) => sql.includes('recording_tombstones') && sql.includes('(SELECT changes()) = 0'));
+    const transcriptIndex = sqlLog.findIndex((sql) => sql.includes('INSERT INTO transcripts'));
+    expect(updateIndex).toBeGreaterThanOrEqual(0);
+    expect(sentinelIndex).toBe(updateIndex + 1);
+    expect(transcriptIndex).toBeGreaterThan(sentinelIndex);
+  });
+
+  it('削除中・削除失敗の録音は編集も承認も拒否する', async () => {
+    for (const reviewStatus of ['deleting', 'delete_failed']) {
+      const patchResponse = await app.fetch(
+        reviewRequest(`/api/v1/recordings/${RECORDING_ID}/review`, 'PATCH', reviewBody()),
+        testEnv([], recording('ready', reviewStatus)),
+      );
+      expect(patchResponse.status).toBe(409);
+      await expect(patchResponse.json()).resolves.toMatchObject({ code: 'REVIEW_NOT_AVAILABLE' });
+      const approveResponse = await app.fetch(
+        reviewRequest(`/api/v1/recordings/${RECORDING_ID}/approve`, 'POST', reviewBody()),
+        testEnv([], recording('ready', reviewStatus)),
+      );
+      expect(approveResponse.status).toBe(409);
+      await expect(approveResponse.json()).resolves.toMatchObject({ code: 'REVIEW_NOT_AVAILABLE' });
+    }
+  });
+
+  it('承認応答は契約どおりdeduplicatedを含まない', async () => {
+    const response = await app.fetch(reviewRequest(`/api/v1/recordings/${RECORDING_ID}/approve`, 'POST', reviewBody()), testEnv([]));
+    expect(response.status).toBe(200);
+    const body = await response.json<Record<string, unknown>>();
+    expect(body).not.toHaveProperty('deduplicated');
+    expect(body).toMatchObject({ recording_id: RECORDING_ID, correlation_id: expect.stringMatching(/^corr_/) });
+  });
+
   it('空文字起こし・候補1件を承認し、日記下書きと辞典再計算を同一D1 batchへ入れる', async () => {
     const sqlLog: string[] = [];
     const response = await app.fetch(
@@ -179,6 +236,7 @@ describe('Phase 3 確認・承認API', () => {
     expect(combined).toContain('DELETE FROM word_occurrences');
     expect(combined).toContain('ROW_NUMBER() OVER');
     expect(combined).toContain("'captured_at_changed'");
+    expect(combined).toContain("captured_at_source = CASE WHEN captured_at <> ? THEN 'manual'");
   });
 
   it('別世帯の録音は存在を返さない', async () => {

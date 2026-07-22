@@ -742,10 +742,37 @@
               "VERSION_CONFLICT",
               "IDEMPOTENCY_CONFLICT",
               "COST_LIMIT_REACHED",
-        "DEMO_WRITE_DISABLED",
-        "INVALID_REVIEW_INPUT",
-        "REVIEW_NOT_AVAILABLE",
+              "DEMO_WRITE_DISABLED",
+              "INVALID_REVIEW_INPUT",
+              "REVIEW_NOT_AVAILABLE",
+              "INVALID_LIMIT",
+              "INVALID_MULTIPART",
+              "INVALID_RECORDING_INPUT",
+              "INVALID_DELETE_INPUT",
+              "INVALID_WAV",
+              "CONTENT_LENGTH_REQUIRED",
+              "AUDIO_TOO_LARGE",
+              "UNSUPPORTED_MEDIA_TYPE",
+              "UPLOAD_IN_PROGRESS",
+              "UPLOAD_RETRY_LIMIT_REACHED",
+              "RECORDING_NOT_READY",
+              "RECORDING_RESERVATION_FAILED",
+              "RECORDING_STATE_UNAVAILABLE",
+              "MEDIA_STORAGE_FAILED",
+              "ALREADY_PROCESSED",
+              "PROCESSING_STATE_UNAVAILABLE",
+              "PROCESSING_ATTEMPT_LIMIT_REACHED",
+              "PROCESSING_FAILED",
+              "JOB_RESERVATION_FAILED",
+              "WORKFLOW_DISPATCH_FAILED",
+              "WORKFLOW_DISPATCH_UNKNOWN",
+              "MOCK_ANALYSIS_FAILED",
+              "STALE_ANALYSIS_JOB",
+              "STALE_ANALYSIS_ATTEMPT",
+              "DELETE_ATTEMPT_LIMIT_REACHED",
+              "DELETE_RESERVATION_FAILED",
               "UPSTREAM_RESULT_UNKNOWN",
+              "INTERNAL_ERROR",
               "IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED"
             ]
           },
@@ -761,14 +788,8 @@
             "pattern": "^corr_[A-Za-z0-9_-]+$"
           },
           "next_action": {
-            "enum": [
-              "none",
-              "reload",
-              "poll",
-              "retry",
-              "manual_edit",
-              "contact_owner"
-            ]
+            "type": "string",
+            "maxLength": 300
           }
         }
       },
@@ -874,6 +895,7 @@
         "additionalProperties": false,
         "required": [
           "items",
+          "failed_deletions",
           "correlation_id"
         ],
         "properties": {
@@ -882,6 +904,21 @@
             "maxItems": 100,
             "items": {
               "$ref": "#/components/schemas/ReviewQueueItem"
+            }
+          },
+          "failed_deletions": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["recording_id", "captured_at", "captured_timezone", "version"],
+              "properties": {
+                "recording_id": {"type": "string", "pattern": "^rec_[A-Za-z0-9_-]+$"},
+                "captured_at": {"type": "string", "format": "date-time"},
+                "captured_timezone": {"type": "string", "maxLength": 64},
+                "version": {"type": "integer", "minimum": 1}
+              }
             }
           },
           "correlation_id": {

@@ -30,7 +30,8 @@ function opaqueId(prefix: string): string {
 }
 
 function allowedForReview(target: ReviewTarget): boolean {
-  return ['pending', 'approved'].includes(target.reviewStatus) && ['ready', 'partial', 'failed'].includes(target.analysisStatus);
+  // 承認済みの再編集はapproveReviewだけが扱う。SQLガード('pending')と同じ条件に保つ。
+  return target.reviewStatus === 'pending' && ['ready', 'partial', 'failed'].includes(target.analysisStatus);
 }
 
 function allowedForApproval(target: ReviewTarget): boolean {
@@ -39,6 +40,22 @@ function allowedForApproval(target: ReviewTarget): boolean {
 
 function recordingGuard(reviewStates: string): string {
   return `id = ? AND household_id = ? AND version = ? AND review_status IN (${reviewStates})`;
+}
+
+// 楽観ロック不成立時にNOT NULL違反でバッチ全体を中止する番兵。後続文の
+// `version = 期待値+1` ガードは、同じ基底versionで競合した敗者でも勝者が
+// 作った現在値と一致して成立してしまうため、成立条件として信用できない。
+function versionConflictSentinel(db: D1Database): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT INTO recording_tombstones (recording_id, household_id, review_status, deleted_at)
+       SELECT NULL, NULL, NULL, NULL WHERE (SELECT changes()) = 0`,
+    )
+    .bind();
+}
+
+function isVersionConflictAbort(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('recording_tombstones');
 }
 
 function candidateStatements(db: D1Database, target: ReviewTarget, input: ReviewInput, nextVersion: number): D1PreparedStatement[] {
@@ -132,7 +149,10 @@ function reindexStatements(db: D1Database, householdId: string, normalizations: 
               )
         WHERE id IN (${wordFilter})`,
     ).bind(householdId, ...normalizations),
-    db.prepare(`DELETE FROM dictionary_words WHERE household_id = ? AND normalized IN (${placeholders}) AND occurrence_count = 0`).bind(householdId, ...normalizations),
+    db.prepare(
+      `DELETE FROM dictionary_words WHERE household_id = ? AND normalized IN (${placeholders}) AND occurrence_count = 0
+        AND NOT EXISTS (SELECT 1 FROM word_occurrences wo WHERE wo.dictionary_word_id = dictionary_words.id)`,
+    ).bind(householdId, ...normalizations),
   ];
 }
 
@@ -157,13 +177,21 @@ export async function saveReview(
           WHERE ${guard}`,
       )
       .bind(input.capturedAt, input.capturedTimezone, input.capturedAt, input.scene, input.parentNote, now, target.id, target.householdId, input.version),
+    versionConflictSentinel(db),
     transcriptStatement(db, target, input, "'pending'", nextVersion, now),
     ...candidateStatements(db, target, input, nextVersion),
   ];
   const audit = auditStatement(db, target, input, "'pending'", nextVersion, correlationId, actorId, now);
   if (changedAt && audit) statements.push(audit);
-  const results = await db.batch(statements);
-  return (results[0]?.meta.changes ?? 0) === 1 ? 'saved' : 'version_conflict';
+  let results;
+  try {
+    results = await db.batch(statements);
+  } catch (error) {
+    if (isVersionConflictAbort(error)) return 'version_conflict';
+    throw error;
+  }
+  // D1のmeta.changesはトリガーの書き込みを含み得るため、1との厳密比較はしない。
+  return (results[0]?.meta.changes ?? 0) >= 1 ? 'saved' : 'version_conflict';
 }
 
 export async function approveReview(
@@ -193,10 +221,13 @@ export async function approveReview(
       .prepare(
         `UPDATE recordings
             SET captured_at = ?, captured_timezone = ?, captured_at_source = CASE WHEN captured_at <> ? THEN 'manual' ELSE captured_at_source END,
-                draft_scene = ?, draft_parent_note = ?, review_status = 'approved', diary_status = 'not_started', version = version + 1, updated_at = ?
+                draft_scene = ?, draft_parent_note = ?, review_status = 'approved',
+                diary_status = CASE WHEN review_status = 'pending' THEN 'not_started' ELSE diary_status END,
+                version = version + 1, updated_at = ?
           WHERE ${guard}`,
       )
       .bind(input.capturedAt, input.capturedTimezone, input.capturedAt, input.scene, input.parentNote, now, target.id, target.householdId, input.version),
+    versionConflictSentinel(db),
     transcriptStatement(db, target, input, "'approved'", nextVersion, now),
     db.prepare(`DELETE FROM word_occurrences WHERE recording_id = ? AND household_id = ? AND EXISTS (SELECT 1 FROM recordings WHERE ${updatedGuard})`)
       .bind(target.id, target.householdId, target.id, target.householdId, nextVersion),
@@ -227,6 +258,13 @@ export async function approveReview(
   );
   const audit = auditStatement(db, target, input, "'approved'", nextVersion, correlationId, actorId, now);
   if (audit) statements.push(audit);
-  const results = await db.batch(statements);
-  return (results[0]?.meta.changes ?? 0) === 1 ? 'saved' : 'version_conflict';
+  let results;
+  try {
+    results = await db.batch(statements);
+  } catch (error) {
+    if (isVersionConflictAbort(error)) return 'version_conflict';
+    throw error;
+  }
+  // D1のmeta.changesはトリガーの書き込みを含み得るため、1との厳密比較はしない。
+  return (results[0]?.meta.changes ?? 0) >= 1 ? 'saved' : 'version_conflict';
 }

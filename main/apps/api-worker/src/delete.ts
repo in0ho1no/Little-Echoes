@@ -303,24 +303,38 @@ async function deleteDataInD1(env: Env, job: DeleteJobRow, attemptId: string): P
     env.DB.prepare('DELETE FROM word_occurrences WHERE recording_id = ?').bind(job.recording_id),
   ];
   if (wordIds.length > 0) {
+    // 辞典集計はSPECどおり承認済み（approved）だけを数える。削除中の録音の
+    // 発話が参照する単語行は、件数0でもFK参照が消えるまで削除しない。
     statements.push(
       env.DB.prepare(
         `WITH ranked AS (
-           SELECT wo.id, ROW_NUMBER() OVER (PARTITION BY wo.dictionary_word_id ORDER BY r.captured_at, r.created_at, wo.recording_id) AS rank
+           SELECT wo.id, ROW_NUMBER() OVER (PARTITION BY wo.dictionary_word_id ORDER BY r.captured_at, r.created_at, wo.recording_id) AS rank,
+                  r.captured_at AS captured_at
              FROM word_occurrences wo JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id
-            WHERE wo.dictionary_word_id IN (${wordPlaceholders})
+            WHERE wo.dictionary_word_id IN (${wordPlaceholders}) AND r.review_status = 'approved'
          )
-         UPDATE word_occurrences SET is_first = CASE WHEN id IN (SELECT id FROM ranked WHERE rank = 1) THEN 1 ELSE 0 END
-          WHERE dictionary_word_id IN (${wordPlaceholders})`,
+         UPDATE word_occurrences
+            SET is_first = CASE WHEN id IN (SELECT id FROM ranked WHERE rank = 1) THEN 1 ELSE 0 END,
+                spoken_at = (SELECT captured_at FROM ranked WHERE ranked.id = word_occurrences.id)
+          WHERE dictionary_word_id IN (${wordPlaceholders})
+            AND EXISTS (
+              SELECT 1 FROM recordings approved
+               WHERE approved.id = word_occurrences.recording_id
+                 AND approved.household_id = word_occurrences.household_id
+                 AND approved.review_status = 'approved'
+            )`,
       ).bind(...wordIds, ...wordIds),
       env.DB.prepare(
         `UPDATE dictionary_words
-            SET occurrence_count = (SELECT COUNT(*) FROM word_occurrences wo WHERE wo.dictionary_word_id = dictionary_words.id),
-                first_recording_id = (SELECT wo.recording_id FROM word_occurrences wo JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id WHERE wo.dictionary_word_id = dictionary_words.id ORDER BY r.captured_at, r.created_at, wo.recording_id LIMIT 1),
-                first_spoken_at = (SELECT wo.spoken_at FROM word_occurrences wo JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id WHERE wo.dictionary_word_id = dictionary_words.id ORDER BY r.captured_at, r.created_at, wo.recording_id LIMIT 1)
+            SET occurrence_count = (SELECT COUNT(*) FROM word_occurrences wo JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id WHERE wo.dictionary_word_id = dictionary_words.id AND r.review_status = 'approved'),
+                first_recording_id = (SELECT wo.recording_id FROM word_occurrences wo JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id WHERE wo.dictionary_word_id = dictionary_words.id AND r.review_status = 'approved' ORDER BY r.captured_at, r.created_at, wo.recording_id LIMIT 1),
+                first_spoken_at = (SELECT r.captured_at FROM word_occurrences wo JOIN recordings r ON r.id = wo.recording_id AND r.household_id = wo.household_id WHERE wo.dictionary_word_id = dictionary_words.id AND r.review_status = 'approved' ORDER BY r.captured_at, r.created_at, wo.recording_id LIMIT 1)
           WHERE id IN (${wordPlaceholders})`,
       ).bind(...wordIds),
-      env.DB.prepare(`DELETE FROM dictionary_words WHERE id IN (${wordPlaceholders}) AND occurrence_count = 0`).bind(...wordIds),
+      env.DB.prepare(
+        `DELETE FROM dictionary_words WHERE id IN (${wordPlaceholders}) AND occurrence_count = 0
+          AND NOT EXISTS (SELECT 1 FROM word_occurrences wo WHERE wo.dictionary_word_id = dictionary_words.id)`,
+      ).bind(...wordIds),
     );
   }
   statements.push(

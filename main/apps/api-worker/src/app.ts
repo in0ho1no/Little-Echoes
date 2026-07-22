@@ -705,6 +705,16 @@ function reviewTarget(recording: RecordingRow): ReviewTarget {
   };
 }
 
+function reviewedRecordingResponse(recording: RecordingRow, correlationId: string): Record<string, string | number> {
+  return {
+    recording_id: recording.id,
+    analysis_status: recording.analysis_status,
+    review_status: recording.review_status,
+    version: recording.version,
+    correlation_id: correlationId,
+  };
+}
+
 function reviewResultError(c: { json: (body: unknown, status: 400 | 401 | 403 | 404 | 409 | 411 | 413 | 415 | 422 | 429 | 500) => Response; get: (key: 'correlationId') => string }, result: 'version_conflict' | 'not_reviewable'): Response {
   if (result === 'version_conflict') return responseError(c, 409, 'VERSION_CONFLICT', '録音は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
   return responseError(c, 409, 'REVIEW_NOT_AVAILABLE', '処理中または削除中の録音は確認できません。', false, '処理完了後に再度確認してください。');
@@ -727,7 +737,7 @@ app.patch('/api/v1/recordings/:id/review', async (c) => {
   if (result !== 'saved') return reviewResultError(c, result);
   const saved = await findManagementRecording(c.env, identity, recording.id);
   if (!saved) return responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '録音状態を取得できません。', true);
-  return c.json(recordingResponse(saved, false, c.get('correlationId')), 200);
+  return c.json(reviewedRecordingResponse(saved, c.get('correlationId')), 200);
 });
 
 app.post('/api/v1/recordings/:id/approve', async (c) => {
@@ -744,7 +754,7 @@ app.post('/api/v1/recordings/:id/approve', async (c) => {
   if (result !== 'saved') return reviewResultError(c, result);
   const approved = await findManagementRecording(c.env, identity, recording.id);
   if (!approved) return responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '録音状態を取得できません。', true);
-  return c.json(recordingResponse(approved, false, c.get('correlationId')), 200);
+  return c.json(reviewedRecordingResponse(approved, c.get('correlationId')), 200);
 });
 
 app.get('/api/v1/recordings/:id/audio', async (c) => {
