@@ -1,6 +1,7 @@
 """スプール上限・再開・1回だけの自動再試行・トークン非露出を検証する。"""
 
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -84,8 +85,8 @@ def test_worker_retries_upload_once_then_waits_for_manual_retry(tmp_path: Path) 
     assert worker.unsent_count() == 0
 
 
-def test_worker_resumes_process_start_after_restart(tmp_path: Path) -> None:
-    """アップロード済みで解析未受付のクリップは、再起動後のresumeで202まで進む。"""
+def test_worker_waits_for_manual_retry_after_process_failures(tmp_path: Path) -> None:
+    """自動試行を使い切った解析受付は、再起動では再送せず明示操作を待つ。"""
     spool = Spool(tmp_path)
     meta = spool.save(b'RIFFwav', metadata())
     upload_only = FakeTransport(
@@ -102,8 +103,10 @@ def test_worker_resumes_process_start_after_restart(tmp_path: Path) -> None:
     assert spool.read_audio(stored.client_capture_id) is None
 
     restart = FakeTransport([(202, b'{"async_job_id":"job_y","status":"dispatched"}')])
-    results = ClipWorker(spool, client_with(restart)).resume()
-    assert results == ['process_accepted']
+    restarted_worker = ClipWorker(spool, client_with(restart))
+    assert restarted_worker.resume() == ['process_start_failed']
+    assert len(restart.requests) == 0
+    assert restarted_worker.advance(spool.entries()[0], manual=True) == 'process_accepted'
     assert spool.pending_count() == 0
     assert restart.requests[0].get_method() == 'POST'
 
@@ -119,6 +122,10 @@ def test_rejected_upload_keeps_spool_and_reports_code(tmp_path: Path) -> None:
     worker = ClipWorker(spool, api)
     assert worker.advance(meta) == 'upload_failed'
     assert spool.read_audio(meta.client_capture_id) is not None
+    stored = spool.entries()[0]
+    assert stored.last_error_code == 'INVALID_WAV'
+    assert stored.last_error_message == 'bad'
+    assert stored.last_error_retryable is False
 
 
 def test_spool_rejects_when_byte_limit_reached(tmp_path: Path) -> None:
@@ -195,3 +202,104 @@ def test_token_only_in_authorization_header_and_https_enforced(tmp_path: Path) -
     assert TOKEN not in request.full_url
     with pytest.raises(ValueError, match='HTTPS'):
         DeviceApiClient('http://ingest.example.test', TOKEN)
+    with pytest.raises(ValueError, match='HTTPS'):
+        DeviceApiClient('https://user@ingest.example.test', TOKEN)
+    with pytest.raises(ValueError, match='HTTPS'):
+        DeviceApiClient('https://ingest.example.test/unexpected-path', TOKEN)
+
+
+def test_retry_budget_survives_restart(tmp_path: Path) -> None:
+    """通信途中で終了しても、自動アップロードは初回を含め合計2回を超えない。"""
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    meta.state = 'uploading'
+    meta.upload_attempts = 1
+    spool.update(meta)
+
+    first_restart = FakeTransport([(500, b'{"retryable":true}')])
+    assert ClipWorker(spool, client_with(first_restart)).resume() == ['upload_failed']
+    assert len(first_restart.requests) == 1
+    stored = spool.entries()[0]
+    assert stored.upload_attempts == 2
+
+    second_restart = FakeTransport([(201, b'{"recording_id":"rec_unexpected"}')])
+    assert ClipWorker(spool, client_with(second_restart)).resume() == ['upload_failed']
+    assert len(second_restart.requests) == 0
+
+
+def test_process_starting_resumes_within_persisted_budget(tmp_path: Path) -> None:
+    """解析要求の通信途中状態は、残っている自動予算内でだけ再開する。"""
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    spool.mark_uploaded(meta, 'rec_' + 'd' * 32)
+    meta.state = 'process_starting'
+    meta.process_attempts = 1
+    spool.update(meta)
+    transport = FakeTransport([(202, b'{"async_job_id":"job_z","status":"dispatched"}')])
+    assert ClipWorker(spool, client_with(transport)).resume() == ['process_accepted']
+    assert len(transport.requests) == 1
+
+
+def test_http_429_is_retried_once(tmp_path: Path) -> None:
+    """429はretryableフィールドがなくても過渡障害として1回だけ自動再試行する。"""
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    transport = FakeTransport(
+        [
+            (429, b'{"code":"RATE_LIMITED","message":"later"}'),
+            (201, b'{"recording_id":"rec_' + b'e' * 32 + b'"}'),
+            (202, b'{"async_job_id":"job_rate","status":"dispatched"}'),
+        ]
+    )
+    assert ClipWorker(spool, client_with(transport)).advance(meta) == 'process_accepted'
+    assert len(transport.requests) == 3
+
+
+def test_status_api_rejects_error_responses() -> None:
+    """状態取得の4xxを正常データとして扱わず、機械コードを保持する。"""
+    rejecting = FakeTransport([(403, b'{"code":"DEMO_WRITE_DISABLED","message":"disabled","retryable":false}')])
+    with pytest.raises(UploadRejectedError) as captured:
+        client_with(rejecting).get_status('rec_' + 'f' * 32)
+    assert captured.value.code == 'DEMO_WRITE_DISABLED'
+
+
+def test_concurrent_saves_cannot_exceed_item_limit(tmp_path: Path) -> None:
+    """並行保存でも件数確認と書き込みを直列化し、20件上限を超えない。"""
+    spool = Spool(tmp_path)
+
+    def save_one(_index: int) -> bool:
+        try:
+            spool.save(b'wav', metadata())
+        except SpoolFullError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        saved = list(executor.map(save_one, range(MAX_ITEMS + 8)))
+    assert sum(saved) == MAX_ITEMS
+    assert spool.pending_count() == MAX_ITEMS
+
+
+def test_corrupt_or_path_mismatched_metadata_is_ignored(tmp_path: Path) -> None:
+    """破損JSONや内部ID改変を読み飛ばし、スプール外のパス操作へ使わない。"""
+    (tmp_path / 'broken.json').write_bytes(b'\xffnot-json')
+    valid_name = '00000000-0000-4000-8000-000000000001'
+    (tmp_path / f'{valid_name}.json').write_text(
+        '{"client_capture_id":"../../outside","captured_at":"x","captured_timezone":"x",'
+        '"pre_roll_seconds":10,"post_roll_seconds":5,"post_roll_truncated":false}',
+        encoding='utf-8',
+    )
+    spool = Spool(tmp_path)
+    assert spool.entries() == []
+    assert spool.invalid_count() == 2
+    assert len(list(tmp_path.glob('*.json.corrupt'))) == 2
+    assert spool.purge_expired() == 0
+
+
+def test_spool_writes_leave_no_temporary_files(tmp_path: Path) -> None:
+    """正常な保存・状態更新後に原子的置換用の一時ファイルを残さない。"""
+    spool = Spool(tmp_path)
+    meta = spool.save(b'RIFFwav', metadata())
+    meta.state = 'uploading'
+    spool.update(meta)
+    assert list(tmp_path.glob('*.tmp')) == []

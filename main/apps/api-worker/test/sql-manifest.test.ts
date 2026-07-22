@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -68,7 +68,7 @@ function capturingEnv(collected: Set<string>): Env {
 }
 
 describe('SQLマニフェスト', () => {
-  it('review/delete/workflowの全SQL文を捕捉してマニフェストへ書き出す', async () => {
+  it('review/delete/workflowの捕捉SQLがコミット済みマニフェストと一致する', async () => {
     const collected = new Set<string>();
     const env = capturingEnv(collected);
     const target = { id: 'rec_1', householdId: 'hh', version: 1, reviewStatus: 'pending', analysisStatus: 'ready', capturedAt: '2026-07-22T00:00:00.000Z' };
@@ -99,7 +99,7 @@ describe('SQLマニフェスト', () => {
     const statements = [...collected].sort();
     expect(statements.length).toBeGreaterThan(25);
     const manifestPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'sql-manifest.json');
-    mkdirSync(dirname(manifestPath), { recursive: true });
-    writeFileSync(manifestPath, `${JSON.stringify({ statements }, null, 2)}\n`, 'utf-8');
+    const committed = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { statements: string[] };
+    expect(committed.statements).toEqual(statements);
   });
 });
