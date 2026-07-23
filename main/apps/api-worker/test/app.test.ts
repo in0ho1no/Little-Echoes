@@ -609,6 +609,8 @@ describe('ルーターと録音API', () => {
     expect(script).toContain("fetch('/api/v1/recordings/'");
     expect(script).toContain('let remaining=180');
     expect(script).toContain('setTimeout(poll,5000)');
+    expect(html).toContain('id="processing-status"');
+    expect(script).toContain('更新が停止しました。ページを再読み込みしてください。');
   });
 
   for (const [code, expected] of [

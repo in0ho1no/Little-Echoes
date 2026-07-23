@@ -45,7 +45,10 @@ export function classifyOpenAiError(error: unknown): OpenAiAnalysisError {
   }
   if (candidate?.status === 429) return new OpenAiAnalysisError('UPSTREAM_RATE_LIMIT', true);
   if (typeof candidate?.status === 'number' && candidate.status >= 500) return new OpenAiAnalysisError('UPSTREAM_UNAVAILABLE', true);
-  // A response whose outcome cannot be established must never be replayed automatically.
+  // No status also covers pre-send failures (DNS/TLS/immediate fetch rejection) where the
+  // request never reached OpenAI. The SDK does not reliably expose a "was it sent" signal,
+  // so this stays on the safe side (UPSTREAM_RESULT_UNKNOWN, no auto-replay) at the cost of
+  // consuming one attempt/quota slot even for ordinary connectivity blips.
   if (!candidate?.status) return new OpenAiAnalysisError('UPSTREAM_RESULT_UNKNOWN', false);
   return new OpenAiAnalysisError('UPSTREAM_REJECTED', false);
 }

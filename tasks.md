@@ -197,7 +197,15 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 - [x] Terra実装、Sol独立レビュー、横断アーキテクチャレビュー、Python Review、Python Qualityを実施し、指摘を修正した。利用可能モデルにFable5がないためFable5レビューだけを完了条件として残す。
 - [x] `gpt-realtime-whisper`転写、`gpt-5.6-luna`構造化単語抽出、R2音声検証、D1の録音別3試行・UTC日別100呼び出し予約、認可トークン再検証、手動再解析と安全な失敗表示を実装した。
 - [x] Ruff、整形確認、mypy、pyrightを再実行して成功し、最終SQLマニフェストを含むpytest 130件が成功した。
-- [ ] 手動再試行制限までのWorker型検査とVitest 110件は成功した。その後の最終Sol・アーキテクチャ指摘（外部応答後D1障害の再送防止、Workflow/D1不一致の収束、CAS競合、処理中画面の有限ポーリング、終端dispatchの再送表示）を修正してテストを追加し、両レビューでHigh/Mediumなしを確認したが、Codex使用量上限により最終Worker再検証は未実施。
+- [x] 手動再試行制限までのWorker型検査とVitest 110件は成功した。その後の最終Sol・アーキテクチャ指摘（外部応答後D1障害の再送防止、Workflow/D1不一致の収束、CAS競合、処理中画面の有限ポーリング、終端dispatchの再送表示）を修正してテストを追加し、両レビューでHigh/Mediumなしを確認したが、Codex使用量上限により最終Worker再検証は未実施だった。
+- [x] Claude（本セッション）が上記の未実施だった最終Worker再検証を実施し、2件のゲート失敗と横断アーキテクチャレビュー（独立エージェント併用）でMedium 2件・Low 2件を検出・修正した（2026-07-23）。
+  - Vitest失敗: `sql-manifest.json`に現行`workflow.ts`のどのコードからも生成されない古いSQL文（`UPDATE async_jobs SET status = ?, last_error_code = ?, ... WHERE id = ? AND status = ?`）が残存していた。該当行を削除し再生成。
+  - 型検査エラー: `test/workflow.test.ts`で`options.batchErrorSql`（`string | undefined`）をネストしたクロージャ内の`.includes()`へ渡しナローイングが効かずTS2345。ローカル変数へ捕捉して解消。
+  - Medium: `POST /process`が実際に返す`500`（`UPSTREAM_RESULT_UNKNOWN`等）がopenapi.jsonの当該パスに未定義。`retry-analysis`と同様に`500`を追記。
+  - Medium: `review-detail.js`のポーリングが15分（180回）で打ち切られた際、直前のサーバー側収束確認自体が`unknown`だった場合に画面が「処理中です」のまま無言で固着しうる。打ち切り時に`processing-status`要素へ「更新が停止しました。ページを再読み込みしてください。」と表示するよう修正し、回帰テストを追加。
+  - Low: `classifyOpenAiError`の未送信ネットワーク障害も安全側で`UPSTREAM_RESULT_UNKNOWN`扱いする設計意図をコメントで明記（ロジックは変更せず、安全側を維持）。
+  - Low（対応見送り、意図的）: `0002_phase5_openai.sql`は`0001`と同じく`IF NOT EXISTS`なしで冪等でないが、SQLite/D1の`ALTER TABLE ADD COLUMN`はそもそも条件付き構文を持たず、Phase 2で確立済みの手動`d1_migrations`管理運用（README記載）と整合する意図的な設計。再適用時は静かな二重適用ではなく明示的エラーで安全に失敗するため、既存パターンから外れる変更はしない。
+  - 修正後にVitest 115件・Worker型検査・pytest 129件（マニフェスト1件減による自然減）・ruff/format/mypy/pyright・`git diff --check`を再実行し全て成功した。
 - [ ] 残りの外部ゲートは、非児童固定サンプルの選定と送信承認、OpenAI Secret投入、実API最小確認、Fable5レビュー、Cloudflareデプロイ、`DEMO_WRITE_ENABLED`の明示的な有効化である。
 
 ## Phase 6 — 日記・画像

@@ -73,7 +73,8 @@ function analysisEnv(options: AnalysisEnvOptions = {}): { env: Env; captured: Ca
     }),
     batch: async (statements: CapturedStatement[]) => {
       captured.push(statements);
-      if (options.batchErrorSql && statements.some((statement) => statement.sql.includes(options.batchErrorSql))) {
+      const batchErrorSql = options.batchErrorSql;
+      if (batchErrorSql && statements.some((statement) => statement.sql.includes(batchErrorSql))) {
         throw new Error('injected D1 batch failure');
       }
       return statements.map((statement) => ({
