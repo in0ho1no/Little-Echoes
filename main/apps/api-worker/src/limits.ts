@@ -5,6 +5,9 @@ export const DEMO_WRITE_DEADLINE = '2026-08-31T15:00:00.000Z';
 export const RECORDING_RETENTION_DAYS = 30;
 export const UPLOAD_RESERVED_STALE_MILLISECONDS = 10 * 60 * 1000;
 export const ANALYSIS_STALE_MILLISECONDS = 15 * 60 * 1000;
+export const OPENAI_REQUEST_TIMEOUT_MILLISECONDS = 30_000;
+export const MAX_WORD_CANDIDATES = 30;
+export const MAX_WORD_TEXT_LENGTH = 100;
 
 export function isDemoWriteAllowed(enabled: string, now = new Date()): boolean {
   return enabled === 'true' && now.getTime() < Date.parse(DEMO_WRITE_DEADLINE);

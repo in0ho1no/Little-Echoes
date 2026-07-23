@@ -8,13 +8,14 @@ import pytest
 
 API_WORKER_ROOT = Path(__file__).parents[3] / 'api-worker'
 MANIFEST_PATH = API_WORKER_ROOT / 'sql-manifest.json'
-MIGRATION_PATH = API_WORKER_ROOT / 'migrations' / '0001_initial.sql'
+MIGRATIONS_PATH = API_WORKER_ROOT / 'migrations'
 
 
-def apply_migration() -> sqlite3.Connection:
-    """メモリ上のSQLiteへ初期マイグレーションを適用する。"""
+def apply_migrations() -> sqlite3.Connection:
+    """メモリ上のSQLiteへ全マイグレーションを適用する。"""
     connection = sqlite3.connect(':memory:')
-    connection.executescript(MIGRATION_PATH.read_text(encoding='utf-8'))
+    for migration in sorted(MIGRATIONS_PATH.glob('*.sql')):
+        connection.executescript(migration.read_text(encoding='utf-8'))
     return connection
 
 
@@ -33,6 +34,6 @@ def test_manifest_exists_and_is_populated() -> None:
 @pytest.mark.parametrize('sql', load_statements(), ids=lambda sql: str(sql)[:60])
 def test_production_sql_compiles_against_real_schema(sql: str) -> None:
     """全本番SQL文が実スキーマ上でコンパイルできる（曖昧列名・構文非互換の検出）。"""
-    connection = apply_migration()
+    connection = apply_migrations()
     parameters = [None] * sql.count('?')
     connection.execute(f'EXPLAIN {sql}', parameters)

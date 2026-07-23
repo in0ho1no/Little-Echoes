@@ -30,6 +30,8 @@ export type Env = Omit<
   ACCESS_AUD: string;
   ADMIN_HOST: string;
   INGEST_HOST: string;
+  /** Secret binding only. It is never returned, logged, or stored in D1. */
+  OPENAI_API_KEY?: string;
   ACCESS_JWT_VERIFY?: (jwt: string, env: Env) => Promise<VerifiedAccessIdentity | null>;
 }
 

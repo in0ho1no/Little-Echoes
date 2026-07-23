@@ -132,6 +132,54 @@
         }
       }
     },
+    "/api/v1/recordings/{recording_id}/retry-analysis": {
+      "post": {
+        "operationId": "retryAnalysis",
+        "security": [
+          {
+            "accessJwt": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RecordingId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Version"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "$ref": "#/components/responses/AcceptedJob"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/v1/recordings/{recording_id}/audio": {
       "get": {
         "operationId": "streamAudio",
@@ -748,7 +796,8 @@
               "INVALID_LIMIT",
               "INVALID_MULTIPART",
               "INVALID_RECORDING_INPUT",
-              "INVALID_DELETE_INPUT",
+               "INVALID_DELETE_INPUT",
+               "INVALID_RETRY_INPUT",
               "INVALID_WAV",
               "CONTENT_LENGTH_REQUIRED",
               "AUDIO_TOO_LARGE",
@@ -761,7 +810,8 @@
               "MEDIA_STORAGE_FAILED",
               "ALREADY_PROCESSED",
               "PROCESSING_STATE_UNAVAILABLE",
-              "PROCESSING_ATTEMPT_LIMIT_REACHED",
+               "PROCESSING_ATTEMPT_LIMIT_REACHED",
+               "RETRY_NOT_AVAILABLE",
               "PROCESSING_FAILED",
               "JOB_RESERVATION_FAILED",
               "WORKFLOW_DISPATCH_FAILED",
@@ -772,6 +822,17 @@
               "DELETE_ATTEMPT_LIMIT_REACHED",
               "DELETE_RESERVATION_FAILED",
               "UPSTREAM_RESULT_UNKNOWN",
+              "EMPTY_TRANSCRIPT",
+              "INVALID_STRUCTURED_OUTPUT",
+              "OPENAI_NOT_CONFIGURED",
+              "UPSTREAM_RATE_LIMIT",
+              "UPSTREAM_UNAVAILABLE",
+              "UPSTREAM_REJECTED",
+              "EMPTY_WORD_CANDIDATES",
+              "TRANSCRIPT_TOO_LONG",
+              "ANALYSIS_STATE_CHANGED",
+              "AUDIO_NOT_AVAILABLE",
+              "INVALID_AUDIO",
               "INTERNAL_ERROR",
               "IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED"
             ]

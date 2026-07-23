@@ -13,7 +13,7 @@ const RECORDING_ID = 'rec_11111111111111111111111111111111';
 let tokenHmac = '';
 
 type FirstHandler = (sql: string) => unknown;
-type RunHandler = (sql: string) => D1Result<unknown>;
+type RunHandler = (sql: string, values: unknown[]) => D1Result<unknown>;
 
 type AllHandler = (sql: string) => unknown[];
 
@@ -25,8 +25,10 @@ function fakeDatabase(
   return {
     prepare: (sql: string) => ({
       bind: (..._values: unknown[]) => ({
+        sql,
+        values: _values,
         first: async () => first(sql),
-        run: async () => run(sql),
+        run: async () => run(sql, _values),
         all: async () => ({ results: allRows(sql) }),
       }),
     }),
@@ -381,6 +383,37 @@ describe('ルーターと録音API', () => {
     });
   });
 
+  it('failed初回job後のdevice process再送は新jobを作らず409へ収束する', async () => {
+    const inserts: string[] = [];
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('FROM device_tokens')) return deviceRow();
+        if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('failed');
+        if (sql.includes("status IN ('dispatch_pending', 'dispatched', 'running')")) return null;
+        if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 0 };
+        if (sql.includes('ORDER BY operation_number DESC')) {
+          return { id: 'job_initial', status: 'failed', correlation_id: 'corr_initial', last_error_code: 'WORKFLOW_DISPATCH_FAILED', updated_at: '2026-07-23T00:00:00.000Z', manual_retry: 0 };
+        }
+        return null;
+      },
+      (sql) => {
+        if (sql.includes('INSERT INTO async_jobs')) inserts.push(sql);
+        return { meta: { changes: sql.includes('INSERT INTO async_jobs') ? 0 : 1 } } as D1Result<unknown>;
+      },
+    );
+    let workflowCreated = false;
+    supplied.ANALYSIS_WORKFLOW = { create: async () => { workflowCreated = true; } } as unknown as Workflow<{ async_job_id: string }>;
+    const response = await app.fetch(
+      new Request(`https://ingest.example.test/api/v1/recordings/${RECORDING_ID}/process`, { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}` } }),
+      supplied,
+    );
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ code: 'RETRY_NOT_AVAILABLE' });
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toContain("NOT EXISTS (SELECT 1 FROM async_jobs WHERE recording_id = ? AND job_type = 'analysis')");
+    expect(workflowCreated).toBe(false);
+  });
+
   it('Workflow受付結果不明時は同じAsyncJob IDだけを再確認する', async () => {
     const job = { id: 'job_11111111111111111111111111111111', status: 'dispatch_pending', correlation_id: 'corr_original', last_error_code: null };
     const supplied = env((sql) => {
@@ -408,6 +441,38 @@ describe('ルーターと録音API', () => {
       await expect(response.json()).resolves.toMatchObject({ code: 'UPSTREAM_RESULT_UNKNOWN', retryable: false });
     }
     expect(new Set(createdIds)).toEqual(new Set([job.id]));
+  });
+
+  it('Workflow completeとD1非終端の不一致は結果不明へ原子的に収束する', async () => {
+    const job = { id: 'job_11111111111111111111111111111111', status: 'dispatch_pending', correlation_id: 'corr_original', last_error_code: null };
+    const supplied = env((sql) => {
+      if (sql.includes('FROM device_tokens')) return deviceRow();
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('pending');
+      if (sql === 'SELECT status FROM async_jobs WHERE id = ?') return { status: 'dispatch_pending' };
+      if (sql.includes('FROM async_jobs') && sql.includes("status IN ('dispatch_pending'")) return job;
+      return null;
+    });
+    const batches: Array<Array<{ sql: string; values: unknown[] }>> = [];
+    (supplied.DB as unknown as { batch: (statements: Array<{ sql: string; values: unknown[] }>) => Promise<D1Result<unknown>[]> }).batch = async (statements) => {
+      batches.push(statements);
+      return statements.map(() => ({ meta: { changes: 1 } }) as D1Result<unknown>);
+    };
+    supplied.ANALYSIS_WORKFLOW = {
+      create: async () => {
+        throw new Error('instance already exists');
+      },
+      get: async () => ({ status: async () => ({ status: 'complete' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    const response = await app.fetch(
+      new Request(`https://ingest.example.test/api/v1/recordings/${RECORDING_ID}/process`, { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}` } }),
+      supplied,
+    );
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({ code: 'UPSTREAM_RESULT_UNKNOWN', retryable: false });
+    const sql = batches.flat().map((statement) => statement.sql).join('\n');
+    expect(sql).toContain("last_error_code = ?");
+    expect(sql).toContain("analysis_status = 'failed'");
+    expect(batches.flat().some((statement) => statement.values.includes('UPSTREAM_RESULT_UNKNOWN'))).toBe(true);
   });
 
   it('確認待ち一覧の空状態をOpenAPI形式で返す', async () => {
@@ -462,6 +527,330 @@ describe('ルーターと録音API', () => {
     const body = await response.json<Record<string, unknown>>();
     expect(body.async_job).toBeUndefined();
     expect(body.error).toMatchObject({ code: 'UPSTREAM_RESULT_UNKNOWN', retryable: false });
+  });
+
+  it('partial解析は安全なエラーと手動補完・再試行の案内を返す', async () => {
+    const supplied = env((sql) => {
+      if (sql.includes('FROM device_tokens')) return deviceRow();
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('partial');
+      if (sql.includes('ORDER BY operation_number DESC')) {
+        return {
+          id: 'job_partial', status: 'succeeded', correlation_id: 'corr_partial',
+          last_error_code: 'EMPTY_TRANSCRIPT', updated_at: '2026-07-23T00:00:00.000Z',
+        };
+      }
+      return null;
+    });
+    const response = await app.fetch(
+      new Request(`https://ingest.example.test/api/v1/recordings/${RECORDING_ID}`, { headers: { Authorization: `Bearer ${TOKEN}` } }),
+      supplied,
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      analysis_status: 'partial',
+      error: {
+        code: 'EMPTY_TRANSCRIPT',
+        message: '一部の自動解析結果だけ取得できました。',
+        retryable: false,
+        correlation_id: 'corr_partial',
+        next_action: '手動で内容を補完するか、上限内で再試行してください。',
+      },
+    });
+  });
+
+  it('partial録音のHTMLは確認・補完を表示し、編集可能な終端状態として扱う', async () => {
+    const supplied = env((sql) => {
+      if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('partial');
+      if (sql.includes('FROM transcripts')) return { raw_text: 'りんご', reviewed_text: null };
+      if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 1 };
+      if (sql.includes('SELECT id FROM device_tokens')) return { id: 'dev_retry' };
+      if (sql.includes('ORDER BY operation_number DESC')) {
+        return { id: 'job_partial', status: 'succeeded', correlation_id: 'corr_partial', last_error_code: 'EMPTY_TRANSCRIPT', updated_at: '2026-07-23T00:00:00.000Z' };
+      }
+      return null;
+    });
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request(`https://app.example.test/recordings/${RECORDING_ID}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+      supplied,
+    );
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(body).toContain('確認待ちです。内容を確認・補完してください。');
+    expect(body).toContain('id="review-form"');
+    expect(body).toContain('data-action="save"');
+    expect(body).toContain('id="retry-analysis"');
+    expect(body).toContain('文字起こし結果が空でした。');
+    expect(body).not.toContain('処理中');
+    expect(body).not.toContain('（モック）');
+  });
+
+  it('処理中HTMLは状態APIを有限間隔で確認して終端時に再描画する', async () => {
+    const supplied = env((sql) => {
+      if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('pending');
+      return null;
+    });
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const page = await app.fetch(
+      new Request(`https://app.example.test/recordings/${RECORDING_ID}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+      supplied,
+    );
+    const html = await page.text();
+    expect(html).toContain(`data-recording-id="${RECORDING_ID}"`);
+    expect(html).toContain('<script src="/assets/review-detail.js"></script>');
+    expect(html).not.toContain('id="review-form"');
+    const asset = await app.fetch(
+      new Request('https://app.example.test/assets/review-detail.js', { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+      supplied,
+    );
+    const script = await asset.text();
+    expect(script).toContain("fetch('/api/v1/recordings/'");
+    expect(script).toContain('let remaining=180');
+    expect(script).toContain('setTimeout(poll,5000)');
+  });
+
+  for (const [code, expected] of [
+    ['EMPTY_WORD_CANDIDATES', '単語候補を抽出できませんでした。'],
+    ['UPSTREAM_UNAVAILABLE', '自動解析サービスで問題が発生しました。'],
+    ['PRIVATE_INTERNAL_DETAIL', '自動解析を完了できませんでした。取得済みの内容を確認してください。'],
+  ] as const) {
+    it(`partial HTMLは${code}を安全な理由へ変換する`, async () => {
+      const supplied = env((sql) => {
+        if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('partial');
+        if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 0 };
+        if (sql.includes('SELECT id FROM device_tokens')) return { id: 'dev_retry' };
+        if (sql.includes('ORDER BY operation_number DESC')) {
+          return { id: 'job_partial', status: 'succeeded', correlation_id: 'corr', last_error_code: code, updated_at: '2026-07-23T00:00:00.000Z' };
+        }
+        return null;
+      });
+      supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+      const response = await app.fetch(
+        new Request(`https://app.example.test/recordings/${RECORDING_ID}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+        supplied,
+      );
+      const body = await response.text();
+      expect(body).toContain(expected);
+      expect(body).not.toContain(code);
+    });
+  }
+
+  for (const unavailable of ['attempt-limit', 'kill-switch', 'missing-token', 'manual-used'] as const) {
+    it(`${unavailable}ではSSRにretryボタンを表示せず手動補完を案内する`, async () => {
+      const supplied = env((sql) => {
+        if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('failed');
+        if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: unavailable === 'attempt-limit' ? 3 : 1 };
+        if (sql.includes('SELECT id FROM device_tokens')) return unavailable === 'missing-token' ? null : { id: 'dev_retry' };
+        if (sql.includes('ORDER BY operation_number DESC')) {
+          return {
+            id: 'job_failed', status: 'failed', correlation_id: 'corr', last_error_code: 'UPSTREAM_UNAVAILABLE',
+            updated_at: '2026-07-23T00:00:00.000Z', manual_retry: unavailable === 'manual-used' ? 1 : 0,
+          };
+        }
+        return null;
+      });
+      if (unavailable === 'kill-switch') supplied.DEMO_WRITE_ENABLED = 'false';
+      supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+      const response = await app.fetch(
+        new Request(`https://app.example.test/recordings/${RECORDING_ID}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+        supplied,
+      );
+      const body = await response.text();
+      expect(body).not.toContain('id="retry-analysis"');
+      expect(body).toContain('手動で内容を補完してください。');
+    });
+  }
+
+  it('管理者はpartial録音を有効tokenに紐付けて有限回だけ再解析予約できる', async () => {
+    const insertValues: unknown[][] = [];
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('partial');
+        if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 1 };
+        if (sql.includes('SELECT id FROM device_tokens')) return { id: 'dev_retry' };
+        return null;
+      },
+      (sql, values) => {
+        if (sql.includes('INSERT INTO async_jobs')) insertValues.push(values);
+        return { meta: { changes: 1 } } as D1Result<unknown>;
+      },
+    );
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request(`https://app.example.test/api/v1/recordings/${RECORDING_ID}/retry-analysis`, {
+        method: 'POST',
+        headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token', 'Content-Type': 'application/json', 'Content-Length': '13' },
+        body: '{"version":1}',
+      }),
+      supplied,
+    );
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({ status: 'dispatched' });
+    expect(insertValues).toHaveLength(1);
+    expect(insertValues[0]).toContain('dev_retry');
+  });
+
+  it('明示手動retryを終端後に2回目予約せず409で拒否する', async () => {
+    let reservedId: string | null = null;
+    let insertCount = 0;
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('partial');
+        if (sql.includes('ORDER BY operation_number DESC') && reservedId) {
+          return { id: reservedId, status: 'succeeded', correlation_id: 'corr_manual', last_error_code: null, updated_at: '2026-07-23T00:00:00.000Z', manual_retry: 1 };
+        }
+        if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 1 };
+        if (sql.includes('SELECT id FROM device_tokens')) return { id: 'dev_retry' };
+        return null;
+      },
+      (sql, values) => {
+        if (sql.includes('INSERT INTO async_jobs')) {
+          insertCount += 1;
+          reservedId = String(values[0]);
+        }
+        return { meta: { changes: 1 } } as D1Result<unknown>;
+      },
+    );
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const request = () => new Request(`https://app.example.test/api/v1/recordings/${RECORDING_ID}/retry-analysis`, {
+      method: 'POST',
+      headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token', 'Content-Type': 'application/json', 'Content-Length': '13' },
+      body: '{"version":1}',
+    });
+    expect((await app.fetch(request(), supplied)).status).toBe(202);
+    expect((await app.fetch(request(), supplied)).status).toBe(409);
+    expect(insertCount).toBe(1);
+  });
+
+  it('明示dispatch失敗後の同じHTTP再送でも新しいmanual job IDを作らない', async () => {
+    let reservedId: string | null = null;
+    const insertedIds: string[] = [];
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('failed');
+        if (sql.includes('ORDER BY operation_number DESC') && reservedId) {
+          return { id: reservedId, status: 'failed', correlation_id: 'corr_manual', last_error_code: 'WORKFLOW_DISPATCH_FAILED', updated_at: '2026-07-23T00:00:00.000Z', manual_retry: 1 };
+        }
+        if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 1 };
+        if (sql.includes('SELECT id FROM device_tokens')) return { id: 'dev_retry' };
+        return null;
+      },
+      (sql, values) => {
+        if (sql.includes('INSERT INTO async_jobs')) {
+          reservedId = String(values[0]);
+          insertedIds.push(reservedId);
+        }
+        return { meta: { changes: 1 } } as D1Result<unknown>;
+      },
+    );
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    supplied.ANALYSIS_WORKFLOW = {
+      create: async () => { throw new Error('dispatch failed'); },
+      get: async () => ({ status: async () => ({ status: 'errored' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    const request = () => new Request(`https://app.example.test/api/v1/recordings/${RECORDING_ID}/retry-analysis`, {
+      method: 'POST',
+      headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token', 'Content-Type': 'application/json', 'Content-Length': '13' },
+      body: '{"version":1}',
+    });
+    expect((await app.fetch(request(), supplied)).status).toBe(500);
+    expect((await app.fetch(request(), supplied)).status).toBe(409);
+    expect(insertedIds).toHaveLength(1);
+  });
+
+  it('dispatch_pendingのmanual retry再送は同じjob IDを再dispatchする', async () => {
+    const supplied = env((sql) => {
+      if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('pending');
+      if (sql.includes('ORDER BY operation_number DESC')) {
+        return { id: 'job_manual', status: 'dispatch_pending', correlation_id: 'corr_manual', last_error_code: 'WORKFLOW_DISPATCH_UNKNOWN', updated_at: '2026-07-23T00:00:00.000Z', manual_retry: 1 };
+      }
+      return null;
+    });
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request(`https://app.example.test/api/v1/recordings/${RECORDING_ID}/retry-analysis`, {
+        method: 'POST',
+        headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token', 'Content-Type': 'application/json', 'Content-Length': '13' },
+        body: '{"version":1}',
+      }),
+      supplied,
+    );
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({ async_job_id: 'job_manual' });
+  });
+
+  it('device初回の明示dispatch失敗はjobと録音を同じbatchでfailedへ収束する', async () => {
+    const supplied = env((sql) => {
+      if (sql.includes('FROM device_tokens')) return deviceRow();
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('failed');
+      if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 0 };
+      return null;
+    });
+    const batches: string[][] = [];
+    const original = supplied.DB;
+    supplied.DB = {
+      ...original,
+      batch: async (statements: Array<{ sql: string }>) => {
+        batches.push(statements.map((statement) => statement.sql));
+        return statements.map(() => ({ meta: { changes: 1 } }));
+      },
+    } as unknown as D1Database;
+    supplied.ANALYSIS_WORKFLOW = {
+      create: async () => { throw new Error('dispatch failed'); },
+      get: async () => ({ status: async () => ({ status: 'errored' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    const response = await app.fetch(
+      new Request(`https://ingest.example.test/api/v1/recordings/${RECORDING_ID}/process`, { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}` } }),
+      supplied,
+    );
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({ code: 'WORKFLOW_DISPATCH_FAILED', retryable: false });
+    expect(batches.flat().some((sql) => sql.includes("UPDATE recordings SET analysis_status = 'failed'"))).toBe(true);
+    expect(batches.flat().join('\n')).toContain('newer.status IN');
+  });
+
+  it('管理retryの明示dispatch失敗も新active job/attemptをguardして録音をfailedへ収束する', async () => {
+    const supplied = env((sql) => {
+      if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM recordings r JOIN sources')) return recordingRow('partial');
+      if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 1 };
+      if (sql.includes('SELECT id FROM device_tokens')) return { id: 'dev_retry' };
+      return null;
+    });
+    const batches: string[][] = [];
+    const original = supplied.DB;
+    supplied.DB = {
+      ...original,
+      batch: async (statements: Array<{ sql: string }>) => {
+        batches.push(statements.map((statement) => statement.sql));
+        return statements.map(() => ({ meta: { changes: 1 } }));
+      },
+    } as unknown as D1Database;
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    supplied.ANALYSIS_WORKFLOW = {
+      create: async () => { throw new Error('dispatch failed'); },
+      get: async () => ({ status: async () => ({ status: 'terminated' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    const response = await app.fetch(
+      new Request(`https://app.example.test/api/v1/recordings/${RECORDING_ID}/retry-analysis`, {
+        method: 'POST',
+        headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token', 'Content-Type': 'application/json', 'Content-Length': '13' },
+        body: '{"version":1}',
+      }),
+      supplied,
+    );
+    expect(response.status).toBe(500);
+    const sql = batches.flat().join('\n');
+    expect(sql).toContain("analysis_status = 'failed'");
+    expect(sql).toContain('recordings.active_attempt_id');
   });
 
   it('15分停止したdispatch_pendingジョブは同一IDでWorkflow作成を再確認する', async () => {
