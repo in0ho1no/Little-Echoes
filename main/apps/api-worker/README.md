@@ -23,6 +23,38 @@ Node、pnpm、取得キャッシュ、pnpmストアはすべてWorkspaceの`.too
 
 デプロイ前には、対象ゾーン、デバイス用ホスト名、最小権限APIトークン、D1/R2実ID、Accessポリシー、HMAC Secretを別途確認する。`wrangler.toml`とSecret値はGitへ追加しない。
 
+## Cloudflare APIトークンの最小権限
+
+Phase 5の外部ゲート（Secret投入、D1マイグレーション適用、デプロイ）に必要な最小権限。
+ダッシュボードの「My Profile → API Tokens → Create Token → Custom token」で作成する。
+
+| スコープ | 権限グループ | レベル | 必要とする操作 |
+| --- | --- | --- | --- |
+| Account（対象アカウントのみ） | Workers Scripts | Edit | `wrangler deploy`、`wrangler secret put/list`（SecretはWorkerスクリプト設定の一部） |
+| Account（対象アカウントのみ） | D1 | Edit | `wrangler d1 migrations apply --remote`、`d1 execute --remote` |
+| Account（対象アカウントのみ） | Account Settings | Read | `wrangler whoami`とアカウント解決 |
+| Zone（`in0ho1no.com`のみ） | Workers Routes | Edit | `custom_domain = true`の2ホスト（`app.`/`ingest.`）の登録 |
+
+含めない権限: Workers R2 Storage（バケット作成済みで、デプロイ時のBinding接続に権限は不要）、
+Workers KV Storage（未使用）、Zone DNS（カスタムドメインのDNSレコードはWorkers Routes経由で管理される）。
+
+作成時の設定:
+
+- Account Resources / Zone Resources は対象アカウントと`in0ho1no.com`だけに限定する
+- TTL（有効期限）を設定する。デモ失効日の2026-09-01以前を推奨
+- トークン値はファイルへ保存せず、使用するPowerShellセッションでだけ環境変数へ設定する
+
+```powershell
+# トークン値は貼り付け入力し、履歴・ファイルへ残さない
+$env:CLOUDFLARE_API_TOKEN = Read-Host -MaskInput 'Cloudflare API Token'
+.\scripts\mise-local.ps1 pnpm exec wrangler whoami
+```
+
+`account_id`は`wrangler.toml`に記載済みのため`CLOUDFLARE_ACCOUNT_ID`は不要。
+権限グループ名はCloudflareの権限リファレンスに基づくが、Workflowsのデプロイとインスタンス照会が
+Workers Scripts Editでカバーされる点は公式に明記されていない。デプロイ時にAuthorizationエラー
+（code 10000系）が出た場合は、エラーメッセージが示す権限グループを1つずつ追加する。
+
 ## OpenAI API Secret
 
 `OPENAI_API_KEY`はPCクライアント、Wranglerの`vars`、設定ファイル、ログへ保存しない。CloudflareへのデプロイとSecret投入がユーザー承認済みであることを確認した後、対象WorkerへSecretとして設定する。
@@ -36,7 +68,7 @@ Secret値をコマンドライン引数、PowerShell履歴、リダイレクト�
 
 解析Workflowは次を固定する。
 
-- 文字起こしは`gpt-realtime-whisper`を`/v1/audio/transcriptions`で使用する
+- 文字起こしは`gpt-4o-transcribe`を`/v1/audio/transcriptions`で使用する
 - 単語抽出は`gpt-5.6-luna`のResponses APIと構造化出力を使用する
 - Responses APIは`store: false`、`background: false`
 - OpenAI SDKは`maxRetries: 0`

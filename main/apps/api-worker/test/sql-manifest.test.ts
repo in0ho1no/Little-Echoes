@@ -189,7 +189,7 @@ describe('SQLマニフェスト', () => {
     expect(statements.length).toBeGreaterThan(35);
     expect(statements.some((sql) => sql.includes('INSERT INTO processing_attempts'))).toBe(true);
     expect(statements.some((sql) => sql.includes('INSERT INTO openai_call_reservations'))).toBe(true);
-    expect(statements.some((sql) => sql.includes("INSERT INTO transcripts") && sql.includes('gpt-realtime-whisper'))).toBe(true);
+    expect(statements.some((sql) => sql.includes("INSERT INTO transcripts") && sql.includes('gpt-4o-transcribe'))).toBe(true);
     expect(statements.some((sql) => sql.includes('INSERT INTO word_candidates') && sql.includes('active_attempt_id'))).toBe(true);
     expect(statements.some((sql) => sql.includes("error_code = ?") && sql.includes("status = 'failed'"))).toBe(true);
     const manifestPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'sql-manifest.json');

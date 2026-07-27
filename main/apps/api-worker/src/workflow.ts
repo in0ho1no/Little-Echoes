@@ -193,7 +193,7 @@ async function completeAnalysis(
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
       `INSERT INTO transcripts (recording_id, raw_text, reviewed_text, language, model, prompt_version, created_at, updated_at)
-       SELECT ?, ?, NULL, 'ja', 'gpt-realtime-whisper', 'transcript-v1', ?, ? FROM recordings
+       SELECT ?, ?, NULL, 'ja', 'gpt-4o-transcribe', 'transcript-v1', ?, ? FROM recordings
         WHERE id = ? AND household_id = ? AND active_attempt_id = ? AND review_status = 'pending'
        ON CONFLICT(recording_id) DO UPDATE SET raw_text = excluded.raw_text, language = excluded.language,
          model = excluded.model, prompt_version = excluded.prompt_version, updated_at = excluded.updated_at`,

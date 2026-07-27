@@ -65,7 +65,7 @@ export function createOpenAiAnalysisClient(apiKey: string): OpenAiAnalysisClient
       try {
         const response = await client.audio.transcriptions.create({
           file: await toFile(wav, 'recording.wav', { type: 'audio/wav' }),
-          model: 'gpt-realtime-whisper',
+          model: 'gpt-4o-transcribe',
           language: 'ja',
           response_format: 'json',
         });

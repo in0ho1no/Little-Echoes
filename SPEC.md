@@ -719,9 +719,9 @@ Workflowsの`step.do()`は既定で複数回試行されるため、既定値を
 
 使用モデル:
 
-- `gpt-realtime-whisper`
+- `gpt-4o-transcribe`
 - 呼び出しは`/v1/audio/transcriptions`へのRESTファイルアップロードとし、Realtime WebSocketは使用しない
-- 課金は音声時間単位（参考: $0.017/分、2026-07-20時点）。最大20秒のクリップは1件あたり約$0.006以下となる
+- 課金は音声時間単位。最大20秒のクリップは1件あたり少額にとどまり、日次100回上限で総額を有界とする
 
 出力:
 
@@ -908,7 +908,7 @@ Workflowsの`step.do()`は既定で複数回試行されるため、既定値を
   "raw_text": "りんご たべたい",
   "reviewed_text": null,
   "language": "ja",
-  "model": "gpt-realtime-whisper",
+  "model": "gpt-4o-transcribe",
   "prompt_version": "transcript-v1",
   "created_at": "2026-07-20T01:00:10Z",
   "updated_at": "2026-07-20T01:00:10Z"
@@ -1696,7 +1696,7 @@ Phase 1の実装で必要なD1制約、R2キー形式、ジョブ・認可・エ
 
 | 項目 | 決定 |
 | --- | --- |
-| OpenAIモデル | 文字起こし: `gpt-realtime-whisper`（`/v1/audio/transcriptions`へのRESTファイルアップロードで使用。音声時間単位課金のため20秒クリップは約$0.006以下）。単語抽出・日記文生成: `gpt-5.6-luna`（提出要件のGPT-5.6製品内利用にも該当）。画像生成: `gpt-image-2`（`gpt-image-1`はdeprecated） |
+| OpenAIモデル | 文字起こし: `gpt-4o-transcribe`（`/v1/audio/transcriptions`へのRESTファイルアップロードで使用。音声時間単位課金で日次100回上限により有界。当初の`gpt-realtime-whisper`は実APIでREST非対応が確認されたため2026-07-28に変更）。単語抽出・日記文生成: `gpt-5.6-luna`（提出要件のGPT-5.6製品内利用にも該当）。画像生成: `gpt-image-2`（`gpt-image-1`はdeprecated） |
 | 日記文・画像生成の実行方式 | Cloudflare Workflowsによる非同期処理で統一する。Phase 6の日記・画像生成APIはD1トランザクションとWorkflow受付後に`202 Accepted`を返し、生成結果は状態ポーリングで取得する。Phase 3の承認APIは日記下書きまでを同期確定して`200 OK`を返す（2026-07-22のPhase 3分離決定で更新） |
 | 画像サイズ・品質 | `size: "1024x1024"`、`quality: "low"`に固定する。絵日記風の画風には低品質で十分でありコストも抑えられる |
 | Webフロントエンド構成 | Honoによるサーバーレンダリング+最小限のvanilla JS。独立したSPA用パイプラインは追加しないが、WranglerによるWorkerのビルド・バンドルは行う。同じWorkerスクリプトを管理用・デバイス用の2ホストへルーティングし、Cloudflare Accessは管理用ホストだけに適用する |
@@ -1762,7 +1762,7 @@ Phase 1の実装で必要なD1制約、R2キー形式、ジョブ・認可・エ
 
 | 項目 | 決定 |
 | --- | --- |
-| `gpt-realtime-whisper` | OpenAI公式モデルページが`/v1/audio/transcriptions`対応を示す一方、同エンドポイントのAPIリファレンスにある列挙値へ未反映という文書間の差を確認した。ユーザー承認により既定モデル`gpt-realtime-whisper`とファイル型REST転写を維持し、公式SDKの型検査と、承認済み固定サンプルによる最小1回の実API確認をPhase 5の完了ゲートとする。実APIで非対応が確認された場合はモデルを黙って変更せず、本書を先に更新して再承認を得る |
+| `gpt-realtime-whisper` | OpenAI公式モデルページが`/v1/audio/transcriptions`対応を示す一方、同エンドポイントのAPIリファレンスにある列挙値へ未反映という文書間の差を確認した。ユーザー承認により既定モデル`gpt-realtime-whisper`とファイル型REST転写を維持し、公式SDKの型検査と、承認済み固定サンプルによる最小1回の実API確認をPhase 5の完了ゲートとする。実APIで非対応が確認された場合はモデルを黙って変更せず、本書を先に更新して再承認を得る → 2026-07-28の実API確認で非対応を確認（`Invalid URL`応答。モデル一覧には存在するがREST転写エンドポイントが受理しない）。定めた手順どおり本書を更新し、ユーザー再承認のうえ`gpt-4o-transcribe`へ変更した |
 | 構造化出力 | 単語抽出は公式SDKのZod連携を使用し、APIへ渡すJSON SchemaとWorker側の実行時検証を同じ定義から生成する。ZodはMIT License、OpenAI Node SDKはApache License 2.0であり、バージョンを固定して配布時のライセンス表示を維持する |
 | 単語候補の禁止条件 | 意味内容の自動禁止語リストは設けない。空・空白だけ、制御文字、Schema・文字数・候補数違反を技術的な禁止条件とし、候補を保存せず`partial`へ遷移する。固有名詞・幼児語を含む意味内容の判断は親のレビューを正とする |
 | AI呼び出しの認可 | 解析用`AsyncJob`へ受付時の不透明な`device_tokens.id`を保存し、各OpenAI呼び出し直前に同じトークン行の世帯・入力元・有効期限・失効状態を再検証する。トークン削除で参照が`NULL`になった場合は安全側に解析を拒否する |
