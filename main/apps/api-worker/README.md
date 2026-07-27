@@ -1,11 +1,11 @@
-# Phase 2 API Worker
+# Little Echoes API Worker
 
 このディレクトリには、Cloudflareへ適用する前にレビューできるWorker、D1初期マイグレーション、Wrangler設定テンプレートを置く。
 
 - `migrations/0001_initial.sql` はPhase 1契約の制約をD1へ移す
 - `wrangler.template.toml` はBinding名と互換日だけを固定する。実ID、ホスト名、Secretは含めない
-- `src/` は管理用・デバイス用ホストをルーター段階で分離し、固定WAV、有限上限、非公開R2、モック解析Workflowを実装する
-- Phase 2ではOpenAI APIを呼ばない。解析結果は固定のモックデータだけである
+- `src/` は管理用・デバイス用ホストをルーター段階で分離し、固定WAV、有限上限、非公開R2、OpenAI解析Workflowを実装する
+- 自動テストではOpenAI APIを呼ばず、注入した固定応答だけを使用する
 
 ## ローカル実行
 
@@ -22,6 +22,64 @@ Node、pnpm、取得キャッシュ、pnpmストアはすべてWorkspaceの`.too
 `mise-local.ps1`はwingetで導入済みのmiseを実行するだけで、miseが作成するNode本体とキャッシュの保存先をWorkspace内へ固定する。`worker-configuration.d.ts`は`pnpm run typecheck`ごとにWranglerが再生成するためGitへ追加しない。
 
 デプロイ前には、対象ゾーン、デバイス用ホスト名、最小権限APIトークン、D1/R2実ID、Accessポリシー、HMAC Secretを別途確認する。`wrangler.toml`とSecret値はGitへ追加しない。
+
+## Cloudflare APIトークンの最小権限
+
+Phase 5の外部ゲート（Secret投入、D1マイグレーション適用、デプロイ）に必要な最小権限。
+ダッシュボードの「My Profile → API Tokens → Create Token → Custom token」で作成する。
+
+| スコープ | 権限グループ | レベル | 必要とする操作 |
+| --- | --- | --- | --- |
+| Account（対象アカウントのみ） | Workers Scripts | Edit | `wrangler deploy`、`wrangler secret put/list`（SecretはWorkerスクリプト設定の一部） |
+| Account（対象アカウントのみ） | D1 | Edit | `wrangler d1 migrations apply --remote`、`d1 execute --remote` |
+| Account（対象アカウントのみ） | Account Settings | Read | `wrangler whoami`とアカウント解決 |
+| Zone（`in0ho1no.com`のみ） | Workers Routes | Edit | `custom_domain = true`の2ホスト（`app.`/`ingest.`）の登録 |
+
+含めない権限: Workers R2 Storage（バケット作成済みで、デプロイ時のBinding接続に権限は不要）、
+Workers KV Storage（未使用）、Zone DNS（カスタムドメインのDNSレコードはWorkers Routes経由で管理される）。
+
+作成時の設定:
+
+- Account Resources / Zone Resources は対象アカウントと`in0ho1no.com`だけに限定する
+- TTL（有効期限）を設定する。デモ失効日の2026-09-01以前を推奨
+- トークン値はファイルへ保存せず、使用するPowerShellセッションでだけ環境変数へ設定する
+
+```powershell
+# トークン値は貼り付け入力し、履歴・ファイルへ残さない
+$env:CLOUDFLARE_API_TOKEN = Read-Host -MaskInput 'Cloudflare API Token'
+.\scripts\mise-local.ps1 pnpm exec wrangler whoami
+```
+
+`account_id`は`wrangler.toml`に記載済みのため`CLOUDFLARE_ACCOUNT_ID`は不要。
+権限グループ名はCloudflareの権限リファレンスに基づくが、Workflowsのデプロイとインスタンス照会が
+Workers Scripts Editでカバーされる点は公式に明記されていない。デプロイ時にAuthorizationエラー
+（code 10000系）が出た場合は、エラーメッセージが示す権限グループを1つずつ追加する。
+
+## OpenAI API Secret
+
+`OPENAI_API_KEY`はPCクライアント、Wranglerの`vars`、設定ファイル、ログへ保存しない。CloudflareへのデプロイとSecret投入がユーザー承認済みであることを確認した後、対象WorkerへSecretとして設定する。
+
+```powershell
+.\scripts\mise-local.ps1 pnpm exec wrangler secret put OPENAI_API_KEY --config wrangler.toml
+.\scripts\mise-local.ps1 pnpm exec wrangler secret list --config wrangler.toml
+```
+
+Secret値をコマンドライン引数、PowerShell履歴、リダイレクト先ファイルへ含めない。`secret put`の対話入力を使用する。Secret投入後も、固定サンプル、日次・録音別上限、期限、緊急停止、レビュー、デプロイの各ゲートが完了するまで`DEMO_WRITE_ENABLED=false`を維持する。
+
+解析Workflowは次を固定する。
+
+- 文字起こしは`gpt-4o-transcribe`を`/v1/audio/transcriptions`で使用する
+- 単語抽出は`gpt-5.6-luna`のResponses APIと構造化出力を使用する
+- Responses APIは`store: false`、`background: false`
+- OpenAI SDKは`maxRetries: 0`
+- Workflowへ渡すペイロードは`AsyncJob.id`だけで、音声、文字起こし、プロンプト、Secretを保持しない
+
+## Phase 5依存ライセンス
+
+- `openai` 6.48.0: Apache License 2.0
+- `zod` 4.4.3: MIT License
+
+どちらもバージョンを`package.json`と`pnpm-lock.yaml`へ固定する。配布時は各パッケージのライセンス・著作権表示を維持し、最終的な公開リポジトリのライセンス判断とは分離して扱う。
 
 30日後の完全削除は、R2、関連する全D1行、辞典再集計、トゥームストーン、最大3回の総削除予算を同じ削除Workflowで収束させる。Workflow起動結果が不明な場合も新しいIDを作らず、同じIDだけを最大3回照合する。3回とも不明なら録音を非表示のまま隔離して自動操作を停止し、`DELETE_WORKFLOW_DISPATCH_QUARANTINED`を運用確認対象として残す。`queued`/`running`などの非終端状態が24時間続いた場合は旧インスタンスの終了を確認してから、有限予算内の次回試行へ進める。終了結果が不明ならleaseを保持して重複終了要求を防ぎ、3回で同様に隔離する。日次最大10件のうち再調停は最大5件とし、再調停した録音を同じ日次処理の期限候補から除外して、新規削除へ毎回5件以上の枠を残す。
 

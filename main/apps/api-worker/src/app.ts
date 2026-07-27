@@ -43,6 +43,7 @@ interface JobRow {
   correlation_id: string;
   last_error_code: string | null;
   updated_at: string;
+  manual_retry: number;
 }
 
 interface TranscriptRow {
@@ -79,6 +80,7 @@ function allowedRoute(host: string, method: string, path: string, env: Env): boo
   const recordingPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}$/;
   const reviewPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/review$/;
   const approvalPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/approve$/;
+  const retryAnalysisPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/retry-analysis$/;
   const dictionaryPath = /^\/api\/v1\/dictionary\/word_[a-z0-9]{32}$/;
   if (host === env.INGEST_HOST) {
     return (
@@ -90,7 +92,7 @@ function allowedRoute(host: string, method: string, path: string, env: Env): boo
   if (host === env.ADMIN_HOST) {
     if (method === 'DELETE') return recordingPath.test(path);
     if (method === 'PATCH') return reviewPath.test(path);
-    if (method === 'POST') return approvalPath.test(path);
+    if (method === 'POST') return approvalPath.test(path) || retryAnalysisPath.test(path);
     return (
       method === 'GET' &&
       (path === '/' ||
@@ -268,10 +270,22 @@ function acceptedJobResponse(jobIdValue: string, status: string, correlationId: 
 
 async function latestJob(env: Env, recordingIdValue: string): Promise<JobRow | null> {
   return env.DB.prepare(
-    'SELECT id, status, correlation_id, last_error_code, updated_at FROM async_jobs WHERE recording_id = ? AND job_type = ? ORDER BY operation_number DESC LIMIT 1',
+    'SELECT id, status, correlation_id, last_error_code, updated_at, manual_retry FROM async_jobs WHERE recording_id = ? AND job_type = ? ORDER BY operation_number DESC LIMIT 1',
   )
     .bind(recordingIdValue, 'analysis')
     .first<JobRow>();
+}
+
+function safeAnalysisReason(code: string | null | undefined): string {
+  if (code === 'EMPTY_TRANSCRIPT') return '文字起こし結果が空でした。音声を確認して手動で補完できます。';
+  if (code === 'EMPTY_WORD_CANDIDATES') return '単語候補を抽出できませんでした。必要な単語を手動で追加できます。';
+  if (code === 'COST_LIMIT_REACHED') return '本日のデモ上限に達しました。';
+  if (code === 'TRANSCRIPT_TOO_LONG') return '文字起こし結果が長すぎたため、自動解析を完了できませんでした。';
+  if (code === 'AUDIO_NOT_AVAILABLE' || code === 'INVALID_AUDIO') return '保存音声を自動解析に利用できませんでした。';
+  if (code === 'UPSTREAM_RATE_LIMIT' || code === 'UPSTREAM_UNAVAILABLE' || code === 'UPSTREAM_REJECTED' || code === 'UPSTREAM_RESULT_UNKNOWN') {
+    return '自動解析サービスで問題が発生しました。';
+  }
+  return '自動解析を完了できませんでした。取得済みの内容を確認してください。';
 }
 
 export const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -489,7 +503,38 @@ async function envRecordingByCapture(env: Env, identity: DeviceIdentity, clientC
     .first<RecordingRow>();
 }
 
-type DispatchResult = 'dispatch_pending' | 'dispatched' | 'failed' | 'unknown';
+type DispatchResult = 'dispatch_pending' | 'dispatched' | 'failed' | 'result_unknown' | 'unknown';
+
+async function convergeAnalysisDispatchFailure(env: Env, id: string, errorCode: 'UPSTREAM_RESULT_UNKNOWN' | 'WORKFLOW_DISPATCH_FAILED'): Promise<boolean> {
+  const failedAt = new Date().toISOString();
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE processing_attempts
+          SET status = 'unknown', error_code = ?, retryable = 0, finished_at = ?
+        WHERE job_id = ? AND processing_kind = 'analysis' AND status = 'running'`,
+    ).bind(errorCode, failedAt, id),
+    env.DB.prepare(
+      `UPDATE async_jobs SET status = 'failed', last_error_code = ?, finished_at = ?, updated_at = ?
+        WHERE id = ? AND status IN ('dispatch_pending', 'dispatched', 'running')`,
+    ).bind(errorCode, failedAt, failedAt, id),
+    env.DB.prepare(
+      `UPDATE recordings SET analysis_status = 'failed', updated_at = ?
+        WHERE id = (SELECT recording_id FROM async_jobs WHERE id = ? AND status = 'failed' AND last_error_code = ?)
+          AND household_id = (SELECT household_id FROM async_jobs WHERE id = ? AND status = 'failed' AND last_error_code = ?)
+          AND review_status = 'pending' AND analysis_status IN ('pending', 'transcribing', 'extracting_words')
+          AND NOT EXISTS (
+            SELECT 1 FROM async_jobs newer
+             WHERE newer.recording_id = recordings.id AND newer.id <> ?
+               AND newer.job_type = 'analysis' AND newer.status IN ('dispatch_pending', 'dispatched', 'running')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_attempts active
+             WHERE active.id = recordings.active_attempt_id AND active.status = 'running'
+          )`,
+    ).bind(failedAt, id, errorCode, id, errorCode, id),
+  ]);
+  return (results[1]?.meta.changes ?? 0) === 1;
+}
 
 async function ensureAnalysisWorkflow(env: Env, id: string): Promise<DispatchResult> {
   let created = false;
@@ -507,18 +552,20 @@ async function ensureAnalysisWorkflow(env: Env, id: string): Promise<DispatchRes
       const status = typeof observed?.status === 'string' ? observed.status : 'unknown';
       if (status === 'unknown') return 'unknown';
       if (['errored', 'terminated'].includes(status)) {
-        const failedAt = new Date().toISOString();
-        await env.DB.prepare(
-          'UPDATE async_jobs SET status = ?, last_error_code = ?, finished_at = ?, updated_at = ? WHERE id = ? AND status = ?',
-        )
-          .bind('failed', 'WORKFLOW_DISPATCH_FAILED', failedAt, failedAt, id, 'dispatch_pending')
-          .run();
-        return 'failed';
+        if (await convergeAnalysisDispatchFailure(env, id, 'WORKFLOW_DISPATCH_FAILED')) return 'failed';
+        const job = await env.DB.prepare('SELECT status FROM async_jobs WHERE id = ?').bind(id).first<{ status: string }>();
+        if (job?.status === 'succeeded') return 'dispatched';
+        if (job?.status === 'failed') return 'failed';
+        return 'unknown';
       }
       if (status === 'complete') {
         const job = await env.DB.prepare('SELECT status FROM async_jobs WHERE id = ?').bind(id).first<{ status: string }>();
         if (job?.status === 'succeeded') return 'dispatched';
         if (job?.status === 'failed') return 'failed';
+        if (await convergeAnalysisDispatchFailure(env, id, 'UPSTREAM_RESULT_UNKNOWN')) return 'result_unknown';
+        const settled = await env.DB.prepare('SELECT status FROM async_jobs WHERE id = ?').bind(id).first<{ status: string }>();
+        if (settled?.status === 'succeeded') return 'dispatched';
+        if (settled?.status === 'failed') return 'failed';
         return 'unknown';
       }
     } catch {
@@ -557,7 +604,8 @@ app.post('/api/v1/recordings/:id/process', async (c) => {
   if (currentJob) {
     const dispatch = currentJob.status === 'dispatch_pending' ? await ensureAnalysisWorkflow(c.env, currentJob.id) : currentJob.status;
     if (dispatch === 'unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理の受付結果を確認できません。', false, '状態を確認してから同じ要求を再送してください。');
-    if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', true, '状態を確認してから再試行してください。');
+    if (dispatch === 'result_unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理結果を確認できなかったため安全側で終了しました。', false, '管理画面から状態を確認し、必要なら明示的に再試行してください。');
+    if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', false, '管理画面から状態を確認し、必要なら明示的に再試行してください。');
     return c.json(acceptedJobResponse(currentJob.id, dispatch, c.get('correlationId')), 202);
   }
   if (recording.analysis_status === 'ready') return responseError(c, 409, 'ALREADY_PROCESSED', '録音はすでに処理済みです。', false, '現在の状態を確認してください。');
@@ -579,17 +627,16 @@ app.post('/api/v1/recordings/:id/process', async (c) => {
   const now = new Date().toISOString();
   try {
     await c.env.DB.prepare(
-      `INSERT INTO async_jobs (id, household_id, recording_id, job_type, status, operation_number, correlation_id, created_at, updated_at)
-       SELECT ?, ?, ?, 'analysis', 'dispatch_pending',
-              COALESCE((SELECT MAX(operation_number) + 1 FROM async_jobs WHERE recording_id = ? AND job_type = 'analysis'), 1),
-              ?, ?, ?
-        WHERE (SELECT COUNT(*) FROM processing_attempts WHERE recording_id = ? AND processing_kind = 'analysis') < 3
+      `INSERT INTO async_jobs (id, household_id, recording_id, job_type, status, operation_number, correlation_id, authorization_token_id, created_at, updated_at)
+       SELECT ?, ?, ?, 'analysis', 'dispatch_pending', 1, ?, ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM async_jobs WHERE recording_id = ? AND job_type = 'analysis')
+          AND (SELECT COUNT(*) FROM processing_attempts WHERE recording_id = ? AND processing_kind = 'analysis') < 3
           AND NOT EXISTS (
             SELECT 1 FROM async_jobs WHERE recording_id = ? AND job_type = 'analysis'
               AND status IN ('dispatch_pending', 'dispatched', 'running')
           )`,
     )
-      .bind(id, identity.householdId, recording.id, recording.id, c.get('correlationId'), now, now, recording.id, recording.id)
+      .bind(id, identity.householdId, recording.id, c.get('correlationId'), identity.id, now, now, recording.id, recording.id, recording.id)
       .run()
       .then((result) => {
         if ((result.meta.changes ?? 0) !== 1) throw new Error('analysis job was not reserved');
@@ -603,18 +650,112 @@ app.post('/api/v1/recordings/:id/process', async (c) => {
     if (raced) {
       const dispatch = raced.status === 'dispatch_pending' ? await ensureAnalysisWorkflow(c.env, raced.id) : raced.status;
       if (dispatch === 'unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理の受付結果を確認できません。', false, '状態を確認してから同じ要求を再送してください。');
-      if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', true);
+      if (dispatch === 'result_unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理結果を確認できなかったため安全側で終了しました。', false, '管理画面から状態を確認し、必要なら明示的に再試行してください。');
+      if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', false, '管理画面から状態を確認し、必要なら明示的に再試行してください。');
       return c.json(acceptedJobResponse(raced.id, dispatch, c.get('correlationId')), 202);
     }
     const exhausted = await c.env.DB.prepare('SELECT COUNT(*) AS attempt_count FROM processing_attempts WHERE recording_id = ? AND processing_kind = ?')
       .bind(recording.id, 'analysis')
       .first<{ attempt_count: number }>();
     if ((exhausted?.attempt_count ?? 0) >= 3) return responseError(c, 409, 'PROCESSING_ATTEMPT_LIMIT_REACHED', '解析の試行上限に達しました。', false, '手動で内容を入力してください。');
+    const previous = await latestJob(c.env, recording.id);
+    if (previous) return responseError(c, 409, 'RETRY_NOT_AVAILABLE', 'この録音の初回解析はすでに受け付け済みです。', false, '管理画面から状態を確認してください。');
     return responseError(c, 500, 'JOB_RESERVATION_FAILED', '処理の予約に失敗しました。', true, '状態を確認してから再試行してください。');
   }
   const dispatch = await ensureAnalysisWorkflow(c.env, id);
   if (dispatch === 'unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理の受付結果を確認できません。', false, '状態を確認してから同じ要求を再送してください。');
-  if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', true, '状態を確認してから再試行してください。');
+  if (dispatch === 'result_unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理結果を確認できなかったため安全側で終了しました。', false, '管理画面から状態を確認し、必要なら明示的に再試行してください。');
+  if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', false, '管理画面から状態を確認し、必要なら明示的に再試行してください。');
+  return c.json(acceptedJobResponse(id, dispatch, c.get('correlationId')), 202);
+});
+
+app.post('/api/v1/recordings/:id/retry-analysis', async (c) => {
+  const identity = await managementIdentity(c);
+  if (isResponse(identity)) return identity;
+  if (!isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED)) {
+    return responseError(c, 403, 'DEMO_WRITE_DISABLED', 'デモ書き込みは現在停止しています。', false, '手動入力で内容を補完してください。');
+  }
+  const contentLength = c.req.raw.headers.get('Content-Length');
+  if (!contentLength || !/^[0-9]+$/.test(contentLength) || Number(contentLength) > 128 || !c.req.raw.headers.get('Content-Type')?.startsWith('application/json')) {
+    return responseError(c, 422, 'INVALID_RETRY_INPUT', '再解析要求が不正です。');
+  }
+  let body: unknown;
+  try {
+    body = await c.req.raw.json();
+  } catch {
+    return responseError(c, 422, 'INVALID_RETRY_INPUT', '再解析要求が不正です。');
+  }
+  const version = typeof body === 'object' && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && 'version' in body ? (body as { version?: unknown }).version : null;
+  if (!Number.isSafeInteger(version) || typeof version !== 'number' || version < 1) {
+    return responseError(c, 422, 'INVALID_RETRY_INPUT', '再解析要求が不正です。');
+  }
+  const recording = await findManagementRecording(c.env, identity, c.req.param('id'));
+  if (!recording) return responseError(c, 404, 'NOT_FOUND', '対象の録音は見つかりません。');
+  const previousRetry = await latestJob(c.env, recording.id);
+  if (previousRetry?.manual_retry === 1) {
+    if (['dispatch_pending', 'dispatched', 'running'].includes(previousRetry.status)) {
+      const dispatch = previousRetry.status === 'dispatch_pending' ? await ensureAnalysisWorkflow(c.env, previousRetry.id) : previousRetry.status;
+      if (dispatch === 'unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理の受付結果を確認できません。', false, '同じ再試行ボタンで受付状態を再確認してください。');
+      if (dispatch === 'result_unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理結果を確認できなかったため安全側で終了しました。', false, '手動入力で内容を補完してください。');
+      if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', false, '手動入力で内容を補完してください。');
+      return c.json(acceptedJobResponse(previousRetry.id, dispatch, previousRetry.correlation_id), 202);
+    }
+    return responseError(c, 409, 'RETRY_NOT_AVAILABLE', '明示的な再解析はすでに使用済みです。', false, '手動入力で内容を補完してください。');
+  }
+  if (recording.version !== version) return responseError(c, 409, 'VERSION_CONFLICT', '録音は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+  if (recording.review_status !== 'pending' || !['partial', 'failed'].includes(recording.analysis_status)) {
+    return responseError(c, 409, 'RETRY_NOT_AVAILABLE', 'この録音は再解析できません。', false, '手動入力で内容を補完してください。');
+  }
+  const attempts = await c.env.DB.prepare('SELECT COUNT(*) AS attempt_count FROM processing_attempts WHERE recording_id = ? AND processing_kind = ?')
+    .bind(recording.id, 'analysis')
+    .first<{ attempt_count: number }>();
+  if ((attempts?.attempt_count ?? 0) >= 3) {
+    return responseError(c, 409, 'PROCESSING_ATTEMPT_LIMIT_REACHED', '解析の試行上限に達しました。', false, '手動入力で内容を補完してください。');
+  }
+  const now = new Date().toISOString();
+  const token = await c.env.DB.prepare(
+    `SELECT id FROM device_tokens
+      WHERE household_id = ? AND source_id = ? AND revoked_at IS NULL AND expires_at > ?
+      ORDER BY id ASC LIMIT 1`,
+  )
+    .bind(recording.household_id, recording.source_id, now)
+    .first<{ id: string }>();
+  if (!token) return responseError(c, 409, 'RETRY_NOT_AVAILABLE', '有効なデバイストークンがありません。', false, '手動入力で内容を補完してください。');
+  const id = jobId();
+  try {
+    const reserved = await c.env.DB.prepare(
+      `INSERT INTO async_jobs (id, household_id, recording_id, job_type, status, operation_number, correlation_id, authorization_token_id, manual_retry, created_at, updated_at)
+       SELECT ?, ?, ?, 'analysis', 'dispatch_pending', COALESCE(MAX(operation_number) + 1, 1), ?, ?, 1, ?, ?
+         FROM async_jobs
+        WHERE recording_id = ? AND job_type = 'analysis'
+       HAVING COUNT(*) >= 0
+          AND (SELECT COUNT(*) FROM processing_attempts WHERE recording_id = ? AND processing_kind = 'analysis') < 3
+          AND NOT EXISTS (SELECT 1 FROM async_jobs WHERE recording_id = ? AND job_type = 'analysis' AND status IN ('dispatch_pending', 'dispatched', 'running'))
+          AND EXISTS (SELECT 1 FROM recordings WHERE id = ? AND household_id = ? AND version = ? AND review_status = 'pending' AND analysis_status IN ('partial', 'failed'))`,
+    )
+      .bind(id, identity.householdId, recording.id, c.get('correlationId'), token.id, now, now, recording.id, recording.id, recording.id, recording.id, identity.householdId, version)
+      .run();
+    if ((reserved.meta.changes ?? 0) !== 1) throw new Error('analysis retry was not reserved');
+  } catch {
+    const existing = await c.env.DB.prepare(
+      `SELECT id, status, correlation_id, last_error_code, updated_at, manual_retry FROM async_jobs
+        WHERE recording_id = ? AND job_type = 'analysis' AND manual_retry = 1 AND status IN ('dispatch_pending', 'dispatched', 'running')`,
+    )
+      .bind(recording.id)
+      .first<JobRow>();
+    if (existing) {
+      const dispatch = existing.status === 'dispatch_pending' ? await ensureAnalysisWorkflow(c.env, existing.id) : existing.status;
+      if (dispatch === 'unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理の受付結果を確認できません。', false, '状態を確認してから明示的に再試行してください。');
+      if (dispatch === 'result_unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理結果を確認できなかったため安全側で終了しました。', false, '手動入力で内容を補完してください。');
+      if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', false, '手動入力で内容を補完してください。');
+      return c.json(acceptedJobResponse(existing.id, dispatch, c.get('correlationId')), 202);
+    }
+    return responseError(c, 409, 'RETRY_NOT_AVAILABLE', '再解析を予約できません。', false, '手動入力で内容を補完してください。');
+  }
+  const dispatch = await ensureAnalysisWorkflow(c.env, id);
+  if (dispatch === 'unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理の受付結果を確認できません。', false, '状態を確認してから明示的に再試行してください。');
+  if (dispatch === 'result_unknown') return responseError(c, 500, 'UPSTREAM_RESULT_UNKNOWN', '処理結果を確認できなかったため安全側で終了しました。', false, '手動入力で内容を補完してください。');
+  if (dispatch === 'failed') return responseError(c, 500, 'WORKFLOW_DISPATCH_FAILED', '処理の受付に失敗しました。', false, '手動入力で内容を補完してください。');
   return c.json(acceptedJobResponse(id, dispatch, c.get('correlationId')), 202);
 });
 
@@ -631,6 +772,12 @@ app.get('/api/v1/recordings/:id', async (c) => {
       const dispatch = await ensureAnalysisWorkflow(c.env, job.id);
       if (dispatch === 'dispatched') job = { ...job, status: 'dispatched' };
       else if (dispatch === 'failed') job = { ...job, status: 'failed', last_error_code: job.last_error_code ?? 'WORKFLOW_DISPATCH_FAILED' };
+      else if (dispatch === 'result_unknown') {
+        job = { ...job, status: 'failed', last_error_code: 'UPSTREAM_RESULT_UNKNOWN' };
+        const refreshed =
+          'sourceId' in identity ? await findDeviceRecording(c.env, identity, recording.id) : await findManagementRecording(c.env, identity, recording.id);
+        recording = refreshed ?? recording;
+      }
     }
   }
   if (job && ['dispatched', 'running'].includes(job.status)) {
@@ -657,8 +804,16 @@ app.get('/api/v1/recordings/:id', async (c) => {
   };
   if (job && ['dispatch_pending', 'dispatched', 'running'].includes(job.status)) {
     body.async_job = acceptedJobResponse(job.id, job.status, job.correlation_id);
+  } else if (recording.analysis_status === 'partial') {
+    body.error = errorBody(
+      job?.correlation_id ?? c.get('correlationId'),
+      job?.last_error_code ?? 'PROCESSING_FAILED',
+      '一部の自動解析結果だけ取得できました。',
+      false,
+      '手動で内容を補完するか、上限内で再試行してください。',
+    );
   } else if (job?.status === 'failed') {
-    body.error = errorBody(job.correlation_id, job.last_error_code ?? 'PROCESSING_FAILED', '処理に失敗しました。', false, '手動入力または上限内の再試行を選択してください。');
+    body.error = errorBody(job?.correlation_id ?? c.get('correlationId'), job?.last_error_code ?? 'PROCESSING_FAILED', '処理に失敗しました。', false, '手動入力または上限内の再試行を選択してください。');
   }
   return c.json(body);
 });
@@ -1036,7 +1191,30 @@ app.get('/recordings/:id', async (c) => {
       : await c.env.DB.prepare('SELECT surface, normalized, ? AS new_override FROM word_candidates WHERE recording_id = ? ORDER BY normalized')
           .bind('auto', recording.id)
           .all<{ surface: string; normalized: string; new_override: 'auto' | 'force_new' | 'force_not_new' }>();
-  const status = recording.analysis_status === 'ready' ? '確認待ちです。内容を確認してください。' : recording.analysis_status === 'failed' ? '処理に失敗しました。手動入力または再試行が必要です。' : '処理中です。少し待つと自動で更新されます。';
+  let canRetry = false;
+  let retryReason = '';
+  let analysisReason = '';
+  if (['partial', 'failed'].includes(recording.analysis_status)) {
+    const [attempts, token, job] = await Promise.all([
+      c.env.DB.prepare('SELECT COUNT(*) AS attempt_count FROM processing_attempts WHERE recording_id = ? AND processing_kind = ?')
+        .bind(recording.id, 'analysis').first<{ attempt_count: number }>(),
+      c.env.DB.prepare('SELECT id FROM device_tokens WHERE household_id = ? AND source_id = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY id ASC LIMIT 1')
+        .bind(recording.household_id, recording.source_id, new Date().toISOString()).first<{ id: string }>(),
+      latestJob(c.env, recording.id),
+    ]);
+    const activeJob = job && ['dispatch_pending', 'dispatched', 'running'].includes(job.status);
+    analysisReason = safeAnalysisReason(job?.last_error_code);
+    canRetry = isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED) && (attempts?.attempt_count ?? 0) < 3 && Boolean(token) && !activeJob && job?.manual_retry !== 1;
+    if (canRetry) retryReason = '自動解析をもう一度だけ明示的に試せます。';
+    else if (!isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED)) retryReason = '現在は再解析を利用できません。手動で内容を補完してください。';
+    else if ((attempts?.attempt_count ?? 0) >= 3) retryReason = '解析の試行上限に達しました。手動で内容を補完してください。';
+    else if (!token) retryReason = '有効な入力端末がないため再解析できません。手動で内容を補完してください。';
+    else if (activeJob) retryReason = '再解析を処理中です。完了までお待ちください。';
+    else if (job?.manual_retry === 1) retryReason = '明示的な再解析は使用済みです。手動で内容を補完してください。';
+    else retryReason = '再解析を利用できません。手動で内容を補完してください。';
+    retryReason = `${analysisReason} ${retryReason}`;
+  }
+  const status = ['ready', 'partial'].includes(recording.analysis_status) ? '確認待ちです。内容を確認・補完してください。' : recording.analysis_status === 'failed' ? '処理に失敗しました。手動入力または再試行が必要です。' : '処理中です。少し待つと自動で更新されます。';
   const candidateList = editableWords.results.map((candidate) => `<li>${escapeHtml(candidate.surface)}（${escapeHtml(candidate.normalized)}）</li>`).join('') || '<li>候補はまだありません。</li>';
   const editable = ['ready', 'partial', 'failed'].includes(recording.analysis_status);
   const wordControls =
@@ -1046,10 +1224,13 @@ app.get('/recordings/:id', async (c) => {
           `<fieldset data-review-word><label>表記<input data-word-display value="${escapeHtml(word.surface)}" maxlength="100" required></label><label>よみ<input data-word-normalized value="${escapeHtml(word.normalized)}" maxlength="100" required></label><label>NEW表示<select data-word-override aria-label="${index + 1}件目のNEW表示"><option value="auto"${word.new_override === 'auto' ? ' selected' : ''}>自動</option><option value="force_new"${word.new_override === 'force_new' ? ' selected' : ''}>常に表示</option><option value="force_not_new"${word.new_override === 'force_not_new' ? ' selected' : ''}>表示しない</option></select></label></fieldset>`,
       )
       .join('') || '<p>単語候補はありません。必要なら下の追加欄へ入力してください。</p>';
+  const retryButton = retryReason
+    ? `<p id="retry-reason">${escapeHtml(retryReason)}</p>${canRetry ? '<button type="button" id="retry-analysis">自動解析を再試行</button>' : ''}`
+    : '';
   const editor = editable
-    ? `<h2>確認・承認</h2><p id="save-status" aria-live="polite"></p><form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><button type="button" data-action="save">下書きを保存</button><button type="button" data-action="approve">承認する</button></form><script src="/assets/review-detail.js"></script>`
+    ? `<h2>確認・承認</h2><p id="save-status" aria-live="polite"></p>${retryButton}<form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><button type="button" data-action="save">下書きを保存</button><button type="button" data-action="approve">承認する</button></form>`
     : '<p>処理中は編集・承認できません。状態は自動的に更新されます。</p>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 録音</title></head><body><main><p><a href="/">確認待ち一覧へ戻る</a> · <a href="/dictionary">ことば辞典</a></p><h1>録音の確認</h1><p><strong>状態:</strong> ${escapeHtml(recording.analysis_status)}</p><p>${status}</p><p><strong>録音日時:</strong> ${escapeHtml(recording.captured_at)} (${escapeHtml(recording.captured_timezone)})</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし（モック）</h2><p>${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? 'まだありません。')}</p><h2>単語候補（モック）</h2><ul>${candidateList}</ul>${editor}</main></body></html>`);
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 録音</title></head><body><main data-recording-id="${recording.id}"><p><a href="/">確認待ち一覧へ戻る</a> · <a href="/dictionary">ことば辞典</a></p><h1>録音の確認</h1><p><strong>状態:</strong> ${escapeHtml(recording.analysis_status)}</p><p id="processing-status">${status}</p><p><strong>録音日時:</strong> ${escapeHtml(recording.captured_at)} (${escapeHtml(recording.captured_timezone)})</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p>${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? 'まだありません。')}</p><h2>単語候補</h2><ul>${candidateList}</ul>${editor}</main><script src="/assets/review-detail.js"></script></body></html>`);
 });
 
 app.get('/assets/review.js', async (c) => {
@@ -1071,7 +1252,7 @@ app.get('/assets/review.js', async (c) => {
 app.get('/assets/review-detail.js', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  const script = `(()=>{const form=document.getElementById('review-form');if(!form)return;const status=document.getElementById('save-status');const field=name=>form.elements.namedItem(name);const buttons=form.querySelectorAll('button');const submit=async action=>{const words=[];for(const row of form.querySelectorAll('[data-review-word]')){const display=row.querySelector('[data-word-display]').value.trim();const normalized=row.querySelector('[data-word-normalized]').value.trim();const override=row.querySelector('[data-word-override]').value;if(!display||!normalized){status.textContent='候補の表記とよみを入力してください。';return}words.push({display_name:display,normalized,new_override:override})}const lines=String(field('additional_words').value).split('\\n').map(line=>line.trim()).filter(Boolean);for(const line of lines){const parts=line.split('|');if(parts.length!==2||!parts[0].trim()||!parts[1].trim()){status.textContent='追加単語は「表記|よみ」の形式で入力してください。';return}words.push({display_name:parts[0].trim(),normalized:parts[1].trim(),new_override:'auto'})}if(words.length>30||new Set(words.map(word=>word.normalized.normalize('NFKC').trim().toLocaleLowerCase('ja-JP'))).size!==words.length){status.textContent='単語は30件以内で、同じよみを重複登録できません。';return}const body={version:Number(form.dataset.version),reviewed_text:String(field('reviewed_text').value),words,captured_at:String(field('captured_at').value),captured_timezone:String(field('captured_timezone').value),scene:String(field('scene').value),parent_note:String(field('parent_note').value)};buttons.forEach(button=>button.disabled=true);status.textContent=action==='approve'?'承認を保存しています。':'下書きを保存しています。';try{const response=await fetch('/api/v1/recordings/'+encodeURIComponent(form.dataset.recordingId)+'/'+(action==='approve'?'approve':'review'),{method:action==='approve'?'POST':'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok){const error=await response.json().catch(()=>null);throw new Error(error&&error.message?error.message:'保存に失敗しました。')}status.textContent=action==='approve'?'承認しました。':'下書きを保存しました。';location.reload()}catch(error){status.textContent=error instanceof Error?error.message:'保存に失敗しました。'}finally{buttons.forEach(button=>button.disabled=false)}};form.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;if(action==='save'||action==='approve'){event.preventDefault();void submit(action)}})})();`;
+  const script = `(()=>{const form=document.getElementById('review-form');if(!form){const page=document.querySelector('main[data-recording-id]');if(!page||!/^rec_[a-z0-9]{32}$/.test(page.dataset.recordingId||''))return;let remaining=180;const stalled=()=>{const el=document.getElementById('processing-status');if(el)el.textContent='更新が停止しました。ページを再読み込みしてください。'};const poll=()=>{if(remaining--<=0){stalled();return}fetch('/api/v1/recordings/'+encodeURIComponent(page.dataset.recordingId)).then(response=>{if(!response.ok)throw new Error('status failed');return response.json()}).then(data=>{if(['ready','partial','failed'].includes(data.analysis_status)){location.reload();return}setTimeout(poll,5000)}).catch(()=>setTimeout(poll,10000))};setTimeout(poll,5000);return}const status=document.getElementById('save-status');const field=name=>form.elements.namedItem(name);const buttons=form.querySelectorAll('button');const retry=document.getElementById('retry-analysis');const submit=async action=>{const words=[];for(const row of form.querySelectorAll('[data-review-word]')){const display=row.querySelector('[data-word-display]').value.trim();const normalized=row.querySelector('[data-word-normalized]').value.trim();const override=row.querySelector('[data-word-override]').value;if(!display||!normalized){status.textContent='候補の表記とよみを入力してください。';return}words.push({display_name:display,normalized,new_override:override})}const lines=String(field('additional_words').value).split('\\n').map(line=>line.trim()).filter(Boolean);for(const line of lines){const parts=line.split('|');if(parts.length!==2||!parts[0].trim()||!parts[1].trim()){status.textContent='追加単語は「表記|よみ」の形式で入力してください。';return}words.push({display_name:parts[0].trim(),normalized:parts[1].trim(),new_override:'auto'})}if(words.length>30||new Set(words.map(word=>word.normalized.normalize('NFKC').trim().toLocaleLowerCase('ja-JP'))).size!==words.length){status.textContent='単語は30件以内で、同じよみを重複登録できません。';return}const body={version:Number(form.dataset.version),reviewed_text:String(field('reviewed_text').value),words,captured_at:String(field('captured_at').value),captured_timezone:String(field('captured_timezone').value),scene:String(field('scene').value),parent_note:String(field('parent_note').value)};buttons.forEach(button=>button.disabled=true);status.textContent=action==='approve'?'承認を保存しています。':'下書きを保存しています。';try{const response=await fetch('/api/v1/recordings/'+encodeURIComponent(form.dataset.recordingId)+'/'+(action==='approve'?'approve':'review'),{method:action==='approve'?'POST':'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok){const error=await response.json().catch(()=>null);throw new Error(error&&error.message?error.message:'保存に失敗しました。')}status.textContent=action==='approve'?'承認しました。':'下書きを保存しました。';location.reload()}catch(error){status.textContent=error instanceof Error?error.message:'保存に失敗しました。'}finally{buttons.forEach(button=>button.disabled=false)}};if(retry)retry.addEventListener('click',()=>{retry.disabled=true;status.textContent='自動解析を再試行しています。';fetch('/api/v1/recordings/'+encodeURIComponent(form.dataset.recordingId)+'/retry-analysis',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:Number(form.dataset.version)})}).then(async response=>{if(!response.ok){const error=await response.json().catch(()=>null);throw new Error(error&&error.message?error.message:'再試行を開始できませんでした。')}location.reload()}).catch(error=>{status.textContent=error instanceof Error?error.message:'再試行を開始できませんでした。';retry.disabled=false})});form.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;if(action==='save'||action==='approve'){event.preventDefault();void submit(action)}})})();`;
   return new Response(script, {
     headers: {
       'Content-Type': 'application/javascript; charset=utf-8',
