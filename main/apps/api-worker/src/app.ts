@@ -396,7 +396,7 @@ app.post('/api/v1/recordings', async (c) => {
           new Date(reconcileNow.getTime() - UPLOAD_RESERVED_STALE_MILLISECONDS).toISOString(),
         )
         .run();
-      if ((converged.meta.changes ?? 0) !== 1) {
+      if ((converged.meta.changes ?? 0) === 0) {
         return responseError(c, 409, 'UPLOAD_IN_PROGRESS', '同じ録音を保存中です。', true, 'しばらく待ってから状態を確認してください。');
       }
     }
@@ -405,7 +405,7 @@ app.post('/api/v1/recordings', async (c) => {
     )
       .bind('reserved', new Date().toISOString(), existing.id, 'failed')
       .run();
-    if ((retry.meta.changes ?? 0) !== 1 || !existing.audio_object_key) {
+    if ((retry.meta.changes ?? 0) === 0 || !existing.audio_object_key) {
       return responseError(c, 409, 'UPLOAD_RETRY_LIMIT_REACHED', '音声の再保存上限に達しました。', false, '新しい録音を作成してください。');
     }
     try {
@@ -484,7 +484,7 @@ app.post('/api/v1/recordings', async (c) => {
     )
       .bind(new Date().toISOString(), id, 'reserved')
       .run();
-    if ((reserveAttempt.meta.changes ?? 0) !== 1) throw new Error('upload attempt reservation failed');
+    if ((reserveAttempt.meta.changes ?? 0) === 0) throw new Error('upload attempt reservation failed');
     await c.env.PRIVATE_MEDIA.put(key, wav.bytes, { httpMetadata: { contentType: 'audio/wav' } });
     await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ? AND upload_status = ?').bind('ready', new Date().toISOString(), id, 'reserved').run();
   } catch {
@@ -539,7 +539,7 @@ async function convergeAnalysisDispatchFailure(env: Env, id: string, errorCode: 
           )`,
     ).bind(failedAt, id, errorCode, id, errorCode, id),
   ]);
-  return (results[1]?.meta.changes ?? 0) === 1;
+  return (results[1]?.meta.changes ?? 0) >= 1;
 }
 
 async function ensureAnalysisWorkflow(env: Env, id: string): Promise<DispatchResult> {
@@ -645,7 +645,7 @@ app.post('/api/v1/recordings/:id/process', async (c) => {
       .bind(id, identity.householdId, recording.id, c.get('correlationId'), identity.id, now, now, recording.id, recording.id, recording.id)
       .run()
       .then((result) => {
-        if ((result.meta.changes ?? 0) !== 1) throw new Error('analysis job was not reserved');
+        if ((result.meta.changes ?? 0) === 0) throw new Error('analysis job was not reserved');
       });
   } catch {
     const raced = await c.env.DB.prepare(
@@ -741,7 +741,7 @@ app.post('/api/v1/recordings/:id/retry-analysis', async (c) => {
     )
       .bind(id, identity.householdId, recording.id, c.get('correlationId'), token.id, now, now, recording.id, recording.id, recording.id, recording.id, identity.householdId, version)
       .run();
-    if ((reserved.meta.changes ?? 0) !== 1) throw new Error('analysis retry was not reserved');
+    if ((reserved.meta.changes ?? 0) === 0) throw new Error('analysis retry was not reserved');
   } catch {
     const existing = await c.env.DB.prepare(
       `SELECT id, status, correlation_id, last_error_code, updated_at, manual_retry FROM async_jobs
@@ -1054,7 +1054,7 @@ async function reserveDiaryJob(env: Env, diary: DiaryRow, householdId: string, c
         : `UPDATE recordings SET image_status = 'generating', updated_at = ? WHERE id = ? AND household_id = ? AND version = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'dispatch_pending')`)
         .bind(now, diary.recording_id, householdId, diary.recording_version, id),
     ]);
-    return (result[0]?.meta.changes ?? 0) === 1 && (result[1]?.meta.changes ?? 0) === 1 ? id : null;
+    return (result[0]?.meta.changes ?? 0) >= 1 && (result[1]?.meta.changes ?? 0) >= 1 ? id : null;
   } catch (error) {
     const message = error instanceof Error ? error.message : '';
     if (/UNIQUE|constraint/i.test(message)) return null;
@@ -1185,7 +1185,7 @@ app.post('/api/v1/diary/:id/image', async (c) => {
     const limited = await c.env.DB.prepare(`UPDATE recordings SET image_status = 'limit_reached', updated_at = ? WHERE id = ? AND household_id = ? AND version = ? AND review_status = 'approved' AND image_status <> 'generating'
       AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = recordings.id AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`)
       .bind(new Date().toISOString(), diary.recording_id, identity.householdId, diary.recording_version).run();
-    if ((limited.meta.changes ?? 0) !== 1) return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+    if ((limited.meta.changes ?? 0) === 0) return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
     return responseError(c, 409, 'COST_LIMIT_REACHED', 'この録音の画像生成上限に達しました。', false, '既存画像を利用してください。');
   }
   const id = await reserveDiaryJob(c.env, diary, identity.householdId, c.get('correlationId'), 'image', diary.active_image_id ?? undefined);

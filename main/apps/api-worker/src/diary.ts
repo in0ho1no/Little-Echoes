@@ -326,7 +326,7 @@ export async function cleanupOrphanImageObject(env: Env, jobId: string): Promise
   } catch {
     return false;
   }
-  if ((claimed.meta.changes ?? 0) !== 1) return false;
+  if ((claimed.meta.changes ?? 0) === 0) return false;
   try {
     await env.PRIVATE_MEDIA.delete(imageKey);
     await env.DB.prepare(
@@ -381,7 +381,7 @@ export async function reconcileGenerationDispatch(env: Env, limit = 10, recordin
       `UPDATE async_jobs SET dispatch_lease_until = ? WHERE id = ? AND status IN ('dispatch_pending','dispatched','running')
         AND dispatch_reconcile_count = ? AND updated_at <= ? AND (dispatch_lease_until IS NULL OR dispatch_lease_until <= ?)`,
     ).bind(leaseUntil, job.id, job.dispatch_reconcile_count, staleBefore, claimTime).run();
-    if ((claimed.meta.changes ?? 0) !== 1) continue;
+    if ((claimed.meta.changes ?? 0) === 0) continue;
     const workflow = job.job_type === 'diary' ? env.DIARY_WORKFLOW : env.IMAGE_WORKFLOW;
     // 絶対期限（作成から30分）を超えたジョブは、活性なWorkflowでも延命しない。
     // 期限なしの延命はWorkflowの長時間実行と組み合わさると恒久generatingになり得るため。

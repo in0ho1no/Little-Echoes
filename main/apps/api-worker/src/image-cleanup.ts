@@ -48,7 +48,7 @@ export async function dispatchImageCleanup(env: Env, id: string): Promise<'dispa
       AND status IN ('dispatch_pending','dispatched','running') AND dispatch_reconcile_count = ?
       AND (dispatch_lease_until IS NULL OR dispatch_lease_until <= ?)`,
   ).bind(leaseUntil, id, job.dispatch_reconcile_count, now.toISOString()).run();
-  if ((claimed.meta.changes ?? 0) !== 1) return 'unknown';
+  if ((claimed.meta.changes ?? 0) === 0) return 'unknown';
   try {
     await env.IMAGE_CLEANUP_WORKFLOW.create({ id, params: { async_job_id: id } });
     await env.DB.prepare(`UPDATE image_cleanup_jobs SET status = CASE WHEN status = 'dispatch_pending' THEN 'dispatched' ELSE status END, dispatch_reconcile_count = 0,
@@ -91,7 +91,7 @@ export async function runImageCleanup(env: Env, id: string, runStep: RunStep): P
       `UPDATE image_cleanup_jobs SET status = 'running', attempt_count = attempt_count + 1, updated_at = ?
         WHERE id = ? AND status IN ('dispatch_pending','dispatched','running') AND attempt_count < 3`,
     ).bind(now, id).run();
-    if ((claimed.meta.changes ?? 0) !== 1) return;
+    if ((claimed.meta.changes ?? 0) === 0) return;
     try {
       await env.PRIVATE_MEDIA.delete(job.image_object_key);
       await env.DB.prepare(`UPDATE image_cleanup_jobs SET status = 'succeeded', last_error_code = NULL, finished_at = ?, updated_at = ? WHERE id = ? AND status = 'running'`)

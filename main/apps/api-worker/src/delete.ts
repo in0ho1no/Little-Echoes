@@ -107,7 +107,7 @@ async function quiesceImageWorkflows(env: Env, jobs: ImageDeleteJobRow[]): Promi
     )
       .bind(new Date().toISOString(), job.id)
       .run();
-    if ((marked.meta.changes ?? 0) !== 1) throw new Error('image workflow quiescence commit is unresolved');
+    if ((marked.meta.changes ?? 0) === 0) throw new Error('image workflow quiescence commit is unresolved');
   }
 }
 
@@ -124,7 +124,7 @@ async function failDeleteDispatch(env: Env, asyncJobId: string, errorCode: strin
           AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed')`,
     ).bind(failedAt, asyncJobId, asyncJobId),
   ]);
-  return (results[0]?.meta.changes ?? 0) === 1;
+  return (results[0]?.meta.changes ?? 0) >= 1;
 }
 
 export async function ensureDeleteWorkflow(env: Env, asyncJobId: string): Promise<DeleteReservation['status']> {
@@ -157,7 +157,7 @@ export async function ensureDeleteWorkflow(env: Env, asyncJobId: string): Promis
       )
         .bind(leaseUntil, nowText, asyncJobId, DELETE_BUDGET_LIMIT, nowText)
         .run();
-  if ((claim.meta.changes ?? 0) !== 1) {
+  if ((claim.meta.changes ?? 0) === 0) {
     const current = await env.DB.prepare('SELECT status FROM async_jobs WHERE id = ? AND job_type = ?').bind(asyncJobId, 'delete').first<{ status: string }>();
     if (current?.status === 'failed') return 'failed';
     return current?.status === 'dispatch_pending' ? 'dispatch_pending' : 'dispatched';
@@ -311,11 +311,11 @@ export async function reserveDeleteJob(
        )`,
     ).bind(asyncJobId, target.household_id, target.id, correlationId, now, now, target.id, target.id, target.household_id, expectedVersion + 1, target.id),
   ]);
-  if ((results[0]?.meta.changes ?? 0) !== 1) {
+  if ((results[0]?.meta.changes ?? 0) === 0) {
     const raced = await activeDeleteJob(env, target.id);
     return raced ? { asyncJobId: raced.id, status: raced.status === 'dispatch_pending' ? await ensureDeleteWorkflow(env, raced.id) : 'dispatched' } : { asyncJobId: null, status: 'version_conflict' };
   }
-  if ((results[3]?.meta.changes ?? 0) !== 1) {
+  if ((results[3]?.meta.changes ?? 0) === 0) {
     const raced = await activeDeleteJob(env, target.id);
     if (raced) return { asyncJobId: raced.id, status: raced.status === 'dispatch_pending' ? await ensureDeleteWorkflow(env, raced.id) : 'dispatched' };
     await env.DB.prepare(`UPDATE recordings SET review_status = 'delete_failed', updated_at = ? WHERE id = ? AND review_status = 'deleting'`).bind(now, target.id).run();
@@ -411,7 +411,7 @@ async function deleteDataInD1(env: Env, job: DeleteJobRow, attemptId: string): P
   );
   try {
     const results = await env.DB.batch(statements);
-    return (results.at(-1)?.meta.changes ?? 0) === 1;
+    return (results.at(-1)?.meta.changes ?? 0) >= 1;
   } catch {
     const tombstone = await env.DB.prepare('SELECT recording_id FROM recording_tombstones WHERE recording_id = ? AND household_id = ?')
       .bind(job.recording_id, job.household_id)
@@ -446,7 +446,7 @@ export async function runDeleteWorkflow(
   )
     .bind(new Date().toISOString(), new Date().toISOString(), job.id)
     .run();
-  if ((started.meta.changes ?? 0) !== 1 && job.status !== 'running') return;
+  if ((started.meta.changes ?? 0) === 0 && job.status !== 'running') return;
   try {
     await runStep('delete-recording', async () => {
       const attemptId = newAttemptId();

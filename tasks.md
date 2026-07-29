@@ -249,6 +249,8 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 
 - [x] Sol追加指摘（Medium 2・Low 1）を検証し全件事実と確認のうえ修正（2026-07-29）。(M1) dispatch再調停の期限超過を観測回数カウンタ待ちから初回観測での即時終端へ変更（`pastDeadline || count >= 2`で終端分岐へ）。隠蔽していたテストも`reconcileCount: 0`へ修正、(M2) 画像cleanupの起動照合へ同じ30分絶対期限を追加。期限超過は活性Workflowでも`terminate()`し`CLEANUP_DEADLINE_EXCEEDED`で終端、取り残しR2オブジェクトは日次スイープが回収（`created_at`をload SELECTへ追加）、(Low) featureカバレッジ検査を行単位判定へ変更しコメントアウトされた`// it('...')`の誤検出を排除。SPEC・READMEの期限記述をcleanup込み・即時終端へ更新、featureへcleanup期限シナリオ追加、ミュータント2件追加（期限ショートカット無効化・cleanup期限無視）で計13件。検証: Vitest 164件、`tsc --noEmit`、ミューテーション13/13検出、SQLマニフェスト再生成、pytest 191件、ruff/format/mypy/pyright、`git diff --check`すべて成功。
 
+- [x] 再発防止ガードレールを追加（2026-07-29、ユーザー依頼）。(1) `meta.changes`への厳密比較（`=== 1`/`!== 1`）をsrc全体で禁止し、既存21箇所をトリガー耐性形（書き込み成立`>= 1`・未書き込み`=== 0`）へ統一。静的ガードテスト`test/d1-changes-guard.test.ts`が違反を検出し、ミュータント`strict-changes-comparison-reintroduced`で退行も検出（計14ミュータント）。この統一により、解析job INSERT（`app.ts`の`/process`・retry-analysis）が実D1でトリガー加算により常にthrow→catchフォールバック経由で偶然動作していた潜在不具合も主経路で成立するよう解消。(2) `ag-little-echoes-architecture-review`エージェント定義へ「既知の再発クラス」チェックリスト7項目（meta.changesトリガー加算、送信済みマーカーによる再送禁止、絶対期限と延命禁止、R2ページングとsubrequest上限、番兵署名限定の409写像、scheduled失敗の集約throw、終端時のrunning attempt同時終端）を追記し、以後のレビューで必ず確認する。機械的ガードが難しい設計クラス（送信マーカー・期限・ページング等）はfeature+mutation+SPEC明文化+レビューチェックリストの4層で固定済み。検証: Vitest 165件、`tsc --noEmit`、ミューテーション14/14検出、pytest 191件、ruff/format/mypy/pyright、`git diff --check`すべて成功（SQL文変更なしのためマニフェスト再生成不要）。
+
 ### UI改善バックログ（ユーザー要望 2026-07-28。Phase 6以降の画面整備時に実施）
 
 - [x] 解析・生成の待機中インジケータを整備する（現在は文言のみ。スピナー等で処理中であることを視覚的に示す）。

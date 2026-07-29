@@ -99,6 +99,13 @@ const MUTANTS = [
     replace: 'if (job.created_at > deadlineBefore) {',
     tests: ['test/image-cleanup.test.ts'],
   },
+  {
+    name: 'strict-changes-comparison-reintroduced',
+    file: 'src/workflow.ts',
+    find: "(results[1]?.meta.changes ?? 0) >= 1 ? 'converged' : 'active'",
+    replace: "(results[1]?.meta.changes ?? 0) === 1 ? 'converged' : 'active'",
+    tests: ['test/d1-changes-guard.test.ts'],
+  },
 ];
 
 let failures = 0;

@@ -3,6 +3,11 @@
 # test/feature-coverage.test.ts が検出する。テスト名を変える場合は本ファイルも更新すること。
 Feature: Phase 6 generation hardening
 
+  Scenario: forbids strict meta.changes comparisons that break under D1 triggers
+    Given 実D1のmeta.changesはトリガーの書き込み行数を加算する
+    When src配下のコードがmeta.changesを厳密比較（=== 1 / !== 1）で判定しようとする
+    Then 静的ガードテストが失敗し、>= 1 か === 0 への書き換えを強制する
+
   Scenario: reserves an attempt when D1 reports trigger-inflated changes
     Given D1のmeta.changesはBEFORE INSERTトリガーの書き込み分だけ増える
     When 日記生成Workflowがattemptを予約する
