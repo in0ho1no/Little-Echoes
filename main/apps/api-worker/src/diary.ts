@@ -407,7 +407,9 @@ export async function reconcileGenerationDispatch(env: Env, limit = 10, recordin
       }
       throw new Error('workflow not active');
     } catch {
-      if (job.dispatch_reconcile_count >= 2) {
+      // 期限超過は観測回数のカウンタを待たず初回観測で即時終端する。カウンタ待ちでは
+      // 毎時cron前提で終端まで数時間を要し、期限の意味が薄れるため。
+      if (pastDeadline || job.dispatch_reconcile_count >= 2) {
         const now = new Date().toISOString();
         await env.DB.batch([
           env.DB.prepare(`UPDATE async_jobs SET status = 'failed', dispatch_reconcile_count = 3, dispatch_lease_until = NULL,

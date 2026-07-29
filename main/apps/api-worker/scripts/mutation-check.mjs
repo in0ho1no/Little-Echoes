@@ -85,6 +85,20 @@ const MUTANTS = [
     replace: 'null',
     tests: ['test/image-cleanup.test.ts'],
   },
+  {
+    name: 'deadline-does-not-shortcut-counter',
+    file: 'src/diary.ts',
+    find: 'if (pastDeadline || job.dispatch_reconcile_count >= 2) {',
+    replace: 'if (job.dispatch_reconcile_count >= 2) {',
+    tests: ['test/diary.test.ts'],
+  },
+  {
+    name: 'cleanup-deadline-ignored',
+    file: 'src/image-cleanup.ts',
+    find: 'if (job.created_at <= deadlineBefore) {',
+    replace: 'if (job.created_at > deadlineBefore) {',
+    tests: ['test/image-cleanup.test.ts'],
+  },
 ];
 
 let failures = 0;

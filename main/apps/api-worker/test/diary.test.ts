@@ -281,7 +281,7 @@ describe('Phase 6 diary prompts', () => {
   it('converges a generation job that exceeds the absolute deadline', async () => {
     const { env, bound, terminations } = generationEnv({
       reconcileJob: true,
-      reconcileCount: 2,
+      reconcileCount: 0,
       reconcileCreatedAt: '2020-01-01T00:00:00.000Z',
       workflowStatus: 'running',
     });

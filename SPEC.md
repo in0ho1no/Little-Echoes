@@ -1300,7 +1300,7 @@ POST /api/v1/diary/{diary_id}/regenerate
 - 日記文の手動再生成権は1録音1回とする。Workflow内の日次上限到達で終端したジョブは手動再生成権を消費しない（該当ジョブの`manual_retry`を解除して権利を返す）
 - 日記・画像Workflowのステップ再実行時は解析と同じ引き取り規則を適用し、ジョブが非終端であることを条件に前回running attemptを`STEP_REEXECUTED`で終端してから試行予算内でのみ再開する。running attemptを恒久的に非終端のまま残さない。ジョブを終端させる全経路（失敗収束・dispatch再調停を含む）で、同一ジョブのrunning attemptも同時に終端する
 - 非終端の日記・画像・画像cleanupジョブは、画面からの状態取得に加えて毎時の再調停でも収束を進め、`generating`表示の残存は最長1日以内に終端させる。日次の保持期限削除は従来どおり1日1回のまま変更しない
-- 日記・画像ジョブには作成から30分の絶対期限を設ける。期限超過をdispatch再調停が観測した場合、Workflowが活性でも延命せず終了させ、`GENERATION_DEADLINE_EXCEEDED`で終端する（Workflowは長時間実行が可能なため、期限なしの延命は恒久`generating`になり得る）。終端後の遅延書き込みはジョブ状態ガードにより着地しない
+- 日記・画像・画像cleanupジョブには作成から30分の絶対期限を設ける。期限超過をdispatch再調停・起動照合が観測した場合、観測回数のカウンタを待たずWorkflowが活性でも終了させ、生成は`GENERATION_DEADLINE_EXCEEDED`、cleanupは`CLEANUP_DEADLINE_EXCEEDED`で即時終端する（Workflowは長時間実行が可能なため、期限なしの延命は恒久非終端になり得る）。終端後の遅延書き込みはジョブ状態ガードにより着地せず、cleanupが削除し損ねたR2オブジェクトは日次スイープが回収する
 - Workflowステップは提供者への送信直前にattemptへ送信済みマーカーを記録する。ステップ再実行時に引き取れるのは送信前のattemptだけとし、送信済みマーカー付きのattemptが残っている場合は再送せず`UPSTREAM_RESULT_UNKNOWN`で終端する（提供者受理済み要求の再送・二重課金の禁止）
 
 ### 絵日記画像

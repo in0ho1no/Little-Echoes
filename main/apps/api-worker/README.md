@@ -86,7 +86,7 @@ Secret値をコマンドライン引数、PowerShell履歴、リダイレクト�
 - 画像cleanupの起動照合もlease付きで最大3回に制限する。`failed`隔離後の再開は、D1参照とR2オブジェクトを管理者が確認し、ユーザー承認を得た場合だけ行う
 - 認可済み画像削除と期限後の後始末は`DEMO_WRITE_ENABLED`の停止対象に含めない
 - 画像生成のOpenAI要求タイムアウトは120秒（テキスト系30秒と分離）。cronは日次`17 3 * * *`（保持期限削除・R2孤児スイープを含む全量）と毎時`47 * * * *`（日記・画像・cleanupの再調停のみ）の2本で、非終端ジョブは最長1日以内に終端へ収束する。scheduledは全タスク完了後に失敗を集約してthrowし、監視から失敗が見える
-- 日記・画像ジョブは作成から30分の絶対期限を持つ。超過をdispatch再調停が観測したら活性Workflowでも終了させ`GENERATION_DEADLINE_EXCEEDED`で終端する
+- 日記・画像・画像cleanupジョブは作成から30分の絶対期限を持つ。超過を再調停・起動照合が観測したら、カウンタを待たず活性Workflowでも終了させ、生成は`GENERATION_DEADLINE_EXCEEDED`、cleanupは`CLEANUP_DEADLINE_EXCEEDED`で即時終端する（cleanupの取り残しは日次スイープが回収）
 - Workflowステップは提供者送信直前にattemptへ送信済みマーカーを記録する。再実行が引き取れるのは送信前attemptだけで、送信済みが残る場合は再送せず`UPSTREAM_RESULT_UNKNOWN`終端（二重課金の禁止）
 - R2孤児スイープは`diary-images/`配下のうち、作成から24時間以上経過しD1参照（削除済みでない`diary_images`行・非終端ジョブ）のないオブジェクトだけを削除する（purge後に遅延着地したputの回収経路）。1回1ページ・D1永続カーソルで巡回し、参照確認は一括クエリ・削除は一括要求でsubrequest上限内に収める
 

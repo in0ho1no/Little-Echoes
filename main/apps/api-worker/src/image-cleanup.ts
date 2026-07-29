@@ -1,5 +1,6 @@
 import { WorkflowEntrypoint } from 'cloudflare:workers';
 
+import { GENERATION_DEADLINE_MILLISECONDS } from './limits';
 import type { Env, WorkflowParams } from './types';
 
 type RunStep = (name: string, retryLimit: number, operation: () => Promise<void>) => Promise<void>;
@@ -11,18 +12,35 @@ interface CleanupJob {
   attempt_count: number;
   dispatch_reconcile_count: number;
   dispatch_lease_until: string | null;
+  created_at: string;
 }
 
 async function load(env: Env, id: string): Promise<CleanupJob | null> {
   return env.DB.prepare(
-    `SELECT id, image_object_key, status, attempt_count, dispatch_reconcile_count, dispatch_lease_until
+    `SELECT id, image_object_key, status, attempt_count, dispatch_reconcile_count, dispatch_lease_until, created_at
        FROM image_cleanup_jobs WHERE id = ?`,
   ).bind(id).first<CleanupJob>();
 }
 
+const ACTIVE_CLEANUP_WORKFLOW_STATUSES = ['queued', 'running', 'paused', 'waiting', 'waitingForPause'];
+
 export async function dispatchImageCleanup(env: Env, id: string): Promise<'dispatched' | 'unknown'> {
   const job = await load(env, id);
   if (!job || ['succeeded', 'failed'].includes(job.status) || job.dispatch_reconcile_count >= 3) return 'unknown';
+  // 活性観測のたびのカウンタ延命を絶対期限で打ち切る。終端後の遅延書き込みはstatus guardで
+  // 着地せず、削除し損ねたR2オブジェクトは日次スイープが回収する。
+  const deadlineBefore = new Date(Date.now() - GENERATION_DEADLINE_MILLISECONDS).toISOString();
+  if (job.created_at <= deadlineBefore) {
+    try {
+      const instance = await env.IMAGE_CLEANUP_WORKFLOW.get(id);
+      if (ACTIVE_CLEANUP_WORKFLOW_STATUSES.includes(String((await instance.status()).status))) await instance.terminate();
+    } catch { /* 終了・観測に失敗しても収束を優先する。 */ }
+    const failedAt = new Date().toISOString();
+    await env.DB.prepare(`UPDATE image_cleanup_jobs SET status = 'failed', dispatch_reconcile_count = 3,
+      dispatch_lease_until = NULL, last_error_code = 'CLEANUP_DEADLINE_EXCEEDED', finished_at = ?, updated_at = ?
+      WHERE id = ? AND status IN ('dispatch_pending','dispatched','running')`).bind(failedAt, failedAt, id).run();
+    return 'unknown';
+  }
   const now = new Date();
   const leaseUntil = new Date(now.getTime() + 60 * 1000).toISOString();
   const claimed = await env.DB.prepare(

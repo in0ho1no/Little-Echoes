@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { dispatchImageCleanup, runImageCleanup, sweepUnreferencedImageObjects } from '../src/image-cleanup';
 import type { Env } from '../src/types';
 
-function env(deleteImage: () => Promise<void>, changes = 1, dispatchReconcileCount = 0, sql: string[] = []): Env {
+function env(deleteImage: () => Promise<void>, changes = 1, dispatchReconcileCount = 0, sql: string[] = [], createdAt?: string): Env {
   const database = {
     prepare: (statement: string) => ({
       bind: (..._values: unknown[]) => ({
@@ -14,6 +14,7 @@ function env(deleteImage: () => Promise<void>, changes = 1, dispatchReconcileCou
           attempt_count: 0,
           dispatch_reconcile_count: dispatchReconcileCount,
           dispatch_lease_until: null,
+          created_at: createdAt ?? new Date().toISOString(),
         } : null,
         run: async () => { sql.push(statement); return { meta: { changes } }; },
         all: async () => ({ results: [] }),
@@ -64,6 +65,20 @@ describe('inactive image cleanup', () => {
     } as unknown as Workflow<{ async_job_id: string }>;
     await expect(dispatchImageCleanup(supplied, 'job_cleanup')).resolves.toBe('dispatched');
     expect(statements.some((sql) => sql.includes("CASE WHEN status = 'dispatch_pending' THEN 'dispatched' ELSE status END"))).toBe(true);
+  });
+
+  it('terminates an image cleanup job that exceeds the absolute deadline', async () => {
+    const statements: string[] = [];
+    let terminated = 0;
+    const supplied = env(async () => undefined, 1, 0, statements, '2020-01-01T00:00:00.000Z');
+    supplied.IMAGE_CLEANUP_WORKFLOW = {
+      create: async () => ({}),
+      get: async () => ({ status: async () => ({ status: 'running' }), terminate: async () => { terminated += 1; } }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    await expect(dispatchImageCleanup(supplied, 'job_cleanup')).resolves.toBe('unknown');
+    expect(terminated).toBe(1);
+    expect(statements.some((sql) => sql.includes("last_error_code = 'CLEANUP_DEADLINE_EXCEEDED'"))).toBe(true);
+    expect(statements.some((sql) => sql.includes('SET dispatch_lease_until = ?'))).toBe(false);
   });
 
   it('sweeps only unreferenced day-old image objects', async () => {

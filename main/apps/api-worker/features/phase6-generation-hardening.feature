@@ -20,8 +20,13 @@ Feature: Phase 6 generation hardening
 
   Scenario: converges a generation job that exceeds the absolute deadline
     Given 生成ジョブが作成から30分の絶対期限を超えて非終端のままである
-    When dispatch再調停がそのジョブを観測する
-    Then 活性なWorkflowでも延命せず終了させGENERATION_DEADLINE_EXCEEDEDで終端する
+    When dispatch再調停がそのジョブを初回観測する
+    Then 観測回数カウンタを待たず活性なWorkflowでも終了させGENERATION_DEADLINE_EXCEEDEDで即時終端する
+
+  Scenario: terminates an image cleanup job that exceeds the absolute deadline
+    Given 画像cleanupジョブが作成から30分の絶対期限を超えて非終端のままである
+    When 起動照合がそのジョブを観測する
+    Then 活性なWorkflowでも延命せず終了させCLEANUP_DEADLINE_EXCEEDEDで終端し、対象オブジェクトは日次スイープが回収する
 
   Scenario: converges the attempt and releases the manual retry when the daily limit aborts the reservation
     Given 手動再生成ジョブの予約が日次上限トリガーで中止された

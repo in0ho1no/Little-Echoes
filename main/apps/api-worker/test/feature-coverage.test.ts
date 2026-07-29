@@ -24,10 +24,12 @@ describe('Gherkinシナリオ対応', () => {
     const titles = new Set<string>();
     for (const name of readdirSync(testDirectory).filter((entry) => entry.endsWith('.ts'))) {
       const source = readFileSync(join(testDirectory, name), 'utf-8');
-      // コメントや重複文字列では通過しないよう、it()の実テスト名だけを抽出して突合する。
-      const pattern = /\bit\('((?:[^'\\]|\\.)*)'/g;
-      let match;
-      while ((match = pattern.exec(source)) !== null) titles.add(match[1]);
+      // 行頭（空白のみ許可）のit()だけを実テストとして抽出する。ソース全体への正規表現では
+      // `// it('...')` のようなコメントアウトも一致してしまうため、行単位で判定する。
+      for (const line of source.split('\n')) {
+        const match = /^\s*it\('((?:[^'\\]|\\.)*)'/.exec(line);
+        if (match) titles.add(match[1]);
+      }
     }
     for (const title of scenarios) {
       expect(titles.has(title), `シナリオに対応するit()テストがありません: ${title}`).toBe(true);
