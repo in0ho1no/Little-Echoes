@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { app } from '../src/app';
+import { app, ensureMissingInitialDiaryJobs } from '../src/app';
 import { hmacToken } from '../src/auth';
 import type { Env } from '../src/types';
 import { validateCanonicalWav } from '../src/wav';
@@ -45,6 +45,18 @@ function env(first: FirstHandler, run?: RunHandler, allRows?: AllHandler): Env {
       get: async () => ({ status: async () => ({ status: 'running' }) }),
     } as unknown as Workflow<{ async_job_id: string }>,
     DELETE_WORKFLOW: {
+      create: async () => ({}),
+      get: async () => ({ status: async () => ({ status: 'running' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>,
+    DIARY_WORKFLOW: {
+      create: async () => ({}),
+      get: async () => ({ status: async () => ({ status: 'running' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>,
+    IMAGE_WORKFLOW: {
+      create: async () => ({}),
+      get: async () => ({ status: async () => ({ status: 'running' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>,
+    IMAGE_CLEANUP_WORKFLOW: {
       create: async () => ({}),
       get: async () => ({ status: async () => ({ status: 'running' }) }),
     } as unknown as Workflow<{ async_job_id: string }>,
@@ -120,6 +132,209 @@ async function requestWithoutLength(suppliedEnv: Env): Promise<Response> {
 describe('ルーターと録音API', () => {
   beforeAll(async () => {
     tokenHmac = await hmacToken(TOKEN, SECRET);
+  });
+
+  it('DEMO停止中でも認証済み画像DELETEはcleanupを予約する', async () => {
+    let cleanupCreates = 0;
+    const diary = { id: 'diary_11111111111111111111111111111111', household_id: 'household_1', recording_id: RECORDING_ID, diary_text: '日記', scene: null, version: 1, recording_version: 1, diary_status: 'ready', image_status: 'ready', captured_at: '2026-07-21T00:00:00.000Z', last_generation_error: null, active_image_id: 'image_11111111111111111111111111111111', active_image_created_at: null };
+    const supplied = env((sql) => {
+      if (sql.includes('management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
+      if (sql.includes('SELECT image_object_key FROM diary_images')) return { image_object_key: 'diary-images/image_1.png' };
+      if (sql.includes('FROM image_cleanup_jobs WHERE id')) return {
+        id: 'job_cleanup',
+        image_object_key: 'diary-images/image_1.png',
+        status: 'dispatch_pending',
+        attempt_count: 0,
+        dispatch_reconcile_count: 0,
+        dispatch_lease_until: null,
+      };
+      return null;
+    });
+    supplied.DEMO_WRITE_ENABLED = 'false';
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    supplied.IMAGE_CLEANUP_WORKFLOW = { create: async () => { cleanupCreates += 1; }, get: async () => ({ status: async () => ({ status: 'running' }) }) } as unknown as Workflow<{ async_job_id: string }>;
+    const response = await app.fetch(new Request(`https://app.example.test/api/v1/diary/${diary.id}/image`, { method: 'DELETE', headers: { 'Cf-Access-Jwt-Assertion': 'signed', 'Content-Type': 'application/json' }, body: '{"version":1}' }), supplied);
+    expect(response.status).toBe(202);
+    expect(cleanupCreates).toBe(1);
+  });
+
+  it('household外 diary/image APIは404を返す', async () => {
+    const supplied = env((sql) => sql.includes('management_principals') ? { household_id: 'household_1' } : null);
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const id = 'diary_22222222222222222222222222222222';
+    const get = await app.fetch(new Request(`https://app.example.test/api/v1/diary/${id}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed' } }), supplied);
+    const del = await app.fetch(new Request(`https://app.example.test/api/v1/diary/${id}/image`, { method: 'DELETE', headers: { 'Cf-Access-Jwt-Assertion': 'signed', 'Content-Type': 'application/json' }, body: '{"version":1}' }), supplied);
+    expect(get.status).toBe(404);
+    expect(del.status).toBe(404);
+  });
+
+  it('approved録音の再承認は日記Workflowを自動起動しない', async () => {
+    let diaryCreates = 0;
+    const approved = { ...recordingRow('ready'), review_status: 'approved' };
+    const supplied = env((sql) => {
+      if (sql.includes('management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM recordings r JOIN sources')) return approved;
+      if (sql.includes('SELECT d.id FROM diary_entries')) return { id: 'diary_11111111111111111111111111111111' };
+      if (sql.includes('FROM diary_entries d JOIN recordings')) return { id: 'diary_11111111111111111111111111111111', household_id: 'household_1', recording_id: RECORDING_ID, diary_text: null, scene: null, version: 1, recording_version: 1, diary_status: 'ready', image_status: 'not_requested', captured_at: '2026-07-21T00:00:00.000Z', last_generation_error: null, active_image_id: null, active_image_created_at: null };
+      return null;
+    });
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    supplied.DIARY_WORKFLOW = { create: async () => { diaryCreates += 1; } } as unknown as Workflow<{ async_job_id: string }>;
+    const body = { version: 1, reviewed_text: 'りんご', words: [], captured_at: '2026-07-21T00:00:00.000Z', captured_timezone: 'Asia/Tokyo', scene: '', parent_note: '' };
+    const response = await app.fetch(new Request(`https://app.example.test/api/v1/recordings/${RECORDING_ID}/approve`, { method: 'POST', headers: { 'Cf-Access-Jwt-Assertion': 'signed', 'Content-Type': 'application/json' }, body: JSON.stringify(body) }), supplied);
+    expect(response.status).toBe(200);
+    expect(diaryCreates).toBe(0);
+  });
+
+  it('承認後の初回日記予約が欠落しても再承認要求で冪等に補う', async () => {
+    let diaryCreates = 0;
+    let recordingReads = 0;
+    const approved = { ...recordingRow('ready'), review_status: 'approved', diary_status: 'not_started', image_status: 'not_requested' };
+    const diary = {
+      id: 'diary_11111111111111111111111111111111',
+      household_id: 'household_1',
+      recording_id: RECORDING_ID,
+      diary_text: null,
+      scene: null,
+      version: 1,
+      recording_version: 2,
+      diary_status: 'not_started',
+      image_status: 'not_requested',
+      captured_at: '2026-07-21T00:00:00.000Z',
+      last_generation_error: null,
+      active_image_id: null,
+      active_image_created_at: null,
+    };
+    const supplied = env((sql) => {
+      if (sql.includes('management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM recordings r JOIN sources')) {
+        recordingReads += 1;
+        return recordingReads === 1 ? approved : { ...approved, version: 2 };
+      }
+      if (sql.includes('SELECT d.id FROM diary_entries')) return { id: diary.id };
+      if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
+      return null;
+    });
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    supplied.DIARY_WORKFLOW = {
+      create: async () => { diaryCreates += 1; },
+      get: async () => ({ status: async () => ({ status: 'running' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    const body = { version: 1, reviewed_text: 'りんご', words: [], captured_at: '2026-07-21T00:00:00.000Z', captured_timezone: 'Asia/Tokyo', scene: '', parent_note: '' };
+    const response = await app.fetch(new Request(`https://app.example.test/api/v1/recordings/${RECORDING_ID}/approve`, { method: 'POST', headers: { 'Cf-Access-Jwt-Assertion': 'signed', 'Content-Type': 'application/json' }, body: JSON.stringify(body) }), supplied);
+    expect(response.status).toBe(200);
+    expect(diaryCreates).toBe(1);
+  });
+
+  it('cronは承認コミット後に欠落した初回日記jobだけを補う', async () => {
+    let diaryCreates = 0;
+    const diary = {
+      id: 'diary_11111111111111111111111111111111',
+      household_id: 'household_1',
+      recording_id: RECORDING_ID,
+      diary_text: null,
+      scene: null,
+      version: 1,
+      recording_version: 2,
+      diary_status: 'not_started',
+      image_status: 'not_requested',
+      captured_at: '2026-07-21T00:00:00.000Z',
+      last_generation_error: null,
+      active_image_id: null,
+      active_image_created_at: null,
+    };
+    const supplied = env(
+      (sql) => sql.includes('FROM diary_entries d JOIN recordings') ? diary : null,
+      undefined,
+      (sql) => sql.includes("r.diary_status = 'not_started'") ? [{ id: diary.id, household_id: 'household_1' }] : [],
+    );
+    supplied.DIARY_WORKFLOW = {
+      create: async () => { diaryCreates += 1; },
+      get: async () => ({ status: async () => ({ status: 'running' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    await ensureMissingInitialDiaryJobs(supplied);
+    expect(diaryCreates).toBe(1);
+  });
+
+  it('image daily/lifetime preflightはjobを作らない', async () => {
+    const diary = { id: 'diary_11111111111111111111111111111111', household_id: 'household_1', recording_id: RECORDING_ID, diary_text: '日記', scene: null, version: 1, recording_version: 1, diary_status: 'ready', image_status: 'not_requested', captured_at: '2026-07-21T00:00:00.000Z', last_generation_error: null, active_image_id: null, active_image_created_at: null };
+    for (const [used, expected] of [[20, 429], [5, 409]] as const) {
+      const statements: string[] = []; let creates = 0;
+      const supplied = env((sql) => {
+        if (sql.includes('management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
+        if (sql.includes('usage_counters')) return { used_count: used };
+        return null;
+      }, (sql, values) => { statements.push(sql); return { meta: { changes: 1 } } as D1Result<unknown>; });
+      supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+      supplied.IMAGE_WORKFLOW = { create: async () => { creates += 1; } } as unknown as Workflow<{ async_job_id: string }>;
+      const response = await app.fetch(new Request(`https://app.example.test/api/v1/diary/${diary.id}/image`, { method: 'POST', headers: { 'Cf-Access-Jwt-Assertion': 'signed', 'Content-Type': 'application/json' }, body: '{"version":1,"confirmed":true}' }), supplied);
+      expect(response.status).toBe(expected);
+      expect(creates).toBe(0);
+      expect(statements.some((sql) => sql.includes('INSERT INTO async_jobs'))).toBe(false);
+      if (used === 5) expect(statements.some((sql) => sql.includes("image_status = 'limit_reached'"))).toBe(true);
+    }
+  });
+
+  it('画像生成は初回でも明示確認済み要求だけを受け付ける', async () => {
+    const supplied = env((sql) => sql.includes('management_principals') ? { household_id: 'household_1' } : null);
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request('https://app.example.test/api/v1/diary/diary_11111111111111111111111111111111/image', {
+        method: 'POST',
+        headers: { 'Cf-Access-Jwt-Assertion': 'signed', 'Content-Type': 'application/json' },
+        body: '{"version":1}',
+      }),
+      supplied,
+    );
+    expect(response.status).toBe(422);
+  });
+
+  it('絵日記SSRはmanual retry・画像上限・生成中を安全に表示する', async () => {
+    const diary = { id: 'diary_11111111111111111111111111111111', household_id: 'household_1', recording_id: RECORDING_ID, diary_text: '日記', scene: null, version: 1, recording_version: 1, diary_status: 'generating', image_status: 'limit_reached', captured_at: '2026-07-21T00:00:00.000Z', last_generation_error: null, active_image_id: 'image_11111111111111111111111111111111', active_image_created_at: '2026-07-21T00:01:00.000Z' };
+    const supplied = env((sql) => {
+      if (sql.includes('management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
+      if (sql.includes("manual_retry = 1")) return { used: 1 };
+      return null;
+    }, undefined, () => []);
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(new Request(`https://app.example.test/diary/${diary.id}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed' } }), supplied);
+    const html = await response.text();
+    expect(html).not.toContain('data-action="regenerate-diary"');
+    expect(html).not.toContain('data-action="generate-image"');
+    expect(html).toContain('class="busy"');
+    expect(html).toContain('href="/assets/diary.css"');
+    expect(html).toContain('現在の画像の作成日時: 2026-07-21T00:01:00.000Z');
+  });
+
+  it('diary.jsは初回と置換の双方で確認し確認済みフラグを送る', async () => {
+    const supplied = env((sql) => sql.includes('management_principals') ? { household_id: 'household_1' } : null);
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request('https://app.example.test/assets/diary.js', { headers: { 'Cf-Access-Jwt-Assertion': 'signed' } }),
+      supplied,
+    );
+    const script = await response.text();
+    expect(script).toContain('新しい画像を生成します');
+    expect(script).toContain('作成日時: ');
+    expect(script).toContain('confirmed:true');
+  });
+
+  it('絵日記CSSは管理認証後にCSP互換の表示ルールを返す', async () => {
+    const supplied = env((sql) => sql.includes('management_principals') ? { household_id: 'household_1' } : null);
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request('https://app.example.test/assets/diary.css', { headers: { 'Cf-Access-Jwt-Assertion': 'signed' } }),
+      supplied,
+    );
+    const css = await response.text();
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Content-Type')).toBe('text/css; charset=utf-8');
+    expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(css).toContain('.busy::before');
+    expect(css).toContain('.diary-image');
   });
 
   it('未知ホストを認証前にdeny-by-defaultで拒否する', async () => {

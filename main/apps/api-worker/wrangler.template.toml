@@ -25,8 +25,23 @@ binding = "DELETE_WORKFLOW"
 name = "little-echoes-delete"
 class_name = "DeleteWorkflow"
 
+[[workflows]]
+binding = "DIARY_WORKFLOW"
+name = "little-echoes-diary"
+class_name = "DiaryWorkflow"
+
+[[workflows]]
+binding = "IMAGE_WORKFLOW"
+name = "little-echoes-image"
+class_name = "ImageWorkflow"
+
+[[workflows]]
+binding = "IMAGE_CLEANUP_WORKFLOW"
+name = "little-echoes-image-cleanup"
+class_name = "ImageCleanupWorkflow"
+
 [triggers]
-# 1日1回、最大10件を処理する（既存ジョブの再調停は最大5件）。
+# 1日1回、各cleanup・再調停キューを最大10件ずつ処理する。
 crons = ["17 3 * * *"]
 
 [vars]

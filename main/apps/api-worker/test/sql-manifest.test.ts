@@ -1,12 +1,14 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
 import { ensureDeleteWorkflow, reserveDeleteJob, runDeleteWorkflow, scheduleRetentionCleanup } from '../src/delete';
+import { reconcileGenerationDispatch, reconcileOrphanImageObjects, runDiaryGeneration, runImageGeneration } from '../src/diary';
+import { runImageCleanup, scheduleImageCleanup } from '../src/image-cleanup';
 import { OpenAiAnalysisError, type OpenAiAnalysisClient } from '../src/openai-analysis';
-import { app } from '../src/app';
+import { app, ensureMissingInitialDiaryJobs } from '../src/app';
 import { approveReview, saveReview } from '../src/review';
 import type { Env } from '../src/types';
 import { reconcileStaleAnalysisJob, runOpenAiAnalysis } from '../src/workflow';
@@ -42,6 +44,35 @@ function capturingEnv(collected: Set<string>): Env {
         return {
           id: 'job_1', household_id: 'hh', recording_id: 'rec_1', correlation_id: 'corr_1', operation_number: 1,
           status: 'dispatched', audio_object_key: 'k', draft_parent_note: null,
+          authorization_token_id: 'token_1', manual_retry: 0, diary_id: 'diary_1', diary_text: 'りんごの日記',
+          scene: '公園', parent_note: 'よく話せました', reviewed_text: 'りんご', captured_at: '2026-07-23T00:00:00.000Z',
+        };
+      }
+      if (sql.includes('FROM diary_images WHERE diary_entry_id')) return { id: 'image_old', image_object_key: 'diary-images/image_old.png' };
+      if (sql.includes('FROM image_cleanup_jobs WHERE id')) return {
+        id: 'cleanup_1',
+        image_object_key: 'diary-images/image_old.png',
+        status: 'dispatched',
+        attempt_count: 0,
+        dispatch_reconcile_count: 0,
+        dispatch_lease_until: null,
+      };
+      if (sql.includes('FROM image_cleanup_jobs WHERE diary_image_id')) return { id: 'cleanup_1' };
+      if (sql.includes('FROM diary_entries d JOIN recordings')) {
+        return {
+          id: 'diary_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          household_id: 'hh',
+          recording_id: 'rec_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          diary_text: 'りんごの日記',
+          scene: '公園',
+          version: 1,
+          recording_version: 1,
+          diary_status: 'ready',
+          image_status: 'not_requested',
+          captured_at: '2026-07-23T00:00:00.000Z',
+          last_generation_error: null,
+          active_image_id: null,
+          active_image_created_at: null,
         };
       }
       if (sql.includes('FROM async_jobs WHERE id')) {
@@ -79,6 +110,14 @@ function capturingEnv(collected: Set<string>): Env {
     },
     all: async () => {
       collected.add(sql);
+      if (sql.includes('FROM image_cleanup_jobs WHERE status')) return { results: [{ id: 'cleanup_1' }] };
+      if (sql.includes("r.diary_status = 'not_started'") && sql.includes("j.job_type = 'diary'")) {
+        return { results: [{ id: 'diary_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', household_id: 'hh' }] };
+      }
+      if (sql.includes('SELECT j.id FROM async_jobs j') && sql.includes('orphan_cleanup')) return { results: [{ id: 'job_1' }] };
+      if (sql.includes("job_type IN ('diary','image')") && sql.includes('dispatch_reconcile_count')) {
+        return { results: [{ id: 'job_1', job_type: 'image', household_id: 'hh', recording_id: 'rec_1', dispatch_reconcile_count: 0 }] };
+      }
       return { results: [] };
     },
   });
@@ -92,6 +131,7 @@ function capturingEnv(collected: Set<string>): Env {
     } as unknown as D1Database,
     PRIVATE_MEDIA: {
       delete: async () => undefined,
+      put: async () => undefined,
       get: async () => {
         const bytes = canonicalWav();
         return { size: bytes.byteLength, arrayBuffer: async () => bytes.buffer };
@@ -99,6 +139,10 @@ function capturingEnv(collected: Set<string>): Env {
     } as unknown as R2Bucket,
     ANALYSIS_WORKFLOW: { create: async () => ({}), get: async () => ({ status: async () => ({ status: 'errored' }) }) } as unknown as Workflow<{ async_job_id: string }>,
     DELETE_WORKFLOW: { create: async () => ({}), get: async () => ({ status: async () => ({ status: 'running' }) }) } as unknown as Workflow<{ async_job_id: string }>,
+    DIARY_WORKFLOW: { create: async () => ({}), get: async () => ({ status: async () => ({ status: 'running' }) }) } as unknown as Workflow<{ async_job_id: string }>,
+    IMAGE_WORKFLOW: { create: async () => ({}), get: async () => ({ status: async () => ({ status: 'running' }) }) } as unknown as Workflow<{ async_job_id: string }>,
+    IMAGE_CLEANUP_WORKFLOW: { create: async () => ({}), get: async () => ({ status: async () => ({ status: 'running' }) }) } as unknown as Workflow<{ async_job_id: string }>,
+    OPENAI_API_KEY: 'test-key',
     DEVICE_TOKEN_HMAC_SECRET: 'x'.repeat(64),
     DEMO_WRITE_ENABLED: 'true',
     ACCESS_TEAM_DOMAIN: 'team.example.test',
@@ -158,6 +202,48 @@ describe('SQLマニフェスト', () => {
     await reserveDeleteJob(env, { id: 'rec_1', household_id: 'hh', version: 1, review_status: 'pending' }, 1, 'system', 'scheduler', 'corr_1');
     await ensureDeleteWorkflow(env, 'job_1');
     await scheduleRetentionCleanup(env);
+    const diaryClient = {
+      generateDiary: async () => ({ text: 'きょうはりんごをたべた。', requestId: 'req_diary' }),
+      generateImage: async () => ({ png: new Uint8Array([1, 2, 3]), requestId: 'req_image' }),
+    };
+    await runDiaryGeneration(env, 'job_1', oneStep, diaryClient);
+    await runImageGeneration(env, 'job_1', oneStep, diaryClient);
+    const rejectedDiaryClient = {
+      generateDiary: async () => { throw new OpenAiAnalysisError('UPSTREAM_REJECTED', false); },
+      generateImage: async () => { throw new OpenAiAnalysisError('UPSTREAM_REJECTED', false); },
+    };
+    await runDiaryGeneration(env, 'job_1', oneStep, rejectedDiaryClient);
+    await runImageGeneration(env, 'job_1', oneStep, rejectedDiaryClient);
+    await runImageCleanup(env, 'cleanup_1', oneStep);
+    await runImageCleanup({ ...env, PRIVATE_MEDIA: { delete: async () => { throw new Error('R2 down'); } } as unknown as R2Bucket }, 'cleanup_1', oneStep).catch(() => undefined);
+    await scheduleImageCleanup(env);
+    await reconcileGenerationDispatch(env);
+    await reconcileOrphanImageObjects(env);
+    await ensureMissingInitialDiaryJobs(env);
+    await app.fetch(
+      new Request('https://app.example.test/api/v1/diary/diary_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/image', {
+        method: 'POST',
+        headers: { 'Cf-Access-Jwt-Assertion': 'test', 'Content-Type': 'application/json' },
+        body: '{"version":1,"confirmed":true}',
+      }),
+      env,
+    );
+    await app.fetch(
+      new Request('https://app.example.test/api/v1/diary/diary_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/regenerate', {
+        method: 'POST',
+        headers: { 'Cf-Access-Jwt-Assertion': 'test', 'Content-Type': 'application/json' },
+        body: '{"version":1}',
+      }),
+      env,
+    );
+    await app.fetch(
+      new Request('https://app.example.test/api/v1/diary/diary_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', {
+        method: 'PATCH',
+        headers: { 'Cf-Access-Jwt-Assertion': 'test', 'Content-Type': 'application/json' },
+        body: '{"version":1,"diary_text":"手動の日記"}',
+      }),
+      env,
+    );
     await app.fetch(
       new Request('https://app.example.test/api/v1/recordings/rec_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/retry-analysis', {
         method: 'POST',
@@ -193,6 +279,9 @@ describe('SQLマニフェスト', () => {
     expect(statements.some((sql) => sql.includes('INSERT INTO word_candidates') && sql.includes('active_attempt_id'))).toBe(true);
     expect(statements.some((sql) => sql.includes("error_code = ?") && sql.includes("status = 'failed'"))).toBe(true);
     const manifestPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'sql-manifest.json');
+    if (process.env.UPDATE_SQL_MANIFEST === '1') {
+      writeFileSync(manifestPath, `${JSON.stringify({ statements }, null, 2)}\n`, 'utf-8');
+    }
     const committed = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { statements: string[] };
     expect([...committed.statements].sort()).toEqual(statements);
   });

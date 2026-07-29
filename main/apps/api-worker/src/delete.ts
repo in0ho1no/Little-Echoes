@@ -29,6 +29,12 @@ interface DeleteJobRow {
   audio_object_key: string | null;
 }
 
+interface ImageDeleteJobRow {
+  id: string;
+  has_attempt: number;
+  last_error_code: string | null;
+}
+
 interface ExistingJobRow {
   id: string;
   status: string;
@@ -68,6 +74,41 @@ async function deleteBudgetUsed(env: Env, recordingId: string): Promise<number> 
     .bind(recordingId, recordingId)
     .first<{ used: number }>();
   return row?.used ?? 0;
+}
+
+function imageObjectKeyFromJob(jobId: string): string {
+  return `diary-images/${jobId.replace(/^job_/, 'image_')}.png`;
+}
+
+async function quiesceImageWorkflows(env: Env, jobs: ImageDeleteJobRow[]): Promise<void> {
+  const terminalStatuses = new Set(['complete', 'errored', 'terminated']);
+  const activeStatuses = new Set(['queued', 'running', 'paused', 'waiting', 'waitingForPause']);
+  for (const job of jobs) {
+    if (!['DELETE_REQUESTED', 'DELETE_IMAGE_WORKFLOW_QUIESCED'].includes(job.last_error_code ?? '')) continue;
+    if (job.last_error_code === 'DELETE_IMAGE_WORKFLOW_QUIESCED') continue;
+    if (job.has_attempt !== 0) {
+      const instance = await env.IMAGE_WORKFLOW.get(job.id);
+      let observed = await instance.status();
+      if (activeStatuses.has(String(observed.status))) {
+        try {
+          await instance.terminate();
+        } catch {
+          // 終端との競合でも失敗し得るため、直後のstatusだけを判断根拠にする。
+        }
+        observed = await instance.status();
+      }
+      if (!terminalStatuses.has(String(observed.status))) {
+        throw new Error('image workflow termination is unresolved');
+      }
+    }
+    const marked = await env.DB.prepare(
+      `UPDATE async_jobs SET last_error_code = 'DELETE_IMAGE_WORKFLOW_QUIESCED', updated_at = ?
+        WHERE id = ? AND job_type = 'image' AND status = 'failed' AND last_error_code = 'DELETE_REQUESTED'`,
+    )
+      .bind(new Date().toISOString(), job.id)
+      .run();
+    if ((marked.meta.changes ?? 0) !== 1) throw new Error('image workflow quiescence commit is unresolved');
+  }
 }
 
 async function failDeleteDispatch(env: Env, asyncJobId: string, errorCode: string): Promise<boolean> {
@@ -294,8 +335,23 @@ async function deleteDataInD1(env: Env, job: DeleteJobRow, attemptId: string): P
       .bind(job.recording_id)
       .all<{ image_object_key: string }>()
   ).results;
-  const objectKeys = [job.audio_object_key, ...imageRows.map((row) => row.image_object_key)].filter((key): key is string => Boolean(key));
-  if (objectKeys.length > 0) await env.PRIVATE_MEDIA.delete(objectKeys);
+  const imageJobs = (
+    await env.DB.prepare(
+      `SELECT j.id, j.last_error_code,
+              EXISTS (SELECT 1 FROM processing_attempts pa WHERE pa.job_id = j.id AND pa.processing_kind = 'image') AS has_attempt
+         FROM async_jobs j WHERE j.recording_id = ? AND j.job_type = 'image'`,
+    )
+      .bind(job.recording_id)
+      .all<ImageDeleteJobRow>()
+  ).results;
+  await quiesceImageWorkflows(env, imageJobs);
+  const objectKeys = [
+    job.audio_object_key,
+    ...imageRows.map((row) => row.image_object_key),
+    ...imageJobs.map((imageJob) => imageObjectKeyFromJob(imageJob.id)),
+  ].filter((key): key is string => Boolean(key));
+  const uniqueObjectKeys = [...new Set(objectKeys)];
+  if (uniqueObjectKeys.length > 0) await env.PRIVATE_MEDIA.delete(uniqueObjectKeys);
 
   const now = new Date().toISOString();
   const wordPlaceholders = wordIds.map(() => '?').join(',');
@@ -338,6 +394,7 @@ async function deleteDataInD1(env: Env, job: DeleteJobRow, attemptId: string): P
     );
   }
   statements.push(
+    env.DB.prepare(`DELETE FROM image_cleanup_jobs WHERE diary_image_id IN (SELECT id FROM diary_images WHERE diary_entry_id IN (SELECT id FROM diary_entries WHERE recording_id = ?))`).bind(job.recording_id),
     env.DB.prepare('DELETE FROM diary_images WHERE diary_entry_id IN (SELECT id FROM diary_entries WHERE recording_id = ?)').bind(job.recording_id),
     env.DB.prepare('DELETE FROM diary_entries WHERE recording_id = ?').bind(job.recording_id),
     env.DB.prepare('DELETE FROM word_candidates WHERE recording_id = ?').bind(job.recording_id),

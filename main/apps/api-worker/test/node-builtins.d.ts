@@ -1,6 +1,9 @@
 declare module 'node:fs' {
   export function readFileSync(path: string, encoding: 'utf-8'): string;
+  export function writeFileSync(path: string, data: string, encoding: 'utf-8'): void;
 }
+
+declare const process: { env: Record<string, string | undefined> };
 
 declare module 'node:path' {
   export function dirname(path: string): string;
