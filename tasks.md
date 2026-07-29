@@ -168,7 +168,7 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 - [x] WAVとメタデータJSONのローカルスプールを実装し、OSユーザー限定権限、20件/25 MiB/7日、有界キュー、成功後削除を強制する。
 - [x] デバイストークンは環境変数または起動時秘密入力からのみ受け取り、画面・ログ・ファイル名へ出さない。
 - [x] HTTPSデバイスAPIへのアップロード、1回だけの自動再試行、明示的な再試行操作、`client_capture_id`冪等性、状態ポーリングを実装する。
-- [ ] 固定サンプル送信と実マイク送信を分離し、デモでは固定サンプルだけで再現できるようにする。
+- [x] 固定サンプル送信と実マイク送信を分離し、デモでは固定サンプルだけで再現できるようにする。（`app.py`の`send_fixed_sample`が専用ボタン・マイク非使用で分離実装済み。`sample.wav`配置とあわせ、Phase 5実API確認（2026-07-28）の本番実証で完了。証跡確認 2026-07-30）
 - [x] スプール満杯、ネットワーク失敗、期限切れトークン、切断、再起動復旧、音声をログに出さないことをテストする。
 - [x] Terra実装・Solレビュー・Fable5レビュー・実機確認・修正後の再検証を記録する。
 
@@ -239,7 +239,7 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 - [x] 承認時の初回日記job欠落を成功応答経路とcronで補償し、日記・画像jobのversion guard、種別横断排他、日次/録音別上限、有限試行、dispatch lease、孤児画像と旧画像の有限cleanupを実装。
 - [x] 削除と画像生成の競合は、削除要求で中断した画像Workflowの終端を確認できるまでR2/D1 purgeへ進めず、全画像job由来の決定的R2 keyも削除するよう修正。`DELETE_REQUESTED` jobを孤児cleanupから除外して削除側へ所有権を一本化し、過去に終端したWorkflowの保持期限切れには依存しない。
 - [x] OpenAPIとSQL manifestをPhase 6経路へ拡張。WorkerはVitest 147件、`wrangler types`、`tsc --noEmit`、PythonはRuff check/format、mypy、pyright、pytest 176件、加えて`git diff --check`とJSON解析に成功。
-- [ ] 外部ゲート: D1マイグレーション`0003`〜`0007`のremote適用、5種Workflow bindingと2本cronsを含むデプロイ、実D1/R2/Workflow障害注入、実OpenAI最小呼び出し、書き込み一時解放と再封止。いずれもユーザー確認なしには実施しない。（Fable5レビューは2026-07-29に実施・修正済みのため外部ゲートから除外）
+- [ ] 外部ゲート: D1マイグレーション`0003`〜`0007`のremote適用、5種Workflow bindingと2本cronsを含むデプロイ、実D1/R2/Workflow障害注入、実OpenAI最小呼び出し、書き込み一時解放と再封止。いずれもユーザー確認なしには実施しない。（Fable5レビューは2026-07-29に実施・修正済みのため外部ゲートから除外。実施手順・検証クエリ・コスト見積りは[phase6-external-gates.md](main/docs/phase6-external-gates.md)に整備済み。`wrangler deploy --dry-run`は2026-07-30にローカル実施し、5 Workflow binding・2 crons・封止維持を確認済み）
 - [x] SPEC.mdは既存の規範動作に沿う実装であり、仕様変更は不要と確認。
 - [x] Fable5レビューを実施（2026-07-29、`00a56c3`対象、独立アーキテクチャレビューエージェント併用）。全ゲート再現（Vitest 147件、`tsc --noEmit`、ruff/format/mypy/pyright、pytest 176件、`git diff --check`）。High 1件: `diary.ts:146`の`reserve()`がattempt INSERTの`meta.changes === 1`厳密比較を使うが、0003のBEFORE INSERTトリガー（日記1件・画像2件のusage_counters書き込み）が加算されるため実D1では成功時に2〜3となり常に`'blocked'`判定 — 日記・画像生成が本番で全件`DIARY_STATE_CHANGED`/`IMAGE_STATE_CHANGED`失敗し、試行予算と日次カウンターを消費、挿入済みattempt行は恒久`running`残存する（Phase 2実証済み`44f7ad7`の再発。Phase 5同型箇所`workflow.ts:141,168`は`>= 1`で回避済み。D1モックは常に`changes:1`のためテストで検出不能）。Medium 2件: (1) 画像生成が解析用と共有の30秒タイムアウトのため、1024x1024生成が実運用で高確率に`UPSTREAM_RESULT_UNKNOWN`失敗となり録音別5回・日次20回枠を成果なく消費する（実OpenAI確認前に画像専用の長いタイムアウトへ修正推奨）、(2) ステップ再実行時に前回running attemptを引き取らず`'blocked'`→誤コードで終端し、stale attemptが恒久非終端のまま残る（SPEC 1170・Phase 5の`STEP_REEXECUTED`パターン未適用）。Minor 8件: 承認応答経路の`ensureInitialDiaryGeneration`一過性D1エラーで承認成立済みでも500（cron補償で回復）、`markImageLifetimeLimit`分岐が実質到達不能（HAVING側が先に阻止）、Workflow内日次上限到達時の`failed`遷移とSPEC 593の字義の緊張、置換確認ダイアログのサムネイル欠落（SPEC 1396）、purge後に着地する画像putの理論上の孤児（発生確率極小・記録推奨）、日次1回cronでは画面を開かないstuck jobの収束に最悪約3日、PATCH日記/画像DELETEが全D1障害を409 `VERSION_CONFLICT`へ写像（Phase 3決定の番兵限定写像から逸脱）、画像DELETEの排他guardがdiary job非対象でUI抑止頼み（並行時は課金済み日記結果が破棄されるが有界・安全側）。SPEC確認事項2件: 日記状態表への`ready → generating`（明示再生成）遷移の追記、SPEC 593「状態を変更せず」の適用範囲の明確化。精査して問題なしと確認: 1日記1枚と置換順序の原子性、明示操作のみ・自動再生成なし、並列生成拒否、OpenAI呼び出し前のD1原子予約による有限コスト、`store:false`/`background:false`/`maxRetries:0`、入力分離とzod検証、世帯境界とR2キー非露出、削除との競合閉鎖、収束機構の有界性、SPEC 1344に基づく画像DELETEのキルスイッチ非対象。修正と再検証は未実施。
 
