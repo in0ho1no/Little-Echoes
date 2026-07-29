@@ -251,6 +251,8 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 
 - [x] 再発防止ガードレールを追加（2026-07-29、ユーザー依頼）。(1) `meta.changes`への厳密比較（`=== 1`/`!== 1`）をsrc全体で禁止し、既存21箇所をトリガー耐性形（書き込み成立`>= 1`・未書き込み`=== 0`）へ統一。静的ガードテスト`test/d1-changes-guard.test.ts`が違反を検出し、ミュータント`strict-changes-comparison-reintroduced`で退行も検出（計14ミュータント）。この統一により、解析job INSERT（`app.ts`の`/process`・retry-analysis）が実D1でトリガー加算により常にthrow→catchフォールバック経由で偶然動作していた潜在不具合も主経路で成立するよう解消。(2) `ag-little-echoes-architecture-review`エージェント定義へ「既知の再発クラス」チェックリスト7項目（meta.changesトリガー加算、送信済みマーカーによる再送禁止、絶対期限と延命禁止、R2ページングとsubrequest上限、番兵署名限定の409写像、scheduled失敗の集約throw、終端時のrunning attempt同時終端）を追記し、以後のレビューで必ず確認する。機械的ガードが難しい設計クラス（送信マーカー・期限・ページング等）はfeature+mutation+SPEC明文化+レビューチェックリストの4層で固定済み。検証: Vitest 165件、`tsc --noEmit`、ミューテーション14/14検出、pytest 191件、ruff/format/mypy/pyright、`git diff --check`すべて成功（SQL文変更なしのためマニフェスト再生成不要）。
 
+- [x] Sol再確認で残ったガードレール3件を修正（2026-07-30）。(1) featureカバレッジを既存TypeScript構文解析器で実装し直し、コメント内の`it()`を除外するとともに、Scenario重複・同名実テスト0件/複数件を失敗させて1:1対応を強制。(2) D1ガードを行正規表現から再帰的なTypeScript構文検査へ変更し、複数行・ブラケットアクセス・`meta`別名を扱い、`meta.changes`の別名化自体を禁止して許可形を直接の`>= 1`/`=== 0`に限定。各反例をGherkinとVitestへ追加。(3) 既知の再発クラス7項目を正本`.github/agents`へ反映し、`.claude/agents`のミラーと同一内容であることを確認。仕様動作は変えないためSPEC更新なし。検証: Vitest 167件、`tsc --noEmit`、ミューテーション14/14検出、pytest 191件、ruff/format/mypy/pyright、`git diff --check`すべて成功。
+
 ### UI改善バックログ（ユーザー要望 2026-07-28。Phase 6以降の画面整備時に実施）
 
 - [x] 解析・生成の待機中インジケータを整備する（現在は文言のみ。スピナー等で処理中であることを視覚的に示す）。

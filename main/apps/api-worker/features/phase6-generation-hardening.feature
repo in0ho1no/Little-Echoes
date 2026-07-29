@@ -8,6 +8,16 @@ Feature: Phase 6 generation hardening
     When src配下のコードがmeta.changesを厳密比較（=== 1 / !== 1）で判定しようとする
     Then 静的ガードテストが失敗し、>= 1 か === 0 への書き換えを強制する
 
+  Scenario: rejects aliases of meta.changes
+    Given meta.changesの値が別の変数へ代入されている
+    When その変数を1と厳密比較して静的ガードを回避しようとする
+    Then 別名化した時点で静的ガードが失敗する
+
+  Scenario: ignores commented tests and rejects duplicate implementations
+    Given Scenarioと同名のitがコメント内または複数箇所に記述されている
+    When featureカバレッジを検査する
+    Then コメントは実テストに数えず同名テストが0件または複数なら失敗する
+
   Scenario: reserves an attempt when D1 reports trigger-inflated changes
     Given D1のmeta.changesはBEFORE INSERTトリガーの書き込み分だけ増える
     When 日記生成Workflowがattemptを予約する

@@ -1,7 +1,14 @@
 declare module 'node:fs' {
+  export interface Dirent {
+    name: string;
+    isDirectory(): boolean;
+    isFile(): boolean;
+  }
+
   export function readFileSync(path: string, encoding: 'utf-8'): string;
   export function writeFileSync(path: string, data: string, encoding: 'utf-8'): void;
   export function readdirSync(path: string): string[];
+  export function readdirSync(path: string, options: { withFileTypes: true }): Dirent[];
 }
 
 declare const process: { env: Record<string, string | undefined> };
