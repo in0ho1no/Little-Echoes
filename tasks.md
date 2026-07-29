@@ -27,7 +27,7 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 | 3 — 承認・日時・辞典 | 完了 | Fable5レビュー・修正・実デプロイ・実環境承認E2E（ブラウザ実測）済み。書き込みは`DEMO_WRITE_ENABLED=false`で再封止 |
 | 4 — PC参照クライアント | 完了 | 実装・独立レビュー修正・Sol修正・Fable5確認・実機E2E（Cloudflare Bot Fight Mode遮断の発見と修正含む）済み。書き込みは`DEMO_WRITE_ENABLED=false`で再封止。固定サンプル送信はPhase 5実API確認（2026-07-28）で本番実証済み |
 | 5 — OpenAI解析 | 完了 | 全レビュー・デプロイ・実API最小確認（転写モデルは実測に基づき`gpt-4o-transcribe`へ承認変更）・インジェクション耐性確認・再封止403実測まで完了（2026-07-28）。書き込みは`DEMO_WRITE_ENABLED=false`で再封止済み |
-| 6 — 日記・画像 | ローカル実装・レビュー完了（外部ゲート/Fable5未実施） | 外部デプロイ、実OpenAI/D1/R2/Workflow確認、Fable5レビューは未実施 |
+| 6 — 日記・画像 | ローカル実装・Fable5レビュー・指摘修正・再検証完了（外部ゲート未実施） | Fable5レビュー（2026-07-29）のHigh 1件・Medium 2件・Minor 8件を同日修正し全ゲート再検証。外部デプロイ、実OpenAI/D1/R2/Workflow確認は未実施 |
 | 7 — セキュリティ・提出強化 | 未着手 | 中核フロー完了後 |
 | 8 — Atom VoiceS3R | 任意 | PC・バックエンド・Webが安定後 |
 
@@ -231,7 +231,7 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 - [x] 画像サイズ`1024x1024`・品質`low`、録音別/日別上限、有限再試行、非公開R2保存、認可済み再生を実装する。
 - [x] 日記一覧・詳細画面で、生成中、失敗、置換確認、空状態を表示する。
 - [x] 承認前拒否、上限、並行置換、生成失敗、R2削除、世帯越境をテストする。
-- [ ] Terra実装・Solレビュー・Fable5レビュー・修正後の再検証を記録する。
+- [x] Terra実装・Solレビュー・Fable5レビュー・修正後の再検証を記録する。
 
 ### Phase 6のローカル実装結果（2026-07-29）
 
@@ -241,6 +241,9 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 - [x] OpenAPIとSQL manifestをPhase 6経路へ拡張。WorkerはVitest 147件、`wrangler types`、`tsc --noEmit`、PythonはRuff check/format、mypy、pyright、pytest 176件、加えて`git diff --check`とJSON解析に成功。
 - [ ] 外部ゲート: D1マイグレーション`0003`〜`0006`のremote適用、5種Workflow bindingを含むデプロイ、実D1/R2/Workflow障害注入、実OpenAI最小呼び出し、書き込み一時解放と再封止、Fable5レビュー。いずれもユーザー確認なしには実施しない。
 - [x] SPEC.mdは既存の規範動作に沿う実装であり、仕様変更は不要と確認。
+- [x] Fable5レビューを実施（2026-07-29、`00a56c3`対象、独立アーキテクチャレビューエージェント併用）。全ゲート再現（Vitest 147件、`tsc --noEmit`、ruff/format/mypy/pyright、pytest 176件、`git diff --check`）。High 1件: `diary.ts:146`の`reserve()`がattempt INSERTの`meta.changes === 1`厳密比較を使うが、0003のBEFORE INSERTトリガー（日記1件・画像2件のusage_counters書き込み）が加算されるため実D1では成功時に2〜3となり常に`'blocked'`判定 — 日記・画像生成が本番で全件`DIARY_STATE_CHANGED`/`IMAGE_STATE_CHANGED`失敗し、試行予算と日次カウンターを消費、挿入済みattempt行は恒久`running`残存する（Phase 2実証済み`44f7ad7`の再発。Phase 5同型箇所`workflow.ts:141,168`は`>= 1`で回避済み。D1モックは常に`changes:1`のためテストで検出不能）。Medium 2件: (1) 画像生成が解析用と共有の30秒タイムアウトのため、1024x1024生成が実運用で高確率に`UPSTREAM_RESULT_UNKNOWN`失敗となり録音別5回・日次20回枠を成果なく消費する（実OpenAI確認前に画像専用の長いタイムアウトへ修正推奨）、(2) ステップ再実行時に前回running attemptを引き取らず`'blocked'`→誤コードで終端し、stale attemptが恒久非終端のまま残る（SPEC 1170・Phase 5の`STEP_REEXECUTED`パターン未適用）。Minor 8件: 承認応答経路の`ensureInitialDiaryGeneration`一過性D1エラーで承認成立済みでも500（cron補償で回復）、`markImageLifetimeLimit`分岐が実質到達不能（HAVING側が先に阻止）、Workflow内日次上限到達時の`failed`遷移とSPEC 593の字義の緊張、置換確認ダイアログのサムネイル欠落（SPEC 1396）、purge後に着地する画像putの理論上の孤児（発生確率極小・記録推奨）、日次1回cronでは画面を開かないstuck jobの収束に最悪約3日、PATCH日記/画像DELETEが全D1障害を409 `VERSION_CONFLICT`へ写像（Phase 3決定の番兵限定写像から逸脱）、画像DELETEの排他guardがdiary job非対象でUI抑止頼み（並行時は課金済み日記結果が破棄されるが有界・安全側）。SPEC確認事項2件: 日記状態表への`ready → generating`（明示再生成）遷移の追記、SPEC 593「状態を変更せず」の適用範囲の明確化。精査して問題なしと確認: 1日記1枚と置換順序の原子性、明示操作のみ・自動再生成なし、並列生成拒否、OpenAI呼び出し前のD1原子予約による有限コスト、`store:false`/`background:false`/`maxRetries:0`、入力分離とzod検証、世帯境界とR2キー非露出、削除との競合閉鎖、収束機構の有界性、SPEC 1344に基づく画像DELETEのキルスイッチ非対象。修正と再検証は未実施。
+
+- [x] Fable5レビュー指摘の修正と再検証を完了（2026-07-29、ユーザー指示による全件対応）。SPECを先に更新（日記状態表へ`ready → generating`、画像状態表へ`ready → not_requested`、SPEC 593の適用範囲＝Workflow内日次上限到達は予算・手動再生成権を消費せず終端、画像タイムアウト120秒、置換ダイアログのサムネイル不可時メッセージ、毎時再調停、purge後遅延putの日次スイープ）。実装: (High) `reserve()`を`>= 1`判定へ修正しD1モックをトリガー加算模倣（changes=3）へ変更、(M1) 画像生成のみ要求単位120秒タイムアウト＋待機インジケーターを経過30秒ごと4段階変化（スピナー速度/太さ＋経過秒表示）へ、(M2) reserve内で`STEP_REEXECUTED`引き取りを実装し、`fail()`/`markImageLifetimeLimit`/dispatch再調停の全終端経路でjob配下のrunning attemptを同時終端（恒久非終端行の残存経路を閉鎖）、(Minor) 承認応答は日記予約失敗を握り潰しcron補償へ委譲、image試行予算枯渇を`limit_reached`収束へ接続（到達不能分岐を解消）、日次上限終端時は同一バッチで`manual_retry`解放、置換確認を`<dialog>`＋サムネイル表示（onerrorで「現在の画像を表示できません。」）へ変更、R2孤児の日次スイープ（24時間経過・D1参照なしのみ・有限件数）を追加、cronを日次全量＋毎時再調停の2本立てへ（保持期限削除は日次のまま。`event.cron`厳密一致で分岐）、PATCH日記/画像DELETEの409写像を番兵限定へ修正（他は500 `INTERNAL_ERROR`）、画像DELETEの排他guardへdiary jobを追加（UI抑止に依存しない）。再発防止基盤（依存追加なし、ユーザー承認済み方式）: `features/phase6-generation-hardening.feature`（Gherkin 10シナリオ）と`test/feature-coverage.test.ts`（シナリオ⇔テスト名の1:1突合）、`scripts/mutation-check.mjs`（`pnpm run mutation-check`、重要述語7ミュータント。出現数ドリフト検出付き）。検証: Vitest 158件、`tsc --noEmit`、ミューテーション7/7検出、SQLマニフェスト再生成（`UPDATE_SQL_MANIFEST=1`）、pytest 183件（新SQLのEXPLAIN含む）、ruff/format/mypy/pyright、`git diff --check`すべて成功。wrangler.toml/templateへPhase 6の3 Workflow bindingと2本crons を反映（デプロイは外部ゲートのまま）。
 
 ### UI改善バックログ（ユーザー要望 2026-07-28。Phase 6以降の画面整備時に実施）
 

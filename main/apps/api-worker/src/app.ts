@@ -8,7 +8,7 @@ import { reconcileGenerationDispatch } from './diary';
 import { dispatchImageCleanup } from './image-cleanup';
 import { CORRELATION_ID_HEADER, errorBody, newCorrelationId } from './errors';
 import { ANALYSIS_STALE_MILLISECONDS, isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter, UPLOAD_RESERVED_STALE_MILLISECONDS } from './limits';
-import { approveReview, saveReview, type ReviewInput, type ReviewTarget } from './review';
+import { approveReview, isVersionConflictAbort, saveReview, type ReviewInput, type ReviewTarget } from './review';
 import type { DeviceIdentity, Env, ManagementIdentity } from './types';
 import { validateCanonicalWav, WavValidationError } from './wav';
 import { reconcileStaleAnalysisJob } from './workflow';
@@ -884,15 +884,19 @@ function reviewResultError(c: { json: (body: unknown, status: 400 | 401 | 403 | 
   return responseError(c, 409, 'REVIEW_NOT_AVAILABLE', '処理中または削除中の録音は確認できません。', false, '処理完了後に再度確認してください。');
 }
 
-async function ensureInitialDiaryGeneration(env: Env, householdId: string, recordingId: string, correlationId: string): Promise<void> {
-  const diaryId = await env.DB.prepare(
-    `SELECT d.id FROM diary_entries d JOIN recordings r ON r.id = d.recording_id
-      WHERE d.recording_id = ? AND r.household_id = ? AND r.review_status = 'approved' AND r.diary_status = 'not_started'`,
-  ).bind(recordingId, householdId).first<{ id: string }>();
-  const diary = diaryId ? await findDiary(env, householdId, diaryId.id) : null;
-  if (!diary || diary.diary_status !== 'not_started') return;
-  const diaryJob = await reserveDiaryJob(env, diary, householdId, correlationId, 'diary');
-  if (diaryJob) await dispatchDiaryWorkflow(env, diaryJob, 'diary');
+export async function ensureInitialDiaryGeneration(env: Env, householdId: string, recordingId: string, correlationId: string): Promise<void> {
+  try {
+    const diaryId = await env.DB.prepare(
+      `SELECT d.id FROM diary_entries d JOIN recordings r ON r.id = d.recording_id
+        WHERE d.recording_id = ? AND r.household_id = ? AND r.review_status = 'approved' AND r.diary_status = 'not_started'`,
+    ).bind(recordingId, householdId).first<{ id: string }>();
+    const diary = diaryId ? await findDiary(env, householdId, diaryId.id) : null;
+    if (!diary || diary.diary_status !== 'not_started') return;
+    const diaryJob = await reserveDiaryJob(env, diary, householdId, correlationId, 'diary');
+    if (diaryJob) await dispatchDiaryWorkflow(env, diaryJob, 'diary');
+  } catch {
+    // 承認は確定済みのため応答を失敗させない。欠落した初回日記jobはcronのensureMissingInitialDiaryJobsが補償する。
+  }
 }
 
 app.patch('/api/v1/recordings/:id/review', async (c) => {
@@ -1141,8 +1145,9 @@ app.patch('/api/v1/diary/:id', async (c) => {
       ).bind(now, c.req.param('id'), body.version + 1, identity.householdId),
       sentinel(),
     ]);
-  } catch {
-    return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+  } catch (error) {
+    if (isVersionConflictAbort(error)) return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+    return responseError(c, 500, 'INTERNAL_ERROR', '日記を保存できません。', true, '時間をおいて再試行してください。');
   }
   const diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
   return diary ? c.json(await diaryResponse(c.env, diary, c.get('correlationId'))) : responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '日記状態を取得できません。', true);
@@ -1216,22 +1221,23 @@ app.delete('/api/v1/diary/:id/image', async (c) => {
   const sentinel = () => c.env.DB.prepare(`INSERT INTO recording_tombstones (recording_id, household_id, review_status, deleted_at) SELECT NULL, NULL, NULL, NULL WHERE (SELECT changes()) = 0`);
   try { await c.env.DB.batch([
     c.env.DB.prepare(`UPDATE diary_images SET is_active = 0, deleted_at = ? WHERE id = ? AND diary_entry_id = ? AND is_active = 1
-      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = ? AND j.job_type = 'image' AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.active_image_id, diary.id, diary.recording_id),
+      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = ? AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.active_image_id, diary.id, diary.recording_id),
     sentinel(),
     c.env.DB.prepare(`UPDATE diary_entries SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?
       AND EXISTS (SELECT 1 FROM diary_images WHERE id = ? AND is_active = 0 AND deleted_at = ?)
-      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = diary_entries.recording_id AND j.job_type = 'image' AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.id, diary.version, diary.active_image_id, now),
+      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = diary_entries.recording_id AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.id, diary.version, diary.active_image_id, now),
     sentinel(),
     c.env.DB.prepare(`UPDATE recordings SET image_status = 'not_requested', updated_at = ? WHERE id = ? AND household_id = ?
       AND EXISTS (SELECT 1 FROM diary_images WHERE id = ? AND is_active = 0 AND deleted_at = ?)
-      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = recordings.id AND j.job_type = 'image' AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.recording_id, identity.householdId, diary.active_image_id, now),
+      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = recordings.id AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.recording_id, identity.householdId, diary.active_image_id, now),
     sentinel(),
     c.env.DB.prepare(`INSERT INTO image_cleanup_jobs (id, household_id, diary_image_id, image_object_key, status, created_at, updated_at)
       SELECT ?, ?, ?, ?, 'dispatch_pending', ?, ? WHERE EXISTS (SELECT 1 FROM diary_images WHERE id = ? AND is_active = 0 AND deleted_at = ?)`)
       .bind(cleanupId, identity.householdId, diary.active_image_id, image.image_object_key, now, now, diary.active_image_id, now),
     sentinel(),
-  ]); } catch {
-    return responseError(c, 409, 'VERSION_CONFLICT', '画像は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+  ]); } catch (error) {
+    if (isVersionConflictAbort(error)) return responseError(c, 409, 'VERSION_CONFLICT', '画像は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+    return responseError(c, 500, 'INTERNAL_ERROR', '画像を削除できません。', true, '時間をおいて再試行してください。');
   }
   const dispatch = await dispatchImageCleanup(c.env, cleanupId);
   return dispatch === 'dispatched' ? c.json(acceptedJobResponse(cleanupId, 'dispatched', c.get('correlationId')), 202) : responseError(c, 500, 'WORKFLOW_DISPATCH_UNKNOWN', '画像削除の受付結果を確認できません。', false, '状態を確認してください。');
@@ -1461,7 +1467,8 @@ app.get('/diary/:id', async (c) => {
   const imageLimitMessage = diary.image_status === 'limit_reached' ? '<p>この録音の画像生成上限に達しました。保存済み画像は引き続き表示できます。</p>' : '';
   const imageCreatedMessage = diary.active_image_created_at ? `<p>現在の画像の作成日時: ${escapeHtml(diary.active_image_created_at)}</p>` : '';
   const status = busy ? '生成中です。少し待つと更新されます。' : diary.last_generation_error ? '生成に失敗しました。手動入力または再試行できます。' : '';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 絵日記</title><link rel="stylesheet" href="/assets/diary.css"></head><body><main data-diary-id="${diary.id}" data-version="${diary.version}" data-active-image="${diary.active_image_id ?? ''}" data-active-image-created="${diary.active_image_created_at ?? ''}"><p><a href="/diary">絵日記一覧へ戻る</a></p><h1>絵日記</h1><p id="diary-status"${busy ? ' class="busy"' : ''} aria-live="polite">${escapeHtml(status)}</p><p>録音日時: ${escapeHtml(diary.captured_at)}</p><audio controls preload="metadata" src="/api/v1/recordings/${diary.recording_id}/audio">このブラウザでは音声を再生できません。</audio><section><h2>NEWの単語</h2>${words}</section><label>日記文<textarea id="diary-text" maxlength="4000">${escapeHtml(diary.diary_text)}</textarea></label><p>${diaryButtons}</p>${retryMessage}<section><h2>イラスト</h2>${image}${imageCreatedMessage}<p>${imageGenerateButton}${imageDeleteButton}</p>${imageLimitMessage}</section></main><script src="/assets/diary.js"></script></body></html>`);
+  const replaceDialog = `<dialog id="replace-dialog"><h2>画像の置き換え</h2><p>新しい画像の生成に成功した場合だけ、現在の画像を置き換えます。</p><img id="replace-thumb" class="diary-thumb" alt="現在の画像"><p id="replace-thumb-missing" hidden>現在の画像を表示できません。</p><p id="replace-created"></p><p><button type="button" id="replace-ok">置き換えを続ける</button> <button type="button" id="replace-cancel">やめる</button></p></dialog>`;
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 絵日記</title><link rel="stylesheet" href="/assets/diary.css"></head><body><main data-diary-id="${diary.id}" data-version="${diary.version}" data-active-image="${diary.active_image_id ?? ''}" data-active-image-created="${diary.active_image_created_at ?? ''}"><p><a href="/diary">絵日記一覧へ戻る</a></p><h1>絵日記</h1><p id="diary-status"${busy ? ' class="busy"' : ''} aria-live="polite">${escapeHtml(status)}</p><p>録音日時: ${escapeHtml(diary.captured_at)}</p><audio controls preload="metadata" src="/api/v1/recordings/${diary.recording_id}/audio">このブラウザでは音声を再生できません。</audio><section><h2>NEWの単語</h2>${words}</section><label>日記文<textarea id="diary-text" maxlength="4000">${escapeHtml(diary.diary_text)}</textarea></label><p>${diaryButtons}</p>${retryMessage}<section><h2>イラスト</h2>${image}${imageCreatedMessage}<p>${imageGenerateButton}${imageDeleteButton}</p>${imageLimitMessage}</section>${replaceDialog}</main><script src="/assets/diary.js"></script></body></html>`);
 });
 
 app.get('/dictionary', async (c) => {
@@ -1604,13 +1611,13 @@ app.get('/assets/review-detail.js', async (c) => {
 
 app.get('/assets/diary.css', async (c) => {
   const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
-  const stylesheet = `@keyframes spin{to{transform:rotate(360deg)}}.busy::before{content:"";display:inline-block;width:1em;height:1em;margin-right:.5em;border:.18em solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-.15em;animation:spin .8s linear infinite}.diary-image{max-width:100%;height:auto}@media(prefers-reduced-motion:reduce){.busy::before{animation:none}}`;
+  const stylesheet = `@keyframes spin{to{transform:rotate(360deg)}}.busy::before{content:"";display:inline-block;width:1em;height:1em;margin-right:.5em;border:.18em solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-.15em;animation:spin .8s linear infinite}.busy[data-stage="2"]::before{animation-duration:.6s;border-width:.24em}.busy[data-stage="3"]::before{animation-duration:.45s;border-width:.3em}.busy[data-stage="4"]::before{animation-duration:.3s;border-width:.36em}.diary-image{max-width:100%;height:auto}.diary-thumb{max-width:12rem;height:auto;display:block}#replace-dialog{max-width:22rem}@media(prefers-reduced-motion:reduce){.busy::before{animation:none}}`;
   return new Response(stylesheet, { headers: { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
 });
 
 app.get('/assets/diary.js', async (c) => {
   const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
-  const script = `(()=>{const status=document.getElementById('diary-status');const page=document.querySelector('main[data-diary-id]');const fail=async r=>{const e=await r.json().catch(()=>null);throw new Error(e&&e.message?e.message:'操作に失敗しました。')};if(!page){fetch('/api/v1/diary').then(r=>r.ok?r.json():fail(r)).then(data=>{const list=document.getElementById('diaries');status.textContent=data.items.length?'絵日記です。':'承認済みの絵日記はまだありません。';for(const diary of data.items){const li=document.createElement('li'),a=document.createElement('a');a.href='/diary/'+encodeURIComponent(diary.diary_id);a.textContent=diary.captured_at+' — '+(diary.diary_text||({'generating':'生成中','failed':'生成失敗','not_started':'未作成'}[diary.status]||'日記'));li.append(a);list.append(li)}}).catch(e=>status.textContent=e.message);return}const id=page.dataset.diaryId,version=()=>Number(page.dataset.version),post=async(path,method,body)=>{status.textContent='⏳ 処理を受け付けています…';const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)await fail(r);location.reload()};let remaining=180;const poll=()=>{if(remaining--<=0){status.textContent='更新が停止しました。ページを再読み込みしてください。';return}fetch('/api/v1/diary/'+encodeURIComponent(id)).then(r=>r.ok?r.json():null).then(data=>{if(data&&(data.status==='generating'||data.image_status==='generating'))setTimeout(poll,5000);else if(data)location.reload()}).catch(()=>setTimeout(poll,10000))};if(status.textContent.includes('生成中'))setTimeout(poll,5000);page.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;target.disabled=true;if(action==='save-diary')void post('/api/v1/diary/'+encodeURIComponent(id),'PATCH',{version:version(),diary_text:String(document.getElementById('diary-text').value)}).catch(e=>{status.textContent=e.message;target.disabled=false});if(action==='regenerate-diary')void post('/api/v1/diary/'+encodeURIComponent(id)+'/regenerate','POST',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false});if(action==='generate-image'){const active=page.dataset.activeImage;const created=page.dataset.activeImageCreated;const message=active?'新しい画像の保存に成功した場合だけ、現在の画像（作成日時: '+(created||'不明')+'）を置き換えます。続けますか？':'新しい画像を生成します。生成回数の上限を消費します。続けますか？';if(!confirm(message)){target.disabled=false;return}void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',active?{version:version(),confirmed:true,replace_image_id:active}:{version:version(),confirmed:true}).catch(e=>{status.textContent=e.message;target.disabled=false})}if(action==='delete-image'){if(!confirm('現在の画像を削除しますか？')){target.disabled=false;return}void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','DELETE',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false})}})})();`;
+  const script = `(()=>{const status=document.getElementById('diary-status');const page=document.querySelector('main[data-diary-id]');const fail=async r=>{const e=await r.json().catch(()=>null);throw new Error(e&&e.message?e.message:'操作に失敗しました。')};if(!page){fetch('/api/v1/diary').then(r=>r.ok?r.json():fail(r)).then(data=>{const list=document.getElementById('diaries');status.textContent=data.items.length?'絵日記です。':'承認済みの絵日記はまだありません。';for(const diary of data.items){const li=document.createElement('li'),a=document.createElement('a');a.href='/diary/'+encodeURIComponent(diary.diary_id);a.textContent=diary.captured_at+' — '+(diary.diary_text||({'generating':'生成中','failed':'生成失敗','not_started':'未作成'}[diary.status]||'日記'));li.append(a);list.append(li)}}).catch(e=>status.textContent=e.message);return}const id=page.dataset.diaryId,version=()=>Number(page.dataset.version),post=async(path,method,body)=>{status.textContent='⏳ 処理を受け付けています…';const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)await fail(r);location.reload()};let elapsed=0;const showProgress=()=>{const stage=Math.min(4,1+Math.floor(elapsed/30));status.classList.add('busy');status.dataset.stage=String(stage);status.textContent='生成中です（経過 '+elapsed+'秒・段階 '+stage+'/4）。少し待つと更新されます。'};let remaining=180;const poll=()=>{if(remaining--<=0){status.classList.remove('busy');status.removeAttribute('data-stage');status.textContent='更新が停止しました。ページを再読み込みしてください。';return}fetch('/api/v1/diary/'+encodeURIComponent(id)).then(r=>r.ok?r.json():null).then(data=>{if(data&&(data.status==='generating'||data.image_status==='generating')){elapsed+=5;showProgress();setTimeout(poll,5000)}else if(data)location.reload();else setTimeout(poll,10000)}).catch(()=>{elapsed+=10;showProgress();setTimeout(poll,10000)})};if(status.classList.contains('busy')){showProgress();setTimeout(poll,5000)}const dialog=document.getElementById('replace-dialog');const openReplaceDialog=(active,created,target)=>{const thumb=document.getElementById('replace-thumb');const missing=document.getElementById('replace-thumb-missing');missing.hidden=true;thumb.hidden=false;thumb.onerror=()=>{thumb.hidden=true;missing.hidden=false};document.getElementById('replace-created').textContent='作成日時: '+(created||'不明');document.getElementById('replace-ok').onclick=()=>{dialog.close();void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',{version:version(),confirmed:true,replace_image_id:active}).catch(e=>{status.textContent=e.message;target.disabled=false})};document.getElementById('replace-cancel').onclick=()=>{dialog.close();target.disabled=false};dialog.oncancel=()=>{target.disabled=false};thumb.src='/api/v1/diary/'+encodeURIComponent(id)+'/image';dialog.showModal()};page.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;if(!action)return;target.disabled=true;if(action==='save-diary')void post('/api/v1/diary/'+encodeURIComponent(id),'PATCH',{version:version(),diary_text:String(document.getElementById('diary-text').value)}).catch(e=>{status.textContent=e.message;target.disabled=false});if(action==='regenerate-diary')void post('/api/v1/diary/'+encodeURIComponent(id)+'/regenerate','POST',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false});if(action==='generate-image'){const active=page.dataset.activeImage;if(active){openReplaceDialog(active,page.dataset.activeImageCreated,target);return}if(!confirm('新しい画像を生成します。生成回数の上限を消費します。続けますか？')){target.disabled=false;return}void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',{version:version(),confirmed:true}).catch(e=>{status.textContent=e.message;target.disabled=false})}if(action==='delete-image'){if(!confirm('現在の画像を削除しますか？')){target.disabled=false;return}void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','DELETE',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false})}})})();`;
   return new Response(script, { headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
 });
 

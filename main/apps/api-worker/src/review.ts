@@ -57,7 +57,7 @@ function versionConflictSentinel(db: D1Database): D1PreparedStatement {
     .bind();
 }
 
-function isVersionConflictAbort(error: unknown): boolean {
+export function isVersionConflictAbort(error: unknown): boolean {
   return error instanceof Error && error.message.includes('recording_tombstones');
 }
 

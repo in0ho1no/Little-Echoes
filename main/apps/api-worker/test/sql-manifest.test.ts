@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ensureDeleteWorkflow, reserveDeleteJob, runDeleteWorkflow, scheduleRetentionCleanup } from '../src/delete';
 import { reconcileGenerationDispatch, reconcileOrphanImageObjects, runDiaryGeneration, runImageGeneration } from '../src/diary';
-import { runImageCleanup, scheduleImageCleanup } from '../src/image-cleanup';
+import { runImageCleanup, scheduleImageCleanup, sweepUnreferencedImageObjects } from '../src/image-cleanup';
 import { OpenAiAnalysisError, type OpenAiAnalysisClient } from '../src/openai-analysis';
 import { app, ensureMissingInitialDiaryJobs } from '../src/app';
 import { approveReview, saveReview } from '../src/review';
@@ -34,7 +34,7 @@ function canonicalWav(): Uint8Array {
   return bytes;
 }
 
-function capturingEnv(collected: Set<string>): Env {
+function capturingEnv(collected: Set<string>, options: { blockAttemptInsert?: boolean; attemptCount?: number } = {}): Env {
   const statement = (sql: string): Record<string, unknown> => ({
     sql,
     bind: (..._values: unknown[]) => statement(sql),
@@ -100,7 +100,7 @@ function capturingEnv(collected: Set<string>): Env {
           post_roll_seconds: 0, draft_scene: null, draft_parent_note: null, source_type: 'pc',
         };
       }
-      if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: 0 };
+      if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: options.attemptCount ?? 0 };
       if (sql.includes('SELECT id FROM device_tokens')) return { id: 'token_1' };
       return null;
     },
@@ -126,12 +126,15 @@ function capturingEnv(collected: Set<string>): Env {
       prepare: (sql: string) => statement(sql),
       batch: async (statements: { sql: string }[]) => {
         statements.forEach((bound) => collected.add(bound.sql));
-        return statements.map(() => ({ meta: { changes: 1 } }));
+        return statements.map((bound) => ({
+          meta: { changes: options.blockAttemptInsert && bound.sql.includes('INSERT INTO processing_attempts') ? 0 : 1 },
+        }));
       },
     } as unknown as D1Database,
     PRIVATE_MEDIA: {
       delete: async () => undefined,
       put: async () => undefined,
+      list: async () => ({ objects: [{ key: `diary-images/image_${'f'.repeat(32)}.png`, uploaded: new Date('2020-01-01T00:00:00.000Z') }] }),
       get: async () => {
         const bytes = canonicalWav();
         return { size: bytes.byteLength, arrayBuffer: async () => bytes.buffer };
@@ -214,9 +217,15 @@ describe('SQLマニフェスト', () => {
     };
     await runDiaryGeneration(env, 'job_1', oneStep, rejectedDiaryClient);
     await runImageGeneration(env, 'job_1', oneStep, rejectedDiaryClient);
+    const budgetExhaustedEnv = capturingEnv(collected, { blockAttemptInsert: true, attemptCount: 5 });
+    await runDiaryGeneration(budgetExhaustedEnv, 'job_1', oneStep, diaryClient);
+    await runImageGeneration(budgetExhaustedEnv, 'job_1', oneStep, diaryClient);
+    const contendedEnv = capturingEnv(collected, { blockAttemptInsert: true, attemptCount: 0 });
+    await runDiaryGeneration(contendedEnv, 'job_1', oneStep, diaryClient);
     await runImageCleanup(env, 'cleanup_1', oneStep);
     await runImageCleanup({ ...env, PRIVATE_MEDIA: { delete: async () => { throw new Error('R2 down'); } } as unknown as R2Bucket }, 'cleanup_1', oneStep).catch(() => undefined);
     await scheduleImageCleanup(env);
+    await sweepUnreferencedImageObjects(env);
     await reconcileGenerationDispatch(env);
     await reconcileOrphanImageObjects(env);
     await ensureMissingInitialDiaryJobs(env);

@@ -98,6 +98,40 @@ export async function scheduleImageCleanup(env: Env, limit = 10): Promise<void> 
   for (const job of jobs.results) await dispatchImageCleanup(env, job.id);
 }
 
+// purge後に遅延着地した画像put（所有ジョブ行が既に削除済み）は他の収束機構から不可視になるため、
+// R2の実在オブジェクトを起点にした日次スイープだけが回収できる。24時間未満のオブジェクトには
+// 触れない — 実行中生成の「R2保存済み・D1未コミット」窓を誤削除しないための猶予。
+export async function sweepUnreferencedImageObjects(env: Env, limit = 20): Promise<void> {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  let listed: { objects: { key: string; uploaded: Date }[] };
+  try {
+    listed = await env.PRIVATE_MEDIA.list({ prefix: 'diary-images/', limit: 200 });
+  } catch {
+    return;
+  }
+  let deleted = 0;
+  for (const object of listed.objects) {
+    if (deleted >= limit) return;
+    if (object.uploaded.getTime() > cutoff) continue;
+    const match = /^diary-images\/image_([a-z0-9]{32})\.png$/.exec(object.key);
+    if (!match) continue;
+    let referenced: { present: number } | null;
+    try {
+      referenced = await env.DB.prepare(
+        `SELECT 1 AS present WHERE EXISTS (SELECT 1 FROM diary_images WHERE image_object_key = ? AND deleted_at IS NULL)
+            OR EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status IN ('dispatch_pending','dispatched','running'))`,
+      ).bind(object.key, `job_${match[1]}`).first<{ present: number }>();
+    } catch {
+      return;
+    }
+    if (referenced) continue;
+    try {
+      await env.PRIVATE_MEDIA.delete(object.key);
+      deleted += 1;
+    } catch { /* 失敗分は翌日のスイープが同じ条件で回収する。 */ }
+  }
+}
+
 export class ImageCleanupWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> {
   async run(event: { payload: WorkflowParams }, step: { do: (name: string, options: unknown, operation: () => Promise<void>) => Promise<void> }): Promise<void> {
     await runImageCleanup(this.env, event.payload.async_job_id, (name, retryLimit, operation) => step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, operation));

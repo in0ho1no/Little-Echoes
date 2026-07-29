@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   cleanupOrphanImageObject,
+  createDiaryOpenAiClient,
   DIARY_GENERATION_INSTRUCTIONS,
   diaryGenerationInput,
   imageGenerationInput,
@@ -15,28 +16,34 @@ import type { Env } from '../src/types';
 
 function generationEnv(options: {
   reserveBlocked?: boolean;
+  attemptCount?: number;
+  dailyLimitAbort?: boolean;
+  manualRetryJob?: boolean;
   commitBatchThrows?: boolean;
   commitActuallySucceeded?: boolean;
   deleteOwnedOrphan?: boolean;
   orphanJobs?: string[];
   reconcileJob?: boolean;
   reconcileClaimed?: boolean;
+  reconcileCount?: number;
   workflowStatus?: string;
-} = {}): { env: Env; statements: string[]; deletedKeys: string[] } {
+} = {}): { env: Env; statements: string[]; deletedKeys: string[]; bound: { sql: string; values: unknown[] }[] } {
   const statements: string[] = [];
   const deletedKeys: string[] = [];
+  const bound: { sql: string; values: unknown[] }[] = [];
   let batches = 0;
   const statement = (sql: string): Record<string, unknown> => ({
     sql,
-    bind: (..._values: unknown[]) => statement(sql),
+    bind: (...values: unknown[]) => ({ ...statement(sql), values }),
     first: async () => {
       if (sql.includes('FROM async_jobs j JOIN recordings')) {
         return {
-          id: 'job_1', household_id: 'hh', recording_id: 'rec_1', status: 'dispatched', correlation_id: 'corr_1', manual_retry: 0,
+          id: 'job_1', household_id: 'hh', recording_id: 'rec_1', status: 'dispatched', correlation_id: 'corr_1', manual_retry: options.manualRetryJob ? 1 : 0,
           diary_id: 'diary_1', diary_text: 'りんごをたべた', scene: '公園', parent_note: null, reviewed_text: 'りんご', captured_at: '2026-07-29T00:00:00.000Z',
           expected_recording_version: 1, expected_diary_version: 1,
         };
       }
+      if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: options.attemptCount ?? 0 };
       if (sql.includes('FROM diary_images')) return { id: 'image_old', image_object_key: 'diary-images/image_old.png' };
       if (sql.includes('FROM image_cleanup_jobs')) return { id: 'cleanup_1' };
       return null;
@@ -48,7 +55,7 @@ function generationEnv(options: {
         return { results: (options.orphanJobs ?? []).map((id) => ({ id })) };
       }
       if (sql.includes("job_type IN ('diary','image')") && options.reconcileJob) {
-        return { results: [{ id: 'job_1', job_type: 'image', household_id: 'hh', recording_id: 'rec_1', dispatch_reconcile_count: 0 }] };
+        return { results: [{ id: 'job_1', job_type: 'image', household_id: 'hh', recording_id: 'rec_1', dispatch_reconcile_count: options.reconcileCount ?? 0 }] };
       }
       return { results: [] };
     },
@@ -63,14 +70,19 @@ function generationEnv(options: {
   const env = {
     DB: {
       prepare: statement,
-      batch: async (items: { sql: string }[]) => {
+      batch: async (items: { sql: string; values?: unknown[] }[]) => {
         batches += 1;
-        items.forEach((item) => statements.push(item.sql));
+        items.forEach((item) => { statements.push(item.sql); bound.push({ sql: item.sql, values: item.values ?? [] }); });
+        if (options.dailyLimitAbort && batches === 1) throw new Error('openai_daily_limit_reached');
         if (options.commitBatchThrows && batches === 2) throw new Error('D1 response lost');
         if (options.commitBatchThrows && options.commitActuallySucceeded && batches >= 3) {
           return items.map(() => ({ meta: { changes: 0 } }));
         }
-        return items.map((_, index) => ({ meta: { changes: options.reserveBlocked && batches === 1 && index === 1 ? 0 : 1 } }));
+        // 実D1のmeta.changesはBEFORE INSERTトリガーの書き込みを含むため、attempt INSERTの
+        // 成功は1でなく2〜3で返る。本番挙動（Phase 2実証）を模倣し、厳密比較の退行を検出する。
+        return items.map((item) => ({
+          meta: { changes: item.sql.includes('INSERT INTO processing_attempts') ? (options.reserveBlocked ? 0 : 3) : 1 },
+        }));
       },
     } as unknown as D1Database,
     PRIVATE_MEDIA: { put: async () => undefined, delete: async (key: string) => { deletedKeys.push(key); } } as unknown as R2Bucket,
@@ -83,7 +95,7 @@ function generationEnv(options: {
     create: async () => { if (options.workflowStatus && options.workflowStatus !== 'running') throw new Error('already terminal'); },
     get: async () => ({ status: async () => ({ status: options.workflowStatus ?? 'running' }) }),
   } as unknown as Workflow<{ async_job_id: string }>;
-  return { env, statements, deletedKeys };
+  return { env, statements, deletedKeys, bound };
 }
 
 const oneStep = async (_name: string, _limit: number, operation: () => Promise<void>): Promise<void> => operation();
@@ -111,6 +123,57 @@ describe('Phase 6 diary prompts', () => {
     await runDiaryGeneration(env, 'job_1', oneStep, { generateDiary: async () => ({ text: 'きょうはりんごをたべた。', requestId: 'req_diary' }), generateImage: async () => ({ png: new Uint8Array(), requestId: null }) });
     expect(statements.some((sql) => sql.includes("diary_text = ?") && sql.includes("status = 'running'"))).toBe(true);
     expect(statements.some((sql) => sql.includes("status = 'succeeded'") && sql.includes('async_jobs'))).toBe(true);
+  });
+
+  it('reserves an attempt when D1 reports trigger-inflated changes', async () => {
+    const { env, statements } = generationEnv();
+    let called = false;
+    await runDiaryGeneration(env, 'job_1', oneStep, { generateDiary: async () => { called = true; return { text: 'きょうはりんごをたべた。', requestId: 'req_diary' }; }, generateImage: async () => ({ png: new Uint8Array(), requestId: null }) });
+    expect(called).toBe(true);
+    expect(statements.some((sql) => sql.includes("status = 'succeeded'") && sql.includes('async_jobs'))).toBe(true);
+    expect(statements.some((sql) => sql.includes('DIARY_STATE_CHANGED'))).toBe(false);
+  });
+
+  it('terminates a stale running attempt with STEP_REEXECUTED before starting a new one', async () => {
+    const { env, statements } = generationEnv();
+    await runDiaryGeneration(env, 'job_1', oneStep, { generateDiary: async () => ({ text: 'きょうはりんごをたべた。', requestId: 'req_diary' }), generateImage: async () => ({ png: new Uint8Array(), requestId: null }) });
+    expect(statements.some((sql) => sql.includes("SET status = 'failed', error_code = 'STEP_REEXECUTED'") && sql.includes("job_id = ? AND status = 'running'"))).toBe(true);
+  });
+
+  it('converges the attempt and releases the manual retry when the daily limit aborts the reservation', async () => {
+    const { env, statements, bound } = generationEnv({ dailyLimitAbort: true, manualRetryJob: true });
+    let called = false;
+    await runDiaryGeneration(env, 'job_1', oneStep, { generateDiary: async () => { called = true; return { text: 'unused', requestId: null }; }, generateImage: async () => ({ png: new Uint8Array(), requestId: null }) });
+    expect(called).toBe(false);
+    expect(statements.some((sql) => sql.includes("UPDATE async_jobs SET status = 'failed'"))).toBe(true);
+    const release = bound.find((item) => item.sql.includes('SET manual_retry = 0'));
+    expect(release?.values.at(-1)).toBe(1);
+    expect(statements.some((sql) => sql.includes('UPDATE processing_attempts') && sql.includes("job_id = ? AND status = 'running'"))).toBe(true);
+  });
+
+  it('routes an exhausted image attempt budget to the lifetime limit convergence', async () => {
+    const { env, statements } = generationEnv({ reserveBlocked: true, attemptCount: 5 });
+    let called = false;
+    await runImageGeneration(env, 'job_1', oneStep, { generateDiary: async () => ({ text: 'unused', requestId: null }), generateImage: async () => { called = true; return { png: new Uint8Array(), requestId: null }; } });
+    expect(called).toBe(false);
+    expect(statements.some((sql) => sql.includes("image_status = 'limit_reached'"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("UPDATE processing_attempts SET status = 'failed', error_code = 'COST_LIMIT_REACHED'"))).toBe(true);
+  });
+
+  it('passes the image-specific 120-second timeout to the provider', async () => {
+    const captured: (number | undefined)[] = [];
+    const fake = {
+      responses: { parse: async () => ({ output_parsed: { diary_text: 'x' } }) },
+      images: {
+        generate: async (_body: unknown, options?: { timeout?: number }) => {
+          captured.push(options?.timeout);
+          return { data: [{ b64_json: btoa('png') }] };
+        },
+      },
+    };
+    const client = createDiaryOpenAiClient('key', fake as never);
+    await client.generateImage('prompt');
+    expect(captured).toEqual([120_000]);
   });
 
   it('marks a diary provider failure without publishing generated text', async () => {
@@ -185,5 +248,11 @@ describe('Phase 6 diary prompts', () => {
     await reconcileGenerationDispatch(env);
     expect(statements.some((sql) => sql.includes('SET dispatch_lease_until = ?'))).toBe(true);
     expect(statements.some((sql) => sql.includes('dispatch_reconcile_count = dispatch_reconcile_count + 1') && sql.includes('dispatch_lease_until = ?'))).toBe(true);
+  });
+
+  it('terminates running attempts when dispatch reconciliation fails a job', async () => {
+    const { env, statements } = generationEnv({ reconcileJob: true, reconcileCount: 2, workflowStatus: 'errored' });
+    await reconcileGenerationDispatch(env);
+    expect(statements.some((sql) => sql.includes('UPDATE processing_attempts') && sql.includes("error_code = 'WORKFLOW_DISPATCH_UNKNOWN'"))).toBe(true);
   });
 });

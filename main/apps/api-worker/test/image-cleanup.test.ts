@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { dispatchImageCleanup, runImageCleanup } from '../src/image-cleanup';
+import { dispatchImageCleanup, runImageCleanup, sweepUnreferencedImageObjects } from '../src/image-cleanup';
 import type { Env } from '../src/types';
 
 function env(deleteImage: () => Promise<void>, changes = 1, dispatchReconcileCount = 0, sql: string[] = []): Env {
@@ -64,5 +64,39 @@ describe('inactive image cleanup', () => {
     } as unknown as Workflow<{ async_job_id: string }>;
     await expect(dispatchImageCleanup(supplied, 'job_cleanup')).resolves.toBe('dispatched');
     expect(statements.some((sql) => sql.includes("CASE WHEN status = 'dispatch_pending' THEN 'dispatched' ELSE status END"))).toBe(true);
+  });
+
+  it('sweeps only unreferenced day-old image objects', async () => {
+    const dayOld = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    const fresh = new Date(Date.now() - 60 * 60 * 1000);
+    const referencedKey = `diary-images/image_${'a'.repeat(32)}.png`;
+    const orphanKey = `diary-images/image_${'b'.repeat(32)}.png`;
+    const freshKey = `diary-images/image_${'c'.repeat(32)}.png`;
+    const deleted: string[] = [];
+    const referenceSql: string[] = [];
+    const supplied = env(async () => undefined);
+    supplied.DB = {
+      prepare: (statement: string) => ({
+        bind: (...values: unknown[]) => ({
+          first: async () => {
+            referenceSql.push(statement);
+            return values[0] === referencedKey ? { present: 1 } : null;
+          },
+        }),
+      }),
+    } as unknown as D1Database;
+    supplied.PRIVATE_MEDIA = {
+      list: async () => ({ objects: [
+        { key: referencedKey, uploaded: dayOld },
+        { key: orphanKey, uploaded: dayOld },
+        { key: freshKey, uploaded: fresh },
+        { key: 'diary-images/unrelated.txt', uploaded: dayOld },
+      ] }),
+      delete: async (key: string) => { deleted.push(key); },
+    } as unknown as R2Bucket;
+    await sweepUnreferencedImageObjects(supplied);
+    expect(deleted).toEqual([orphanKey]);
+    expect(referenceSql.every((sql) => sql.includes('deleted_at IS NULL') && sql.includes("status IN ('dispatch_pending','dispatched','running')"))).toBe(true);
+    expect(referenceSql).toHaveLength(2);
   });
 });

@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { app, ensureMissingInitialDiaryJobs } from '../src/app';
+import { app, ensureInitialDiaryGeneration, ensureMissingInitialDiaryJobs } from '../src/app';
 import { hmacToken } from '../src/auth';
 import type { Env } from '../src/types';
 import { validateCanonicalWav } from '../src/wav';
@@ -17,13 +17,17 @@ type RunHandler = (sql: string, values: unknown[]) => D1Result<unknown>;
 
 type AllHandler = (sql: string) => unknown[];
 
+type BatchHandler = (statements: { sql: string; values: unknown[] }[]) => { meta: { changes: number } }[];
+
 function fakeDatabase(
   first: FirstHandler,
   run: RunHandler = () => ({ meta: { changes: 1 } }) as D1Result<unknown>,
   allRows: AllHandler = () => [],
+  onBatch?: BatchHandler,
 ): D1Database {
   return {
     prepare: (sql: string) => ({
+      sql,
       bind: (..._values: unknown[]) => ({
         sql,
         values: _values,
@@ -32,13 +36,14 @@ function fakeDatabase(
         all: async () => ({ results: allRows(sql) }),
       }),
     }),
-    batch: async (statements: unknown[]) => statements.map(() => ({ meta: { changes: 1 } })),
+    batch: async (statements: { sql: string; values: unknown[] }[]) =>
+      onBatch ? onBatch(statements) : statements.map(() => ({ meta: { changes: 1 } })),
   } as unknown as D1Database;
 }
 
-function env(first: FirstHandler, run?: RunHandler, allRows?: AllHandler): Env {
+function env(first: FirstHandler, run?: RunHandler, allRows?: AllHandler, onBatch?: BatchHandler): Env {
   return {
-    DB: fakeDatabase(first, run, allRows),
+    DB: fakeDatabase(first, run, allRows, onBatch),
     PRIVATE_MEDIA: { put: async () => null } as unknown as R2Bucket,
     ANALYSIS_WORKFLOW: {
       create: async () => ({}),
@@ -255,6 +260,68 @@ describe('ルーターと録音API', () => {
     } as unknown as Workflow<{ async_job_id: string }>;
     await ensureMissingInitialDiaryJobs(supplied);
     expect(diaryCreates).toBe(1);
+  });
+
+  it('maps only optimistic lock aborts to a version conflict response', async () => {
+    for (const [message, expected] of [
+      ['NOT NULL constraint failed: recording_tombstones.recording_id', 409],
+      ['D1 connection reset', 500],
+    ] as const) {
+      const supplied = env(
+        (sql) => (sql.includes('management_principals') ? { household_id: 'household_1' } : null),
+        undefined,
+        undefined,
+        () => { throw new Error(message); },
+      );
+      supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+      const response = await app.fetch(new Request('https://app.example.test/api/v1/diary/diary_11111111111111111111111111111111', { method: 'PATCH', headers: { 'Cf-Access-Jwt-Assertion': 'signed', 'Content-Type': 'application/json' }, body: '{"version":1,"diary_text":"手動の日記"}' }), supplied);
+      expect(response.status).toBe(expected);
+      const payload = await response.json() as { code: string };
+      expect(payload.code).toBe(expected === 409 ? 'VERSION_CONFLICT' : 'INTERNAL_ERROR');
+    }
+  });
+
+  it('keeps the approval response successful when the initial diary reservation fails', async () => {
+    const supplied = env((sql) => {
+      if (sql.includes('SELECT d.id FROM diary_entries')) throw new Error('D1 unavailable');
+      return null;
+    });
+    await expect(ensureInitialDiaryGeneration(supplied, 'household_1', RECORDING_ID, 'corr_test')).resolves.toBeUndefined();
+  });
+
+  it('blocks image deletion while a diary generation job is active', async () => {
+    const diary = {
+      id: 'diary_11111111111111111111111111111111',
+      household_id: 'household_1',
+      recording_id: RECORDING_ID,
+      diary_text: '日記',
+      scene: null,
+      version: 1,
+      recording_version: 1,
+      diary_status: 'ready',
+      image_status: 'ready',
+      captured_at: '2026-07-21T00:00:00.000Z',
+      last_generation_error: null,
+      active_image_id: `image_${'2'.repeat(32)}`,
+      active_image_created_at: '2026-07-21T00:01:00.000Z',
+    };
+    const captured: string[] = [];
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
+        if (sql.includes('SELECT image_object_key FROM diary_images')) return { image_object_key: 'diary-images/image_old.png' };
+        if (sql.includes('FROM image_cleanup_jobs WHERE id')) return { id: 'cleanup_1', image_object_key: 'diary-images/image_old.png', status: 'dispatch_pending', attempt_count: 0, dispatch_reconcile_count: 0, dispatch_lease_until: null };
+        return null;
+      },
+      undefined,
+      undefined,
+      (statements) => { statements.forEach((bound) => captured.push(bound.sql)); return statements.map(() => ({ meta: { changes: 1 } })); },
+    );
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(new Request(`https://app.example.test/api/v1/diary/${diary.id}/image`, { method: 'DELETE', headers: { 'Cf-Access-Jwt-Assertion': 'signed', 'Content-Type': 'application/json' }, body: '{"version":1}' }), supplied);
+    expect(response.status).toBe(202);
+    expect(captured.filter((sql) => sql.includes("job_type IN ('diary','image')"))).toHaveLength(3);
   });
 
   it('image daily/lifetime preflightはjobを作らない', async () => {

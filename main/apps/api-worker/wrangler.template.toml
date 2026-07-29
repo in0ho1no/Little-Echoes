@@ -41,8 +41,10 @@ name = "little-echoes-image-cleanup"
 class_name = "ImageCleanupWorkflow"
 
 [triggers]
-# 1日1回、各cleanup・再調停キューを最大10件ずつ処理する。
-crons = ["17 3 * * *"]
+# 日次(17 3): 保持期限削除・R2孤児スイープを含む全量。毎時(47): 日記・画像・cleanupの
+# 再調停のみ（stuck jobの収束を最長1日以内へ短縮）。日次cron文字列はsrc/index.tsの
+# DAILY_FULL_CRONと一致させること。
+crons = ["17 3 * * *", "47 * * * *"]
 
 [vars]
 DEMO_WRITE_ENABLED = "false"
