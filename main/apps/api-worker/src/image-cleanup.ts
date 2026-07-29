@@ -101,35 +101,69 @@ export async function scheduleImageCleanup(env: Env, limit = 10): Promise<void> 
 // purge後に遅延着地した画像put（所有ジョブ行が既に削除済み）は他の収束機構から不可視になるため、
 // R2の実在オブジェクトを起点にした日次スイープだけが回収できる。24時間未満のオブジェクトには
 // 触れない — 実行中生成の「R2保存済み・D1未コミット」窓を誤削除しないための猶予。
-export async function sweepUnreferencedImageObjects(env: Env, limit = 20): Promise<void> {
+// 1回のスイープは1ページだけ処理し、D1へ永続化したカーソルで翌日以降に後続ページへ進む
+// （R2一覧は辞書順のため、先頭固定では後続の孤児へ到達できない）。参照確認は一括2クエリ、
+// 削除は一括1要求とし、Workers Freeのsubrequest上限内に収める。
+const SWEEP_PREFIX = 'diary-images/';
+const SWEEP_PAGE_SIZE = 50;
+
+export async function sweepUnreferencedImageObjects(env: Env): Promise<void> {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  let listed: { objects: { key: string; uploaded: Date }[] };
+  let startAfter: string | undefined;
   try {
-    listed = await env.PRIVATE_MEDIA.list({ prefix: 'diary-images/', limit: 200 });
+    const cursor = await env.DB.prepare(`SELECT start_after FROM r2_sweep_cursors WHERE prefix = ?`)
+      .bind(SWEEP_PREFIX).first<{ start_after: string | null }>();
+    startAfter = cursor?.start_after ?? undefined;
   } catch {
     return;
   }
-  let deleted = 0;
+  let listed: { objects: { key: string; uploaded: Date }[]; truncated: boolean };
+  try {
+    listed = await env.PRIVATE_MEDIA.list({ prefix: SWEEP_PREFIX, limit: SWEEP_PAGE_SIZE, startAfter });
+  } catch {
+    return;
+  }
+  const candidates: { key: string; jobId: string }[] = [];
   for (const object of listed.objects) {
-    if (deleted >= limit) return;
-    if (object.uploaded.getTime() > cutoff) continue;
     const match = /^diary-images\/image_([a-z0-9]{32})\.png$/.exec(object.key);
-    if (!match) continue;
-    let referenced: { present: number } | null;
+    if (!match || object.uploaded.getTime() > cutoff) continue;
+    candidates.push({ key: object.key, jobId: `job_${match[1]}` });
+  }
+  if (candidates.length > 0) {
+    const placeholders = candidates.map(() => '?').join(',');
+    let liveImages: { results: { key: string }[] };
+    let liveJobs: { results: { id: string }[] };
     try {
-      referenced = await env.DB.prepare(
-        `SELECT 1 AS present WHERE EXISTS (SELECT 1 FROM diary_images WHERE image_object_key = ? AND deleted_at IS NULL)
-            OR EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status IN ('dispatch_pending','dispatched','running'))`,
-      ).bind(object.key, `job_${match[1]}`).first<{ present: number }>();
+      liveImages = await env.DB.prepare(
+        `SELECT image_object_key AS key FROM diary_images WHERE deleted_at IS NULL AND image_object_key IN (${placeholders})`,
+      ).bind(...candidates.map((candidate) => candidate.key)).all<{ key: string }>();
+      liveJobs = await env.DB.prepare(
+        `SELECT id FROM async_jobs WHERE status IN ('dispatch_pending','dispatched','running') AND id IN (${placeholders})`,
+      ).bind(...candidates.map((candidate) => candidate.jobId)).all<{ id: string }>();
     } catch {
       return;
     }
-    if (referenced) continue;
-    try {
-      await env.PRIVATE_MEDIA.delete(object.key);
-      deleted += 1;
-    } catch { /* 失敗分は翌日のスイープが同じ条件で回収する。 */ }
+    const referencedKeys = new Set(liveImages.results.map((row) => row.key));
+    const referencedJobs = new Set(liveJobs.results.map((row) => row.id));
+    const doomed = candidates
+      .filter((candidate) => !referencedKeys.has(candidate.key) && !referencedJobs.has(candidate.jobId))
+      .map((candidate) => candidate.key);
+    if (doomed.length > 0) {
+      try {
+        await env.PRIVATE_MEDIA.delete(doomed);
+      } catch {
+        return; /* カーソルを進めず、翌日のスイープが同じページを再処理する。 */
+      }
+    }
   }
+  const nextStartAfter = listed.truncated ? listed.objects.at(-1)?.key ?? null : null;
+  const now = new Date().toISOString();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO r2_sweep_cursors (prefix, start_after, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(prefix) DO UPDATE SET start_after = excluded.start_after, updated_at = excluded.updated_at`,
+    ).bind(SWEEP_PREFIX, nextStartAfter, now).run();
+  } catch { /* カーソル未更新は再処理になるだけで安全側。 */ }
 }
 
 export class ImageCleanupWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> {

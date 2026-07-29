@@ -53,9 +53,37 @@ const MUTANTS = [
   {
     name: 'all-errors-mapped-to-version-conflict',
     file: 'src/review.ts',
-    find: "error.message.includes('recording_tombstones')",
-    replace: "error.message.includes('')",
+    find: "error.message.includes('NOT NULL constraint failed: recording_tombstones')",
+    replace: "error.message.includes('recording_tombstones')",
     tests: ['test/app.test.ts'],
+  },
+  {
+    name: 'takeover-claims-sent-attempts',
+    file: 'src/diary.ts',
+    find: '.bind(now, job.id, `${kind}_generation`, job.id),',
+    replace: '.bind(now, job.id, `${kind}_generation_sent`, job.id),',
+    tests: ['test/diary.test.ts'],
+  },
+  {
+    name: 'deadline-comparison-inverted',
+    file: 'src/diary.ts',
+    find: 'job.created_at <= deadlineBefore',
+    replace: 'job.created_at > deadlineBefore',
+    tests: ['test/diary.test.ts'],
+  },
+  {
+    name: 'daily-cron-branch-inverted',
+    file: 'src/index.ts',
+    find: 'event.cron === DAILY_FULL_CRON',
+    replace: 'event.cron !== DAILY_FULL_CRON',
+    tests: ['test/index.test.ts'],
+  },
+  {
+    name: 'sweep-cursor-never-advances',
+    file: 'src/image-cleanup.ts',
+    find: 'listed.truncated ? listed.objects.at(-1)?.key ?? null : null',
+    replace: 'null',
+    tests: ['test/image-cleanup.test.ts'],
   },
 ];
 

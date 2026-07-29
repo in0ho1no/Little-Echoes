@@ -34,7 +34,7 @@ function canonicalWav(): Uint8Array {
   return bytes;
 }
 
-function capturingEnv(collected: Set<string>, options: { blockAttemptInsert?: boolean; attemptCount?: number } = {}): Env {
+function capturingEnv(collected: Set<string>, options: { blockAttemptInsert?: boolean; attemptCount?: number; reconcileCount?: number; reconcileCreatedAt?: string } = {}): Env {
   const statement = (sql: string): Record<string, unknown> => ({
     sql,
     bind: (..._values: unknown[]) => statement(sql),
@@ -116,7 +116,7 @@ function capturingEnv(collected: Set<string>, options: { blockAttemptInsert?: bo
       }
       if (sql.includes('SELECT j.id FROM async_jobs j') && sql.includes('orphan_cleanup')) return { results: [{ id: 'job_1' }] };
       if (sql.includes("job_type IN ('diary','image')") && sql.includes('dispatch_reconcile_count')) {
-        return { results: [{ id: 'job_1', job_type: 'image', household_id: 'hh', recording_id: 'rec_1', dispatch_reconcile_count: 0 }] };
+        return { results: [{ id: 'job_1', job_type: 'image', household_id: 'hh', recording_id: 'rec_1', dispatch_reconcile_count: options.reconcileCount ?? 0, created_at: options.reconcileCreatedAt ?? new Date().toISOString() }] };
       }
       return { results: [] };
     },
@@ -134,7 +134,7 @@ function capturingEnv(collected: Set<string>, options: { blockAttemptInsert?: bo
     PRIVATE_MEDIA: {
       delete: async () => undefined,
       put: async () => undefined,
-      list: async () => ({ objects: [{ key: `diary-images/image_${'f'.repeat(32)}.png`, uploaded: new Date('2020-01-01T00:00:00.000Z') }] }),
+      list: async () => ({ truncated: false, objects: [{ key: `diary-images/image_${'f'.repeat(32)}.png`, uploaded: new Date('2020-01-01T00:00:00.000Z') }] }),
       get: async () => {
         const bytes = canonicalWav();
         return { size: bytes.byteLength, arrayBuffer: async () => bytes.buffer };
@@ -227,6 +227,7 @@ describe('SQLマニフェスト', () => {
     await scheduleImageCleanup(env);
     await sweepUnreferencedImageObjects(env);
     await reconcileGenerationDispatch(env);
+    await reconcileGenerationDispatch(capturingEnv(collected, { reconcileCount: 2, reconcileCreatedAt: '2020-01-01T00:00:00.000Z' }));
     await reconcileOrphanImageObjects(env);
     await ensureMissingInitialDiaryJobs(env);
     await app.fetch(

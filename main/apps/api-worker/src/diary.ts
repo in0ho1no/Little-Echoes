@@ -3,7 +3,7 @@ import OpenAI from 'openai';
 import { zodTextFormat } from 'openai/helpers/zod';
 import { z } from 'zod';
 
-import { IMAGE_OPENAI_REQUEST_TIMEOUT_MILLISECONDS, isDemoWriteAllowed, OPENAI_REQUEST_TIMEOUT_MILLISECONDS } from './limits';
+import { GENERATION_DEADLINE_MILLISECONDS, IMAGE_OPENAI_REQUEST_TIMEOUT_MILLISECONDS, isDemoWriteAllowed, OPENAI_REQUEST_TIMEOUT_MILLISECONDS } from './limits';
 import { classifyOpenAiError, OpenAiAnalysisError } from './openai-analysis';
 import { dispatchImageCleanup } from './image-cleanup';
 import type { Env, WorkflowParams } from './types';
@@ -128,7 +128,7 @@ function requirePreviousChange(env: Env): D1PreparedStatement {
   );
 }
 
-async function reserve(env: Env, job: GenerationJob, kind: 'diary' | 'image'): Promise<string | 'daily_limit' | 'lifetime_limit' | 'budget_exhausted' | 'blocked'> {
+async function reserve(env: Env, job: GenerationJob, kind: 'diary' | 'image'): Promise<string | 'daily_limit' | 'lifetime_limit' | 'budget_exhausted' | 'prior_call_unresolved' | 'blocked'> {
   const attempt = id('attempt');
   const now = new Date().toISOString();
   const budget = kind === 'image' ? 5 : 3;
@@ -139,9 +139,11 @@ async function reserve(env: Env, job: GenerationJob, kind: 'diary' | 'image'): P
           AND EXISTS (SELECT 1 FROM recordings r JOIN diary_entries d ON d.recording_id = r.id
             WHERE r.id = async_jobs.recording_id AND r.household_id = async_jobs.household_id AND r.review_status = 'approved'
               AND r.version = async_jobs.expected_recording_version AND d.version = async_jobs.expected_diary_version)`).bind(now, now, job.id),
-      // ステップ再実行の引き取り（SPEC 1170）。ジョブ非終端＝結果未コミットのため、前回running attemptを終端してから予算内で再開する。
+      // ステップ再実行の引き取り（SPEC 1170）。未コミットでも「送信済み」の可能性がある
+      // attemptは引き取らない（stage一致＝送信前のみ）— 提供者受理済み要求の再送を禁止するため。
       env.DB.prepare(`UPDATE processing_attempts SET status = 'failed', error_code = 'STEP_REEXECUTED', retryable = 0, finished_at = ?
-        WHERE job_id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'running')`).bind(now, job.id, job.id),
+        WHERE job_id = ? AND status = 'running' AND stage = ?
+          AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'running')`).bind(now, job.id, `${kind}_generation`, job.id),
       env.DB.prepare(
         `INSERT INTO processing_attempts (id, household_id, recording_id, job_id, processing_kind, stage, attempt_number, status, retryable, correlation_id, started_at)
          SELECT ?, ?, ?, ?, ?, ?, COALESCE(MAX(attempt_number),0)+1, 'running', 0, ?, ? FROM processing_attempts
@@ -155,6 +157,9 @@ async function reserve(env: Env, job: GenerationJob, kind: 'diary' | 'image'): P
     ]);
     // 実D1のmeta.changesはBEFORE INSERTトリガーの書き込みを含む（Phase 2実証）ため、厳密比較でなく未挿入(0)だけを失敗と判定する。
     if ((result[2]?.meta.changes ?? 0) >= 1) return attempt;
+    const sentPrior = await env.DB.prepare(`SELECT id FROM processing_attempts WHERE job_id = ? AND status = 'running' AND stage = ?`)
+      .bind(job.id, `${kind}_generation_sent`).first<{ id: string }>();
+    if (sentPrior) return 'prior_call_unresolved';
     const used = await env.DB.prepare(`SELECT COUNT(*) AS attempt_count FROM processing_attempts WHERE recording_id = ? AND processing_kind = ?`)
       .bind(job.recording_id, kind).first<{ attempt_count: number }>();
     return (used?.attempt_count ?? 0) >= budget ? 'budget_exhausted' : 'blocked';
@@ -165,6 +170,15 @@ async function reserve(env: Env, job: GenerationJob, kind: 'diary' | 'image'): P
     if (/constraint|UNIQUE|CHECK|not_active/i.test(text)) return 'blocked';
     throw error;
   }
+}
+
+// 提供者への送信直前にstageを送信済みへ進める。クラッシュ後の再実行はこのマーカーで
+// 「送信したか不明」なattemptを識別し、再送せずUPSTREAM_RESULT_UNKNOWNへ収束させる。
+async function markProviderCallSent(env: Env, job: GenerationJob, kind: 'diary' | 'image', attempt: string): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `UPDATE processing_attempts SET stage = ? WHERE id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'running')`,
+  ).bind(`${kind}_generation_sent`, attempt, job.id).run();
+  return (result.meta.changes ?? 0) >= 1;
 }
 
 async function markImageLifetimeLimit(env: Env, job: GenerationJob): Promise<void> {
@@ -193,11 +207,14 @@ export async function runDiaryGeneration(env: Env, jobId: string, runStep: RunSt
     const attempt = await reserve(env, job, 'diary');
     if (attempt === 'daily_limit') { await fail(env, job, 'diary', 'COST_LIMIT_REACHED', job.manual_retry === 1); return; }
     if (attempt === 'lifetime_limit' || attempt === 'budget_exhausted') { await fail(env, job, 'diary', 'COST_LIMIT_REACHED'); return; }
+    if (attempt === 'prior_call_unresolved') { await fail(env, job, 'diary', 'UPSTREAM_RESULT_UNKNOWN'); return; }
     if (attempt === 'blocked') { await fail(env, job, 'diary', 'DIARY_STATE_CHANGED'); return; }
     if (!isDemoWriteAllowed(env.DEMO_WRITE_ENABLED)) { await fail(env, job, 'diary', 'DEMO_WRITE_DISABLED'); return; }
+    const input = diaryGenerationInput(job, await wordsForDiary(env, job));
+    if (!(await markProviderCallSent(env, job, 'diary', attempt))) { await fail(env, job, 'diary', 'DIARY_STATE_CHANGED'); return; }
     let providerAccepted = false;
     try {
-      const output = await client.generateDiary(diaryGenerationInput(job, await wordsForDiary(env, job)));
+      const output = await client.generateDiary(input);
       providerAccepted = true;
       const now = new Date().toISOString();
       await env.DB.batch([
@@ -239,11 +256,13 @@ export async function runImageGeneration(env: Env, jobId: string, runStep: RunSt
     const attempt = await reserve(env, job, 'image');
     if (attempt === 'daily_limit') { await fail(env, job, 'image', 'COST_LIMIT_REACHED'); return; }
     if (attempt === 'lifetime_limit' || attempt === 'budget_exhausted') { await markImageLifetimeLimit(env, job); return; }
+    if (attempt === 'prior_call_unresolved') { await fail(env, job, 'image', 'UPSTREAM_RESULT_UNKNOWN'); return; }
     if (attempt === 'blocked') { await fail(env, job, 'image', 'IMAGE_STATE_CHANGED'); return; }
     if (!isDemoWriteAllowed(env.DEMO_WRITE_ENABLED)) { await fail(env, job, 'image', 'DEMO_WRITE_DISABLED'); return; }
     const imageId = job.id.replace(/^job_/, 'image_'); const key = `diary-images/${imageId}.png`;
     const previous = await env.DB.prepare(`SELECT id, image_object_key FROM diary_images WHERE diary_entry_id = ? AND is_active = 1 AND deleted_at IS NULL`)
       .bind(job.diary_id).first<{ id: string; image_object_key: string }>();
+    if (!(await markProviderCallSent(env, job, 'image', attempt))) { await fail(env, job, 'image', 'IMAGE_STATE_CHANGED'); return; }
     let providerAccepted = false;
     try {
       const output = await client.generateImage(imageGenerationInput(diaryText, job.scene));
@@ -342,18 +361,21 @@ export async function reconcileOrphanImageObjects(env: Env, limit = 10): Promise
   for (const job of jobs.results) await cleanupOrphanImageObject(env, job.id);
 }
 
+const ACTIVE_WORKFLOW_STATUSES = ['queued', 'running', 'paused', 'waiting', 'waitingForPause'];
+
 export async function reconcileGenerationDispatch(env: Env, limit = 10, recordingId?: string, householdId?: string): Promise<void> {
   const staleBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const deadlineBefore = new Date(Date.now() - GENERATION_DEADLINE_MILLISECONDS).toISOString();
   const claimTime = new Date().toISOString();
   const leaseUntil = new Date(Date.now() + 60 * 1000).toISOString();
   const jobs = await env.DB.prepare(
-    `SELECT id, job_type, household_id, recording_id, dispatch_reconcile_count FROM async_jobs
+    `SELECT id, job_type, household_id, recording_id, dispatch_reconcile_count, created_at FROM async_jobs
       WHERE job_type IN ('diary','image') AND status IN ('dispatch_pending','dispatched','running')
         AND (? IS NULL OR recording_id = ?)
         AND (? IS NULL OR household_id = ?)
         AND updated_at <= ?
       ORDER BY updated_at ASC LIMIT ?`,
-  ).bind(recordingId ?? null, recordingId ?? null, householdId ?? null, householdId ?? null, staleBefore, limit).all<{ id: string; job_type: 'diary' | 'image'; household_id: string; recording_id: string; dispatch_reconcile_count: number }>();
+  ).bind(recordingId ?? null, recordingId ?? null, householdId ?? null, householdId ?? null, staleBefore, limit).all<{ id: string; job_type: 'diary' | 'image'; household_id: string; recording_id: string; dispatch_reconcile_count: number; created_at: string }>();
   for (const job of jobs.results) {
     const claimed = await env.DB.prepare(
       `UPDATE async_jobs SET dispatch_lease_until = ? WHERE id = ? AND status IN ('dispatch_pending','dispatched','running')
@@ -361,10 +383,21 @@ export async function reconcileGenerationDispatch(env: Env, limit = 10, recordin
     ).bind(leaseUntil, job.id, job.dispatch_reconcile_count, staleBefore, claimTime).run();
     if ((claimed.meta.changes ?? 0) !== 1) continue;
     const workflow = job.job_type === 'diary' ? env.DIARY_WORKFLOW : env.IMAGE_WORKFLOW;
+    // 絶対期限（作成から30分）を超えたジョブは、活性なWorkflowでも延命しない。
+    // 期限なしの延命はWorkflowの長時間実行と組み合わさると恒久generatingになり得るため。
+    const pastDeadline = job.created_at <= deadlineBefore;
+    const terminalCode = pastDeadline ? 'GENERATION_DEADLINE_EXCEEDED' : 'WORKFLOW_DISPATCH_UNKNOWN';
     try {
+      if (pastDeadline) {
+        try {
+          const instance = await workflow.get(job.id);
+          if (ACTIVE_WORKFLOW_STATUSES.includes(String((await instance.status()).status))) await instance.terminate();
+        } catch { /* 終了・観測に失敗しても収束を優先する。ジョブ終端後の遅延書き込みはstatus guardで着地しない。 */ }
+        throw new Error('generation deadline exceeded');
+      }
       await workflow.create({ id: job.id, params: { async_job_id: job.id } }).catch(() => undefined);
       const observed = await (await workflow.get(job.id)).status();
-      if (['queued', 'running', 'paused', 'waiting', 'waitingForPause'].includes(String(observed.status))) {
+      if (ACTIVE_WORKFLOW_STATUSES.includes(String(observed.status))) {
         await env.DB.prepare(`UPDATE async_jobs
           SET status = CASE WHEN status = 'dispatch_pending' THEN 'dispatched' ELSE status END,
               dispatch_reconcile_count = 0, dispatch_lease_until = NULL, updated_at = ?
@@ -378,16 +411,16 @@ export async function reconcileGenerationDispatch(env: Env, limit = 10, recordin
         const now = new Date().toISOString();
         await env.DB.batch([
           env.DB.prepare(`UPDATE async_jobs SET status = 'failed', dispatch_reconcile_count = 3, dispatch_lease_until = NULL,
-            last_error_code = 'WORKFLOW_DISPATCH_UNKNOWN', finished_at = ?, updated_at = ?
+            last_error_code = ?, finished_at = ?, updated_at = ?
             WHERE id = ? AND status IN ('dispatch_pending','dispatched','running') AND dispatch_reconcile_count = ? AND dispatch_lease_until = ?`)
-            .bind(now, now, job.id, job.dispatch_reconcile_count, leaseUntil),
-          env.DB.prepare(`UPDATE processing_attempts SET status = 'failed', error_code = 'WORKFLOW_DISPATCH_UNKNOWN', retryable = 0, finished_at = ?
-            WHERE job_id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed' AND last_error_code = 'WORKFLOW_DISPATCH_UNKNOWN')`)
-            .bind(now, job.id, job.id),
+            .bind(terminalCode, now, now, job.id, job.dispatch_reconcile_count, leaseUntil),
+          env.DB.prepare(`UPDATE processing_attempts SET status = 'failed', error_code = ?, retryable = 0, finished_at = ?
+            WHERE job_id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed' AND last_error_code = ?)`)
+            .bind(terminalCode, now, job.id, job.id, terminalCode),
           env.DB.prepare(job.job_type === 'diary'
-            ? `UPDATE recordings SET diary_status = 'failed', updated_at = ? WHERE id = ? AND household_id = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed' AND last_error_code = 'WORKFLOW_DISPATCH_UNKNOWN')`
-            : `UPDATE recordings SET image_status = CASE WHEN EXISTS (SELECT 1 FROM diary_images i JOIN diary_entries d ON d.id = i.diary_entry_id WHERE d.recording_id = ? AND i.is_active = 1 AND i.deleted_at IS NULL) THEN 'ready' ELSE 'failed' END, updated_at = ? WHERE id = ? AND household_id = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed' AND last_error_code = 'WORKFLOW_DISPATCH_UNKNOWN')`)
-            .bind(...(job.job_type === 'diary' ? [now, job.recording_id, job.household_id, job.id] : [job.recording_id, now, job.recording_id, job.household_id, job.id])),
+            ? `UPDATE recordings SET diary_status = 'failed', updated_at = ? WHERE id = ? AND household_id = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed' AND last_error_code = ?)`
+            : `UPDATE recordings SET image_status = CASE WHEN EXISTS (SELECT 1 FROM diary_images i JOIN diary_entries d ON d.id = i.diary_entry_id WHERE d.recording_id = ? AND i.is_active = 1 AND i.deleted_at IS NULL) THEN 'ready' ELSE 'failed' END, updated_at = ? WHERE id = ? AND household_id = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'failed' AND last_error_code = ?)`)
+            .bind(...(job.job_type === 'diary' ? [now, job.recording_id, job.household_id, job.id, terminalCode] : [job.recording_id, now, job.recording_id, job.household_id, job.id, terminalCode])),
         ]);
       } else {
         await env.DB.prepare(`UPDATE async_jobs SET dispatch_reconcile_count = dispatch_reconcile_count + 1,

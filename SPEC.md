@@ -659,6 +659,7 @@ stateDiagram-v2
         diary_failed --> diary_generating: bounded retry
         diary_failed --> diary_ready: manual entry
         diary_ready --> diary_ready: manual edit
+        diary_ready --> diary_generating: explicit regenerate
     }
 
     state "Images" as Images {
@@ -670,6 +671,7 @@ stateDiagram-v2
         image_failed --> image_limit_reached: recording cap reached
         image_ready --> image_generating: explicit regenerate
         image_ready --> image_limit_reached: recording cap reached
+        image_ready --> image_not_requested: delete image
     }
 ```
 
@@ -1276,7 +1278,7 @@ DELETE /api/v1/recordings/{recording_id}
 - 削除Workflowの失敗時は`delete_failed`として記録し、合計3回までだけ再試行する
 - 削除完了前に同じデータを再表示しない
 - 完了後は`recording_tombstones`に`recording_id`、`household_id`、`deleted`状態、`deleted_at`だけを残す。元の`Recording`行と音声キー、文字起こし、メモ、単語、日記、画像を削除する
-- purge後に遅延着地し得る画像オブジェクトへの備えとして、日次スイープで`diary-images/`配下のうち作成から24時間以上経過しD1参照（`diary_images`行または画像ジョブ由来の決定的キー）が存在しないオブジェクトだけを有限件数削除する。実行中生成の未コミットオブジェクトを誤削除しないため、24時間未満のオブジェクトには触れない
+- purge後に遅延着地し得る画像オブジェクトへの備えとして、日次スイープで`diary-images/`配下のうち作成から24時間以上経過しD1参照（削除済みでない`diary_images`行または非終端の画像ジョブ）が存在しないオブジェクトだけを削除する。実行中生成の未コミットオブジェクトを誤削除しないため、24時間未満のオブジェクトには触れない。1回のスイープは1ページ（最大50件）だけを処理し、D1へ永続化したカーソルで翌日以降に後続ページへ進み、末尾到達で先頭へ戻る。参照確認は一括クエリ・削除は一括要求とし、Workersのsubrequest上限内に収める
 
 ### 絵日記一覧
 
@@ -1298,6 +1300,8 @@ POST /api/v1/diary/{diary_id}/regenerate
 - 日記文の手動再生成権は1録音1回とする。Workflow内の日次上限到達で終端したジョブは手動再生成権を消費しない（該当ジョブの`manual_retry`を解除して権利を返す）
 - 日記・画像Workflowのステップ再実行時は解析と同じ引き取り規則を適用し、ジョブが非終端であることを条件に前回running attemptを`STEP_REEXECUTED`で終端してから試行予算内でのみ再開する。running attemptを恒久的に非終端のまま残さない。ジョブを終端させる全経路（失敗収束・dispatch再調停を含む）で、同一ジョブのrunning attemptも同時に終端する
 - 非終端の日記・画像・画像cleanupジョブは、画面からの状態取得に加えて毎時の再調停でも収束を進め、`generating`表示の残存は最長1日以内に終端させる。日次の保持期限削除は従来どおり1日1回のまま変更しない
+- 日記・画像ジョブには作成から30分の絶対期限を設ける。期限超過をdispatch再調停が観測した場合、Workflowが活性でも延命せず終了させ、`GENERATION_DEADLINE_EXCEEDED`で終端する（Workflowは長時間実行が可能なため、期限なしの延命は恒久`generating`になり得る）。終端後の遅延書き込みはジョブ状態ガードにより着地しない
+- Workflowステップは提供者への送信直前にattemptへ送信済みマーカーを記録する。ステップ再実行時に引き取れるのは送信前のattemptだけとし、送信済みマーカー付きのattemptが残っている場合は再送せず`UPSTREAM_RESULT_UNKNOWN`で終端する（提供者受理済み要求の再送・二重課金の禁止）
 
 ### 絵日記画像
 

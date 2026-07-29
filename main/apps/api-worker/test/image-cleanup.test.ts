@@ -70,33 +70,69 @@ describe('inactive image cleanup', () => {
     const dayOld = new Date(Date.now() - 25 * 60 * 60 * 1000);
     const fresh = new Date(Date.now() - 60 * 60 * 1000);
     const referencedKey = `diary-images/image_${'a'.repeat(32)}.png`;
+    const activeJobKey = `diary-images/image_${'d'.repeat(32)}.png`;
     const orphanKey = `diary-images/image_${'b'.repeat(32)}.png`;
     const freshKey = `diary-images/image_${'c'.repeat(32)}.png`;
-    const deleted: string[] = [];
-    const referenceSql: string[] = [];
+    const deleted: unknown[] = [];
+    const sqlLog: string[] = [];
     const supplied = env(async () => undefined);
     supplied.DB = {
       prepare: (statement: string) => ({
-        bind: (...values: unknown[]) => ({
-          first: async () => {
-            referenceSql.push(statement);
-            return values[0] === referencedKey ? { present: 1 } : null;
+        bind: (..._values: unknown[]) => ({
+          first: async () => { sqlLog.push(statement); return null; },
+          run: async () => { sqlLog.push(statement); return { meta: { changes: 1 } }; },
+          all: async () => {
+            sqlLog.push(statement);
+            if (statement.includes('FROM diary_images')) return { results: [{ key: referencedKey }] };
+            if (statement.includes('FROM async_jobs')) return { results: [{ id: `job_${'d'.repeat(32)}` }] };
+            return { results: [] };
           },
         }),
       }),
     } as unknown as D1Database;
     supplied.PRIVATE_MEDIA = {
-      list: async () => ({ objects: [
+      list: async () => ({ truncated: false, objects: [
         { key: referencedKey, uploaded: dayOld },
+        { key: activeJobKey, uploaded: dayOld },
         { key: orphanKey, uploaded: dayOld },
         { key: freshKey, uploaded: fresh },
         { key: 'diary-images/unrelated.txt', uploaded: dayOld },
       ] }),
-      delete: async (key: string) => { deleted.push(key); },
+      delete: async (keys: unknown) => { deleted.push(keys); },
     } as unknown as R2Bucket;
     await sweepUnreferencedImageObjects(supplied);
-    expect(deleted).toEqual([orphanKey]);
-    expect(referenceSql.every((sql) => sql.includes('deleted_at IS NULL') && sql.includes("status IN ('dispatch_pending','dispatched','running')"))).toBe(true);
-    expect(referenceSql).toHaveLength(2);
+    expect(deleted).toEqual([[orphanKey]]);
+    expect(sqlLog.some((sql) => sql.includes('FROM diary_images') && sql.includes('deleted_at IS NULL'))).toBe(true);
+    expect(sqlLog.some((sql) => sql.includes('FROM async_jobs') && sql.includes("status IN ('dispatch_pending','dispatched','running')"))).toBe(true);
+  });
+
+  it('advances the sweep cursor across pages so later orphans are reachable', async () => {
+    const dayOld = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    const lastKey = `diary-images/image_${'e'.repeat(32)}.png`;
+    const cursorWrites: unknown[][] = [];
+    const listCalls: { startAfter?: string }[] = [];
+    const supplied = env(async () => undefined);
+    supplied.DB = {
+      prepare: (statement: string) => ({
+        bind: (...values: unknown[]) => ({
+          first: async () => statement.includes('FROM r2_sweep_cursors') ? { start_after: 'diary-images/image_previous.png' } : null,
+          run: async () => {
+            if (statement.includes('INSERT INTO r2_sweep_cursors')) cursorWrites.push(values);
+            return { meta: { changes: 1 } };
+          },
+          all: async () => ({ results: [] }),
+        }),
+      }),
+    } as unknown as D1Database;
+    supplied.PRIVATE_MEDIA = {
+      list: async (options: { startAfter?: string }) => {
+        listCalls.push(options);
+        return { truncated: true, objects: [{ key: lastKey, uploaded: dayOld }] };
+      },
+      delete: async () => undefined,
+    } as unknown as R2Bucket;
+    await sweepUnreferencedImageObjects(supplied);
+    expect(listCalls[0]?.startAfter).toBe('diary-images/image_previous.png');
+    expect(cursorWrites[0]?.[1]).toBe(lastKey);
   });
 });

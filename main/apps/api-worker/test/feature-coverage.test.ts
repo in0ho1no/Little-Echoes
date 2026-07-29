@@ -21,12 +21,16 @@ describe('Gherkinシナリオ対応', () => {
       );
     expect(scenarios.length).toBeGreaterThan(0);
     const testDirectory = join(root, 'test');
-    const testSources = readdirSync(testDirectory)
-      .filter((name) => name.endsWith('.ts'))
-      .map((name) => readFileSync(join(testDirectory, name), 'utf-8'))
-      .join('\n');
+    const titles = new Set<string>();
+    for (const name of readdirSync(testDirectory).filter((entry) => entry.endsWith('.ts'))) {
+      const source = readFileSync(join(testDirectory, name), 'utf-8');
+      // コメントや重複文字列では通過しないよう、it()の実テスト名だけを抽出して突合する。
+      const pattern = /\bit\('((?:[^'\\]|\\.)*)'/g;
+      let match;
+      while ((match = pattern.exec(source)) !== null) titles.add(match[1]);
+    }
     for (const title of scenarios) {
-      expect(testSources, `シナリオに対応するテストがありません: ${title}`).toContain(`'${title}'`);
+      expect(titles.has(title), `シナリオに対応するit()テストがありません: ${title}`).toBe(true);
     }
   });
 });

@@ -9,9 +9,19 @@ Feature: Phase 6 generation hardening
     Then 予約はブロックと誤判定されず生成が完了する
 
   Scenario: terminates a stale running attempt with STEP_REEXECUTED before starting a new one
-    Given 前回のステップ実行がrunningのattemptを残したままクラッシュした
+    Given 前回のステップ実行が送信前（stage未送信）のrunning attemptを残したままクラッシュした
     When 同じジョブのステップが再実行される
     Then 残存attemptはSTEP_REEXECUTEDで終端され恒久的な非終端行が残らない
+
+  Scenario: does not resend a provider call after a crash between send and commit
+    Given 前回のattemptが送信済みマーカー付きのままrunningで残っている
+    When 同じジョブのステップが再実行される
+    Then 提供者への再送は行わずUPSTREAM_RESULT_UNKNOWNで終端する（二重課金を防ぐ）
+
+  Scenario: converges a generation job that exceeds the absolute deadline
+    Given 生成ジョブが作成から30分の絶対期限を超えて非終端のままである
+    When dispatch再調停がそのジョブを観測する
+    Then 活性なWorkflowでも延命せず終了させGENERATION_DEADLINE_EXCEEDEDで終端する
 
   Scenario: converges the attempt and releases the manual retry when the daily limit aborts the reservation
     Given 手動再生成ジョブの予約が日次上限トリガーで中止された
@@ -52,3 +62,18 @@ Feature: Phase 6 generation hardening
     Given R2にD1参照のない24時間以上前の画像オブジェクトが残っている
     When 日次スイープが実行される
     Then 参照のないオブジェクトだけが削除され新しいオブジェクトと参照付きは残る
+
+  Scenario: advances the sweep cursor across pages so later orphans are reachable
+    Given R2一覧が1ページに収まらない
+    When スイープが1ページを処理し終える
+    Then カーソルをD1へ永続化し翌日以降のスイープが後続ページへ到達できる
+
+  Scenario: runs retention and sweep only on the daily cron
+    Given cronは日次と毎時の2本が登録されている
+    When 毎時トリガーが発火する
+    Then 保持期限削除とR2スイープは実行されず日次トリガーだけが実行する
+
+  Scenario: fails the scheduled invocation when a scheduled task rejects
+    Given いずれかの定期タスクが失敗する
+    When 全タスクの完了後に結果を集約する
+    Then scheduled invocationは失敗として記録され監視から見える

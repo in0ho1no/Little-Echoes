@@ -17,6 +17,7 @@ import type { Env } from '../src/types';
 function generationEnv(options: {
   reserveBlocked?: boolean;
   attemptCount?: number;
+  sentPriorAttempt?: boolean;
   dailyLimitAbort?: boolean;
   manualRetryJob?: boolean;
   commitBatchThrows?: boolean;
@@ -26,11 +27,13 @@ function generationEnv(options: {
   reconcileJob?: boolean;
   reconcileClaimed?: boolean;
   reconcileCount?: number;
+  reconcileCreatedAt?: string;
   workflowStatus?: string;
-} = {}): { env: Env; statements: string[]; deletedKeys: string[]; bound: { sql: string; values: unknown[] }[] } {
+} = {}): { env: Env; statements: string[]; deletedKeys: string[]; bound: { sql: string; values: unknown[] }[]; terminations: { count: number } } {
   const statements: string[] = [];
   const deletedKeys: string[] = [];
   const bound: { sql: string; values: unknown[] }[] = [];
+  const terminations = { count: 0 };
   let batches = 0;
   const statement = (sql: string): Record<string, unknown> => ({
     sql,
@@ -42,6 +45,9 @@ function generationEnv(options: {
           diary_id: 'diary_1', diary_text: 'りんごをたべた', scene: '公園', parent_note: null, reviewed_text: 'りんご', captured_at: '2026-07-29T00:00:00.000Z',
           expected_recording_version: 1, expected_diary_version: 1,
         };
+      }
+      if (sql.includes('SELECT id FROM processing_attempts') && sql.includes('AND stage = ?')) {
+        return options.sentPriorAttempt ? { id: 'attempt_prev' } : null;
       }
       if (sql.includes('COUNT(*) AS attempt_count')) return { attempt_count: options.attemptCount ?? 0 };
       if (sql.includes('FROM diary_images')) return { id: 'image_old', image_object_key: 'diary-images/image_old.png' };
@@ -55,7 +61,7 @@ function generationEnv(options: {
         return { results: (options.orphanJobs ?? []).map((id) => ({ id })) };
       }
       if (sql.includes("job_type IN ('diary','image')") && options.reconcileJob) {
-        return { results: [{ id: 'job_1', job_type: 'image', household_id: 'hh', recording_id: 'rec_1', dispatch_reconcile_count: options.reconcileCount ?? 0 }] };
+        return { results: [{ id: 'job_1', job_type: 'image', household_id: 'hh', recording_id: 'rec_1', dispatch_reconcile_count: options.reconcileCount ?? 0, created_at: options.reconcileCreatedAt ?? new Date().toISOString() }] };
       }
       return { results: [] };
     },
@@ -93,9 +99,12 @@ function generationEnv(options: {
   } as Env;
   env.IMAGE_WORKFLOW = {
     create: async () => { if (options.workflowStatus && options.workflowStatus !== 'running') throw new Error('already terminal'); },
-    get: async () => ({ status: async () => ({ status: options.workflowStatus ?? 'running' }) }),
+    get: async () => ({
+      status: async () => ({ status: options.workflowStatus ?? 'running' }),
+      terminate: async () => { terminations.count += 1; },
+    }),
   } as unknown as Workflow<{ async_job_id: string }>;
-  return { env, statements, deletedKeys, bound };
+  return { env, statements, deletedKeys, bound, terminations };
 }
 
 const oneStep = async (_name: string, _limit: number, operation: () => Promise<void>): Promise<void> => operation();
@@ -135,9 +144,21 @@ describe('Phase 6 diary prompts', () => {
   });
 
   it('terminates a stale running attempt with STEP_REEXECUTED before starting a new one', async () => {
-    const { env, statements } = generationEnv();
+    const { env, statements, bound } = generationEnv();
     await runDiaryGeneration(env, 'job_1', oneStep, { generateDiary: async () => ({ text: 'きょうはりんごをたべた。', requestId: 'req_diary' }), generateImage: async () => ({ png: new Uint8Array(), requestId: null }) });
-    expect(statements.some((sql) => sql.includes("SET status = 'failed', error_code = 'STEP_REEXECUTED'") && sql.includes("job_id = ? AND status = 'running'"))).toBe(true);
+    const takeover = bound.find((item) => item.sql.includes("SET status = 'failed', error_code = 'STEP_REEXECUTED'"));
+    expect(takeover?.sql).toContain("job_id = ? AND status = 'running' AND stage = ?");
+    expect(takeover?.values).toContain('diary_generation');
+    expect(statements.some((sql) => sql.includes('SET stage = ?'))).toBe(true);
+  });
+
+  it('does not resend a provider call after a crash between send and commit', async () => {
+    const { env, bound } = generationEnv({ reserveBlocked: true, sentPriorAttempt: true });
+    let called = false;
+    await runDiaryGeneration(env, 'job_1', oneStep, { generateDiary: async () => { called = true; return { text: 'unused', requestId: null }; }, generateImage: async () => ({ png: new Uint8Array(), requestId: null }) });
+    expect(called).toBe(false);
+    const jobFailure = bound.find((item) => item.sql.includes("UPDATE async_jobs SET status = 'failed'"));
+    expect(jobFailure?.values).toContain('UPSTREAM_RESULT_UNKNOWN');
   });
 
   it('converges the attempt and releases the manual retry when the daily limit aborts the reservation', async () => {
@@ -251,8 +272,22 @@ describe('Phase 6 diary prompts', () => {
   });
 
   it('terminates running attempts when dispatch reconciliation fails a job', async () => {
-    const { env, statements } = generationEnv({ reconcileJob: true, reconcileCount: 2, workflowStatus: 'errored' });
+    const { env, bound } = generationEnv({ reconcileJob: true, reconcileCount: 2, workflowStatus: 'errored' });
     await reconcileGenerationDispatch(env);
-    expect(statements.some((sql) => sql.includes('UPDATE processing_attempts') && sql.includes("error_code = 'WORKFLOW_DISPATCH_UNKNOWN'"))).toBe(true);
+    const termination = bound.find((item) => item.sql.includes('UPDATE processing_attempts') && item.sql.includes('error_code = ?'));
+    expect(termination?.values).toContain('WORKFLOW_DISPATCH_UNKNOWN');
+  });
+
+  it('converges a generation job that exceeds the absolute deadline', async () => {
+    const { env, bound, terminations } = generationEnv({
+      reconcileJob: true,
+      reconcileCount: 2,
+      reconcileCreatedAt: '2020-01-01T00:00:00.000Z',
+      workflowStatus: 'running',
+    });
+    await reconcileGenerationDispatch(env);
+    expect(terminations.count).toBe(1);
+    const jobFailure = bound.find((item) => item.sql.includes("UPDATE async_jobs SET status = 'failed'"));
+    expect(jobFailure?.values).toContain('GENERATION_DEADLINE_EXCEEDED');
   });
 });

@@ -265,6 +265,7 @@ describe('ルーターと録音API', () => {
   it('maps only optimistic lock aborts to a version conflict response', async () => {
     for (const [message, expected] of [
       ['NOT NULL constraint failed: recording_tombstones.recording_id', 409],
+      ['no such table: recording_tombstones', 500],
       ['D1 connection reset', 500],
     ] as const) {
       const supplied = env(
