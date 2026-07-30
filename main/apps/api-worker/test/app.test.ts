@@ -262,6 +262,44 @@ describe('ルーターと録音API', () => {
     expect(diaryCreates).toBe(1);
   });
 
+  it('binds the recording id to the recordings guard when reserving a generation job', async () => {
+    const diary = {
+      id: 'diary_11111111111111111111111111111111',
+      household_id: 'household_1',
+      recording_id: RECORDING_ID,
+      diary_text: null,
+      scene: null,
+      version: 1,
+      recording_version: 2,
+      diary_status: 'not_started',
+      image_status: 'not_requested',
+      captured_at: '2026-07-21T00:00:00.000Z',
+      last_generation_error: null,
+      active_image_id: null,
+      active_image_created_at: null,
+    };
+    const inserts: unknown[][] = [];
+    const supplied = env(
+      (sql) => (sql.includes('FROM diary_entries d JOIN recordings') ? diary : null),
+      undefined,
+      (sql) => (sql.includes("r.diary_status = 'not_started'") ? [{ id: diary.id, household_id: 'household_1' }] : []),
+      (statements) => {
+        statements.forEach((bound) => { if (bound.sql.includes('INSERT INTO async_jobs')) inserts.push(bound.values); });
+        return statements.map(() => ({ meta: { changes: 1 } }));
+      },
+    );
+    supplied.DIARY_WORKFLOW = {
+      create: async () => ({}),
+      get: async () => ({ status: async () => ({ status: 'running' }) }),
+    } as unknown as Workflow<{ async_job_id: string }>;
+    await ensureMissingInitialDiaryJobs(supplied);
+    const values = inserts[0] ?? [];
+    expect(values).toHaveLength(22);
+    expect(values[13]).toBe(RECORDING_ID);
+    expect(values[16]).toBe(diary.id);
+    expect(values.filter((value) => value === diary.id)).toHaveLength(2);
+  });
+
   it('maps only optimistic lock aborts to a version conflict response', async () => {
     for (const [message, expected] of [
       ['NOT NULL constraint failed: recording_tombstones.recording_id', 409],

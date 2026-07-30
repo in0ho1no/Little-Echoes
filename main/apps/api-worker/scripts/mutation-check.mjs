@@ -100,6 +100,13 @@ const MUTANTS = [
     tests: ['test/image-cleanup.test.ts'],
   },
   {
+    name: 'recordings-guard-bound-to-diary-id',
+    file: 'src/app.ts',
+    find: ', kind, diary.recording_id, diary.recording_id, householdId,',
+    replace: ', kind, diary.recording_id, diary.id, householdId,',
+    tests: ['test/app.test.ts'],
+  },
+  {
     name: 'strict-changes-comparison-reintroduced',
     file: 'src/workflow.ts',
     find: "(results[1]?.meta.changes ?? 0) >= 1 ? 'converged' : 'active'",

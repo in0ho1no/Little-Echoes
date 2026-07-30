@@ -1048,7 +1048,7 @@ async function reserveDiaryJob(env: Env, diary: DiaryRow, householdId: string, c
               AND EXISTS (SELECT 1 FROM diary_entries d WHERE d.id = ? AND d.recording_id = r.id AND d.version = ?)
               AND (CASE WHEN ? = 'diary' THEN r.diary_status IN ('not_started','failed','ready') ELSE r.image_status IN ('not_requested','failed','ready') END)
               AND (? IS NULL OR EXISTS (SELECT 1 FROM diary_images i WHERE i.id = ? AND i.diary_entry_id = ? AND i.is_active = 1 AND i.deleted_at IS NULL)))`,
-      ).bind(id, householdId, diary.recording_id, kind, correlationId, manualRetry ? 1 : 0, diary.recording_version, diary.version, now, now, diary.recording_id, kind, diary.recording_id, diary.id, householdId, diary.recording_version, diary.id, diary.version, kind, replaceImageId ?? null, replaceImageId ?? null, diary.id),
+      ).bind(id, householdId, diary.recording_id, kind, correlationId, manualRetry ? 1 : 0, diary.recording_version, diary.version, now, now, diary.recording_id, kind, diary.recording_id, diary.recording_id, householdId, diary.recording_version, diary.id, diary.version, kind, replaceImageId ?? null, replaceImageId ?? null, diary.id),
       env.DB.prepare(kind === 'diary'
         ? `UPDATE recordings SET diary_status = 'generating', updated_at = ? WHERE id = ? AND household_id = ? AND version = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'dispatch_pending')`
         : `UPDATE recordings SET image_status = 'generating', updated_at = ? WHERE id = ? AND household_id = ? AND version = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'dispatch_pending')`)

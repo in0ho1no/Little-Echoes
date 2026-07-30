@@ -35,6 +35,7 @@ These classes recurred across phases. Local tests and mocks cannot catch most of
 5. Error mapping: only the sentinel signature (`NOT NULL constraint failed: recording_tombstones`) maps to `409 VERSION_CONFLICT`; all other D1 failures are `500`.
 6. Scheduled handlers must aggregate and rethrow task failures; a swallowed `Promise.allSettled` hides outages from monitoring.
 7. Terminal convergence must also terminate the job's running `processing_attempts`; no code path may leave an attempt `running` forever.
+8. Bind-order drift in multi-placeholder SQL (found in production during Phase 6 gate 3: `r.id = ?` bound to a diary id, so the reservation INSERT silently matched zero rows). String mocks and `EXPLAIN` cannot catch it — verify placeholder-to-bind alignment positionally, and keep positional bind assertions for statements with many guards.
 
 ## Output
 

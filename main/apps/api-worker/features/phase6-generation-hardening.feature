@@ -18,6 +18,11 @@ Feature: Phase 6 generation hardening
     When featureカバレッジを検査する
     Then コメントは実テストに数えず同名テストが0件または複数なら失敗する
 
+  Scenario: binds the recording id to the recordings guard when reserving a generation job
+    Given 生成job予約INSERTはrecordings/diary_entriesの多数のガードプレースホルダを持つ
+    When バインド順が1つずれてrecordingsガードへdiary idが渡る
+    Then 位置検証テストが失敗する（実D1でのみ0行になる黙殺バグを防ぐ）
+
   Scenario: reserves an attempt when D1 reports trigger-inflated changes
     Given D1のmeta.changesはBEFORE INSERTトリガーの書き込み分だけ増える
     When 日記生成Workflowがattemptを予約する
