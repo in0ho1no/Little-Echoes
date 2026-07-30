@@ -131,7 +131,11 @@ for (const mutant of MUTANTS) {
     // Windowsの.cmdシム解決も不要になるよう、vitestのbinを現在のNodeで直接実行する。
     const vitestBin = join(root, 'node_modules', 'vitest', 'vitest.mjs');
     const run = spawnSync(process.execPath, [vitestBin, 'run', ...mutant.tests], { cwd: root, encoding: 'utf-8' });
-    if (run.status === 0) {
+    if (run.error || run.status === null) {
+      const reason = run.error?.message ?? `終了ステータスなし（signal: ${run.signal ?? 'unknown'}）`;
+      console.error(`[harness-error] ${mutant.name}: Vitestを正常に起動・完了できなかった: ${reason}`);
+      failures += 1;
+    } else if (run.status === 0) {
       console.error(`[survived] ${mutant.name}: 対象テストがミュータントを検出できなかった。`);
       failures += 1;
     } else {

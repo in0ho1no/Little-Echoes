@@ -5,7 +5,7 @@ import type { Env, VerifiedAccessIdentity } from './types';
 
 const jwksByIssuer = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
-function accessIssuer(teamDomain: string): string | null {
+export function accessIssuer(teamDomain: string): string | null {
   const hostname = teamDomain.toLowerCase();
   return /^[a-z0-9-]+\.cloudflareaccess\.com$/.test(hostname) ? `https://${hostname}` : null;
 }

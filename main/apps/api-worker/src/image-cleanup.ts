@@ -186,6 +186,10 @@ export async function sweepUnreferencedImageObjects(env: Env): Promise<void> {
 
 export class ImageCleanupWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> {
   async run(event: { payload: WorkflowParams }, step: { do: (name: string, options: unknown, operation: () => Promise<void>) => Promise<void> }): Promise<void> {
-    await runImageCleanup(this.env, event.payload.async_job_id, (name, retryLimit, operation) => step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, operation));
+    await runImageCleanup(this.env, event.payload.async_job_id, (name, retryLimit, operation) =>
+      step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, async () => {
+        await operation();
+      }),
+    );
   }
 }

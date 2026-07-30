@@ -450,7 +450,9 @@ export async function reconcileStaleAnalysisJob(env: Env, job: StaleJobRow, now 
 export class AnalysisWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> {
   async run(event: { payload: WorkflowParams }, step: { do: (name: string, options: unknown, operation: () => Promise<void>) => Promise<void> }): Promise<void> {
     await runOpenAiAnalysis(this.env, event.payload.async_job_id, (name, retryLimit, operation) =>
-      step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, operation),
+      step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, async () => {
+        await operation();
+      }),
     );
   }
 }

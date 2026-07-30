@@ -1,7 +1,7 @@
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { describe, expect, it } from 'vitest';
 
-import { verifyAccessJwtWithKeySet } from '../src/access-jwt';
+import { accessIssuer, verifyAccessJwtWithKeySet } from '../src/access-jwt';
 
 const ISSUER = 'https://team.cloudflareaccess.com';
 const AUDIENCE = 'application-audience';
@@ -24,6 +24,21 @@ async function fixture(): Promise<{ sign: (options?: { exp?: boolean | string; s
 }
 
 describe('Cloudflare Access JWT検証', () => {
+  it('Access team domainから完全一致するissuerだけを構築する', () => {
+    expect(accessIssuer('TEAM.cloudflareaccess.com')).toBe(ISSUER);
+    for (const invalid of [
+      '',
+      'https://team.cloudflareaccess.com',
+      'team.cloudflareaccess.com/',
+      'team.cloudflareaccess.com.evil.example',
+      'team_cloudflareaccess.com',
+      'team.example.com',
+      ' team.cloudflareaccess.com',
+    ]) {
+      expect(accessIssuer(invalid)).toBeNull();
+    }
+  });
+
   it('署名・iss・aud・exp・subが揃ったJWTだけを受理する', async () => {
     const { sign, jwks } = await fixture();
     await expect(verifyAccessJwtWithKeySet(await sign(), ISSUER, AUDIENCE, jwks)).resolves.toEqual({ accessSubject: 'access-subject' });

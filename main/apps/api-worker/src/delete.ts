@@ -541,7 +541,9 @@ export async function scheduleRetentionCleanup(env: Env): Promise<void> {
 export class DeleteWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> {
   async run(event: { payload: WorkflowParams }, step: { do: (name: string, options: unknown, operation: () => Promise<void>) => Promise<void> }): Promise<void> {
     await runDeleteWorkflow(this.env, event.payload.async_job_id, (name, operation) =>
-      step.do(name, { retries: { limit: 3, delay: '1 second', backoff: 'constant' } }, operation),
+      step.do(name, { retries: { limit: 3, delay: '1 second', backoff: 'constant' } }, async () => {
+        await operation();
+      }),
     );
   }
 }
