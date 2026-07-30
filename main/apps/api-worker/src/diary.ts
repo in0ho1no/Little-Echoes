@@ -436,12 +436,20 @@ export async function reconcileGenerationDispatch(env: Env, limit = 10, recordin
 
 export class DiaryWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> {
   async run(event: { payload: WorkflowParams }, step: { do: (name: string, options: unknown, operation: () => Promise<void>) => Promise<void> }): Promise<void> {
-    await runDiaryGeneration(this.env, event.payload.async_job_id, (name, retryLimit, operation) => step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, operation));
+    await runDiaryGeneration(this.env, event.payload.async_job_id, (name, retryLimit, operation) =>
+      step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, async () => {
+        await operation();
+      }),
+    );
   }
 }
 
 export class ImageWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> {
   async run(event: { payload: WorkflowParams }, step: { do: (name: string, options: unknown, operation: () => Promise<void>) => Promise<void> }): Promise<void> {
-    await runImageGeneration(this.env, event.payload.async_job_id, (name, retryLimit, operation) => step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, operation));
+    await runImageGeneration(this.env, event.payload.async_job_id, (name, retryLimit, operation) =>
+      step.do(name, { retries: { limit: retryLimit, delay: '1 second', backoff: 'constant' } }, async () => {
+        await operation();
+      }),
+    );
   }
 }
