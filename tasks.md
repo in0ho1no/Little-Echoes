@@ -28,7 +28,7 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 | 4 — PC参照クライアント | 完了 | 実装・独立レビュー修正・Sol修正・Fable5確認・実機E2E（Cloudflare Bot Fight Mode遮断の発見と修正含む）済み。書き込みは`DEMO_WRITE_ENABLED=false`で再封止。固定サンプル送信はPhase 5実API確認（2026-07-28）で本番実証済み |
 | 5 — OpenAI解析 | 完了 | 全レビュー・デプロイ・実API最小確認（転写モデルは実測に基づき`gpt-4o-transcribe`へ承認変更）・インジェクション耐性確認・再封止403実測まで完了（2026-07-28）。書き込みは`DEMO_WRITE_ENABLED=false`で再封止済み |
 | 6 — 日記・画像 | 完了（障害注入のみPhase 7へ延期） | 全レビュー・修正、0003〜0007適用、実OpenAI確認（日記3・画像2・cleanup2、使用量照合一致）、本番バインド順バグの発見修正（`73929c4`）、再封止と403ユーザー実測まで完了（2026-07-30） |
-| 7 — セキュリティ・公開強化 | 実施中（外部ゲート待ち） | ローカル実装・レビュー修正・回帰検査済み。CI Semgrep/gitleaks、実通しデモ、公開・Access判断は未完了 |
+| 7 — セキュリティ・公開強化 | 実施中（CIゲートのみ残） | ローカル実装・レビュー修正・回帰・Access設定確認・実通しデモ（障害注入・削除E2E・使用量照合込み）済み。残りはCI Semgrep/gitleaks成功と最終回帰の記録のみ。公開判断はPhase 7.5末尾へ移動 |
 | 7.5 — UI改善 | 未着手 | Phase 7完了後。生成上限・残り回数の表示（ユーザー要望 2026-07-30）を含む画面整備 |
 | 8 — Atom VoiceS3R | 任意 | PC・バックエンド・Webが安定後 |
 
@@ -268,10 +268,12 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 - [x] CI静的解析（semgrep等）の検出への対応方針を定める（2026-07-30）。構造での解消を原則とし、実害がなく構造化も不合理な検出だけを根拠コメント・専用テスト・Phaseレビュー付きで抑止する。製品ソースの`nosemgrep`を棚卸しし、HTTPS/hostname/userinfoをコンストラクタと送信直前に検証する`uploader.py`のdynamic urllib 1件だけを許可。許可一覧と理由を`main/docs/phase7-security-operations.md`へ記録し、Vitestで追加抑止を検知する。
 - [ ] ログ、エラー、Workflow状態、静的資産、Git履歴にトークン、APIキー、音声、文字起こし、親メモ、R2キーがないことを検査する。ローカルでは例外canary、`console`禁止、Workflow入力をインラインの`AsyncJob.id`だけに限定するASTガード、`step.do()`が戻り値を破棄する実装とASTガード、禁止ファイル名、秘密パターン、製品の`reference/`依存を検査済み。現行/履歴の名前だけを返すredacted検索で検出したのは3つのミラーhook用ダミー検知テストだけ。Docker/gitleaks/Semgrepがローカルにないため、`main`/`develop`へのpush・PRで発火する固定バージョンCIのSemgrepと`fetch-depth: 0`+`--redact`のgitleaks成功を最終外部ゲートとして残す。
 - [x] 日次/生涯/録音別上限、有限再試行、`DEMO_WRITE_ENABLED`、2026-09-01期限、削除例外、上流障害を結合テストする（2026-07-30）。Phase 2〜6の既存結合テストとミューテーションを再実行し、Vitest 176件、ミュータント15/15検出に成功。
-- [ ] 固定3音声、復旧手順、読み取り専用デモ、`reference/`なしの再現手順を準備し、実データを使わずに通しデモする。成人音声から決定的に作る明瞭な単語・短文・不明瞭発話を`main/samples/`へ追加し、元/生成物hash、厳密frame、派生条件、temp 2回再生成byte一致をpytestで固定。復旧・Access・トークン・読み取り専用デモの境界は`main/docs/phase7-security-operations.md`へ記載し、製品の`reference/`依存0件を確認。実OpenAI/Cloudflareの通しデモは費用・リモート書き込みを伴うためユーザー承認待ち。
+- [x] 固定3音声、復旧手順、読み取り専用デモ、`reference/`なしの再現手順を準備し、実データを使わずに通しデモする。成人音声から決定的に作る明瞭な単語・短文・不明瞭発話を`main/samples/`へ追加し、元/生成物hash、厳密frame、派生条件、temp 2回再生成byte一致をpytestで固定。復旧・Access・トークン・読み取り専用デモの境界は`main/docs/phase7-security-operations.md`へ記載し、製品の`reference/`依存0件を確認。
+- [x] 実通しデモを完了（2026-07-31 JST、ユーザー承認・実測込み。UTC日付は2026-07-30）。デプロイ3回（封止のままPhase 7コード`90640558`→解放`dce5922d`→再封止`0535cd27`）、封止403 `DEMO_WRITE_DISABLED`を解放前後の2回実測。固定3音声を実OpenAIで転写→抽出→全件`ready`→ブラウザで承認（不明瞭音声は手動文字起こし編集で回復）→日記自動生成3+手動再生成1→画像生成1件（short-sentence、置換ダイアログ・段階インジケーター確認済み）。障害注入（Phase 6から引き継ぎ、使い捨て録音使用）: `OPENAI_API_KEY`を一時無効化し、解析が`UPSTREAM_REJECTED`・固定文言のみ・`retryable:false`・情報漏えいなしで終端（試行1/3消費）、失敗録音の手動文字起こし承認→日記初回生成の失敗表示→「手動で保存」回復→実キー復元→「日記文を生成」で失敗から成功への回復と再生成使用済み表示を実測。注入手順の行き違いで実キーのまま使い捨て2件が成功する寄り道あり（+4呼び出し、照合に織込み済み）。削除例外+削除E2E: 封止中に使い捨て3件のDELETEが202受付され削除Workflowが完走（トゥームストーン3件`deleted`、recordings/attempts/async_jobs/予約明細の完全カスケード削除を実D1で確認）。実環境の録音削除Workflow完走はこれが初実証。使用量照合完全一致: `openai_non_image`=20（Phase 6の3+解析11+日記6）、`image_generation`=3（Phase 6の2+デモ1）、`recording_create`=6、録音別画像1/5、running残0。デモ用3録音は削除されず`approved`/`diary ready`で温存。検証SQLは読み取り専用でユーザーが実行。
 - [x] READMEまたはプライバシー文書へ、データ取り扱い、`store: false`の範囲、最大30日の監視保持可能性、実在児童データ不使用を記載する（2026-07-30）。READMEの開示を確認し、Phase 7運用文書と固定音声手順へのリンクを追加。
-- [ ] Cloudflare Accessを完全一致の個別承認アドレスだけに設定し、不要な一時許可を失効する。デバイストークンの配布・期限・失効手順を運用文書へ記載する。設定変更はユーザー承認後にだけ実施する。
-- [ ] 公開範囲、共有先、スクリーンショット、OSSライセンス判断を準備する。判断項目と安全条件はPhase 7運用文書へ整理済み。所有者の決定、公開、Secret投入はユーザーの明示指示後にだけ実施する。
+- [x] Cloudflare Accessを完全一致の個別承認アドレスだけに設定し、不要な一時許可を失効する。デバイストークンの配布・期限・失効手順を運用文書へ記載する。設定変更はユーザー承認後にだけ実施する。（2026-07-31完了、設定変更・実測はすべてユーザー実施）Allowポリシーは個人アドレス1件の完全一致のみで、不要になったハッカソン向け2件を削除。IDプロバイダー統合に「Cloudflare」が存在したためOne-time PINのみへ削減し、Accessログインページが「コードを送信」だけを表示することを実測。未承認アドレスへはPINが送信されないことも実測。アプリのCORS設定は全項目既定（許可なし）を確認し、運用文書のAccessチェックリストへCORS既定確認の項目を追記済み。デバイストークン手順は`main/docs/phase7-security-operations.md`に記載済み。外形確認: `app.in0ho1no.com`はAccessログインへ302、`ingest.in0ho1no.com`未定義GETは404（2026-07-31実測）。
+- [ ] 公開範囲、共有先、スクリーンショット、OSSライセンス判断を準備する。判断項目と安全条件はPhase 7運用文書へ整理済み。所有者の決定、公開、Secret投入はユーザーの明示指示後にだけ実施する。→ GUI要素で判断が揺らぎ得るため、実施はPhase 7.5末尾へ移動（ユーザー決定 2026-07-31）。
+- 残件の実施順序（ユーザー決定 2026-07-31）: Access設定確認 → 実通しデモ → （Phase 7.5）→ 公開判断（7.5末尾）→ CI Semgrep/gitleaks外部ゲート。CIゲートは残件対処後に最後へ回し、繰り返しの対処を避ける。
 - [ ] Terra実装・Solレビュー・Fable5レビュー・最終回帰テストを記録する。2026-07-30 Sol実装後、独立アーキテクチャレビューのMedium 3件（Workflow step出力、CSRF経路網羅、XSS実レスポンス）とPythonレビューのMedium 3件（切出し範囲、決定的再生成、source来歴拘束）を全件修正し、両再レビューで追加High/Mediumなし。Vitest 176件、`tsc --noEmit`、ミューテーション15/15、pytest 193件、ruff/format/mypy/pyright、`git diff --check`成功。CI Semgrep/gitleaks、実通しデモ後の最終回帰は未実施。
 - [x] Fable5レビューを実施し指摘を修正（2026-07-31、`eeda48c..16a0cf2`対象、独立アーキテクチャレビューエージェント併用）。High 0件、Medium 2件、Low 3件はいずれも検査不足またはガード不足として成立を確認。(M) `/dictionary/:id`の`display_name`（title/h1）と`utterance_text`を悪性SVG入り実レスポンス検査へ追加、(M) CIのpush/PR対象へ`main`を追加して`develop`と両方を固定、(L) Workflow params/step出力ガードをTypeScript AST検査へ変更し、全`step.do()`でoperationの解決値を破棄、(L) mutation harnessの`run.error`/`status === null`を`harness-error`として失敗扱い、(L) `accessIssuer`の受理/拒否と注入なしの本番JWT verifierフォールバックを負テスト。修正後はVitest 178件、`tsc --noEmit`、ミュータント15/15、`git diff --check`に成功。Python・SQLは変更していないためPython品質ゲートはFable5再現時の193件成功結果を維持し、今回は再実行していない。
 - [x] Sol修正（`977b85e`）をFable5が再レビューし承認（2026-07-31）。Medium 2件・Low 3件の修正がいずれも指摘へ正確に対応することを精読で確認: XSS実レスポンス検査へ`/dictionary/:id`（title/h1の`display_name`・発話履歴`utterance_text`）を追加、CIトリガーへ`main`を追加しトリガー形状もVitestで固定、Workflow境界ガードをTypeScript AST検査へ変更（src実在の`.create` 5件すべてインライン`async_job_id`リテラルであることを件数固定で強制し、反例ソースの自己検査付き。`step.do`は`await operation();`単文のasyncラッパーを構造強制し戻り値破棄を保証）、mutation harnessのspawn失敗（`run.error`/`status===null`）を`harness-error`として失敗扱い、`accessIssuer`の受理/拒否7ケースと注入なし本番フォールバックのfail-closed（D1到達ゼロで401）を負テスト。ゲート再現: Vitest 178件、`tsc --noEmit`、ミュータント15/15、pytest 193件、`git diff --check`すべて成功。追加High/Mediumなし。Info 3件（wrangler両ファイルに`ACCESS_JWT_VERIFY`が現れないことのガードテスト、`/diary/:id`の`data-active-image*`属性エスケープ、運用文書AccessチェックリストへのAccessアプリ側CORS既定確認）は未対応の任意改善として残る。
@@ -284,6 +286,7 @@ Phase 7完了後に実施する。現在の簡素な管理画面を、デモに�
 - [ ] 画面全体の体裁整備（一覧・詳細のレイアウト、状態表示の整理、スマートフォン表示の確認）。範囲はPhase 7完了時点でユーザーと確認して確定する。
 - [ ] 変更はUI・API応答の追加フィールドに限定し、状態機械・上限・課金経路には触れない。
 - [ ] Terra実装・Solレビュー・Fable5レビュー・再検証を記録する。
+- [ ] 公開範囲、共有先、スクリーンショット、OSSライセンス判断（Phase 7から移動。GUI確定後に判断する。所有者の決定、公開、Secret投入はユーザーの明示指示後にだけ実施する）。
 
 ## Phase 8 — Atom VoiceS3R（任意）
 

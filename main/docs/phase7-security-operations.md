@@ -47,6 +47,7 @@ uv run python main/samples/build_fixed_audio.py
 3. ワンタイムPINで対象アドレスだけがログインでき、未承認アドレスが拒否されることを確認する。
 4. 一時許可は利用終了時に前倒しで削除し、遅くとも2026-09-01 00:00 JSTまでに失効させる。
 5. Worker側でも`Cf-Access-Jwt-Assertion`の署名、issuer、audience、有効期限を検証し、Access設定だけに依存しない。
+6. AccessアプリケーションのCORS設定が既定（クロスオリジン許可なし）のままであることを確認する。Accessがpreflightへ応答してOriginを許可すると、Workerの拒否より手前で境界が緩む。
 
 ## デバイストークンのライフサイクル
 
