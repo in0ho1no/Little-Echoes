@@ -17,8 +17,10 @@ function listTypeScriptFiles(directory: string): string[] {
 }
 
 function extractScenarioTitles(source: string): string[] {
+  // checkout時のEOL変換（CRLF）に依存しないよう\r?\nで分割する。\rが残るとJSの`.`は
+  // \rに一致しないため、行末アンカー付きの抽出が全件不一致になる。
   return source
-    .split('\n')
+    .split(/\r?\n/)
     .map((line) => /^\s*Scenario: (.+)$/.exec(line)?.[1]?.trim())
     .filter((title): title is string => Boolean(title));
 }

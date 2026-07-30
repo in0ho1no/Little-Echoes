@@ -127,7 +127,10 @@ for (const mutant of MUTANTS) {
   }
   writeFileSync(path, original.replace(mutant.find, mutant.replace), 'utf-8');
   try {
-    const run = spawnSync('pnpm', ['vitest', 'run', ...mutant.tests], { cwd: root, shell: true, encoding: 'utf-8' });
+    // shell経由にしない — シェル解釈を挟むと環境変数・設定が伝播しsemgrep(CWE-78)の監査対象になる。
+    // Windowsの.cmdシム解決も不要になるよう、vitestのbinを現在のNodeで直接実行する。
+    const vitestBin = join(root, 'node_modules', 'vitest', 'vitest.mjs');
+    const run = spawnSync(process.execPath, [vitestBin, 'run', ...mutant.tests], { cwd: root, encoding: 'utf-8' });
     if (run.status === 0) {
       console.error(`[survived] ${mutant.name}: 対象テストがミュータントを検出できなかった。`);
       failures += 1;
