@@ -264,15 +264,15 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 
 ## Phase 7 — セキュリティ・公開強化
 
-- [ ] 認証・認可・ホスト分離・Access JWT・デバイストークン・IDOR・CSRF・CORS・XSS・入力上限・不正WAV/JSONを負のテストで検証する。
-- [ ] CI静的解析（semgrep等）の検出への対応方針を定める（2026-07-30の対応実績を踏まえる）。原則は構造での解消（例: 補間テンプレートへscriptタグを置かない、shell経由spawnの廃止）とし、実害がなく構造化も不合理な検出に限り根拠コメント付き`nosemgrep`を許可、抑止一覧は本Phaseのレビューで棚卸しする。
-- [ ] ログ、エラー、Workflow状態、静的資産、Git履歴にトークン、APIキー、音声、文字起こし、親メモ、R2キーがないことを検査する。
-- [ ] 日次/生涯/録音別上限、有限再試行、`DEMO_WRITE_ENABLED`、2026-09-01期限、削除例外、上流障害を結合テストする。
-- [ ] 固定3音声、復旧手順、読み取り専用デモ、`reference/`なしの再現手順を準備し、実データを使わずに通しデモする。
-- [ ] READMEまたはプライバシー文書へ、データ取り扱い、`store: false`の範囲、最大30日の監視保持可能性、実在児童データ不使用を記載する。
+- [x] 認証・認可・ホスト分離・Access JWT・デバイストークン・IDOR・CSRF・CORS・XSS・入力上限・不正WAV/JSONを負のテストで検証する（2026-07-30）。`features/phase7-security-hardening.feature`と`test/phase7-security.test.ts`を追加。全管理mutationのpreflight拒否、simple POST 4経路×3 media type拒否、資格情報のホスト交差利用拒否、悪性SVGを辞典・録音・日記へ投入した実HTMLエスケープ、例外redaction、Workflow payload/step出力の非機微型を固定。Access JWTへ期限切れ・別RS256鍵、デバイストークンへ失効・期限・世帯/source束縛の負テストを追加。既存のIDOR、不正WAV/JSON、本文/文字列/配列上限テストと合わせVitest 176件成功。
+- [x] CI静的解析（semgrep等）の検出への対応方針を定める（2026-07-30）。構造での解消を原則とし、実害がなく構造化も不合理な検出だけを根拠コメント・専用テスト・Phaseレビュー付きで抑止する。製品ソースの`nosemgrep`を棚卸しし、HTTPS/hostname/userinfoをコンストラクタと送信直前に検証する`uploader.py`のdynamic urllib 1件だけを許可。許可一覧と理由を`main/docs/phase7-security-operations.md`へ記録し、Vitestで追加抑止を検知する。
+- [ ] ログ、エラー、Workflow状態、静的資産、Git履歴にトークン、APIキー、音声、文字起こし、親メモ、R2キーがないことを検査する。ローカルでは例外canary、`console`禁止、Workflow入力を`AsyncJob.id`だけ・step出力を`Promise<void>`だけにするガード、禁止ファイル名、秘密パターン、製品の`reference/`依存を検査済み。現行/履歴の名前だけを返すredacted検索で検出したのは3つのミラーhook用ダミー検知テストだけ。Docker/gitleaks/Semgrepがローカルにないため、固定バージョンCIのSemgrepと`fetch-depth: 0`+`--redact`のgitleaks成功を最終外部ゲートとして残す。
+- [x] 日次/生涯/録音別上限、有限再試行、`DEMO_WRITE_ENABLED`、2026-09-01期限、削除例外、上流障害を結合テストする（2026-07-30）。Phase 2〜6の既存結合テストとミューテーションを再実行し、Vitest 176件、ミュータント15/15検出に成功。
+- [ ] 固定3音声、復旧手順、読み取り専用デモ、`reference/`なしの再現手順を準備し、実データを使わずに通しデモする。成人音声から決定的に作る明瞭な単語・短文・不明瞭発話を`main/samples/`へ追加し、元/生成物hash、厳密frame、派生条件、temp 2回再生成byte一致をpytestで固定。復旧・Access・トークン・読み取り専用デモの境界は`main/docs/phase7-security-operations.md`へ記載し、製品の`reference/`依存0件を確認。実OpenAI/Cloudflareの通しデモは費用・リモート書き込みを伴うためユーザー承認待ち。
+- [x] READMEまたはプライバシー文書へ、データ取り扱い、`store: false`の範囲、最大30日の監視保持可能性、実在児童データ不使用を記載する（2026-07-30）。READMEの開示を確認し、Phase 7運用文書と固定音声手順へのリンクを追加。
 - [ ] Cloudflare Accessを完全一致の個別承認アドレスだけに設定し、不要な一時許可を失効する。デバイストークンの配布・期限・失効手順を運用文書へ記載する。設定変更はユーザー承認後にだけ実施する。
-- [ ] 公開範囲、共有先、スクリーンショット、OSSライセンス判断を準備する。公開・Secret投入はユーザーの明示指示後にだけ実施する。
-- [ ] Terra実装・Solレビュー・Fable5レビュー・最終回帰テストを記録する。
+- [ ] 公開範囲、共有先、スクリーンショット、OSSライセンス判断を準備する。判断項目と安全条件はPhase 7運用文書へ整理済み。所有者の決定、公開、Secret投入はユーザーの明示指示後にだけ実施する。
+- [ ] Terra実装・Solレビュー・Fable5レビュー・最終回帰テストを記録する。2026-07-30 Sol実装後、独立アーキテクチャレビューのMedium 3件（Workflow step出力、CSRF経路網羅、XSS実レスポンス）とPythonレビューのMedium 3件（切出し範囲、決定的再生成、source来歴拘束）を全件修正し、両再レビューで追加High/Mediumなし。Vitest 176件、`tsc --noEmit`、ミューテーション15/15、pytest 193件、ruff/format/mypy/pyright、`git diff --check`成功。Fable5レビュー、CI Semgrep/gitleaks、実通しデモ後の最終回帰は未実施。
 
 ## Phase 7.5 — UI改善
 

@@ -40,4 +40,7 @@ deletion handling.
 
 See [SPEC.md](SPEC.md) for the current requirements, security controls, and
 acceptance criteria. See [tasks.md](tasks.md) for development phases, validation,
-and review status.
+and review status. The [Phase 7 security and operations runbook](main/docs/phase7-security-operations.md)
+separates local checks from approval-gated Access, Secret, deployment, and
+publication actions. The reproducible adult-voice fixtures are described in
+[the fixed-sample script](main/docs/fixed-sample-script.md).

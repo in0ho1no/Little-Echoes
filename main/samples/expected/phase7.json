@@ -1,0 +1,32 @@
+{
+  "source": "main/apps/pc-client/src/assets/sample.wav",
+  "source_sha256": "bb7f4b644518a62e1a30750e62e121f6dc24ea3779a7c9c972b0eb606d3b3599",
+  "contains_real_child_data": false,
+  "samples": [
+    {
+      "file": "audio/clear-word.wav",
+      "sha256": "352804b0f7f71d30ec5f6de547aef82e6c1252d737073e1d9ae50f046e60b2a3",
+      "frames": 96000,
+      "scenario": "明瞭な単語",
+      "source_range_seconds": [2.5, 6.5],
+      "expected_candidates": ["ワンワン"]
+    },
+    {
+      "file": "audio/short-sentence.wav",
+      "sha256": "b0887ccc609e989e966bb31ac77c6676bf7f559bbf3a3ba18dbc2f8db3955be9",
+      "frames": 132000,
+      "scenario": "短文",
+      "source_range_seconds": [8.0, 13.5],
+      "expected_candidates": ["ブーブー", "バイバイ"]
+    },
+    {
+      "file": "audio/unclear-utterance.wav",
+      "sha256": "8942351c2eaaaf7a59a67a3955a876a9c66766b0f5fe707df864bd8d979004a2",
+      "frames": 96000,
+      "scenario": "不明瞭な発話",
+      "derived_from": "audio/clear-word.wav",
+      "transformation": "seed=7202607; one-pole smoothing; 1/5 amplitude; uniform noise [-1600,1600]",
+      "expected_behavior": "空または不完全な結果でも元音声と手動編集画面へ到達できる"
+    }
+  ]
+}

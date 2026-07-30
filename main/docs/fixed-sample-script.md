@@ -7,7 +7,8 @@
 
 - 長さ: **12〜15秒**（サーバー検証上限は20秒）
 - 形式: WAV / 24 kHz / 16-bit / mono / 1,100,000 bytes以下
-- 配置先: `main/apps/pc-client/src/assets/sample.wav`
+- 元音声: `main/apps/pc-client/src/assets/sample.wav`
+- Phase 7固定3音声: `main/samples/audio/`
 - 形式が合わない場合は変換が必要（収録後に依頼があれば変換手順を案内する）
 
 ## 台本（メイン・約13秒）
@@ -44,3 +45,14 @@
 - 冒頭・末尾に1秒程度の無音を入れると聞き取りが安定する
 - 「テスト」「録音開始」などのメタ発話は入れない
 - 個人名・住所・実在の子どもに関する情報を発話しない
+
+## Phase 7固定3音声の再生成
+
+元音声から、明瞭な単語、短文、不明瞭な発話の3件を決定的に生成する。
+`reference/`や外部サービスは使用しない。
+
+```powershell
+uv run python main/samples/build_fixed_audio.py
+```
+
+期待する場面と候補は`main/samples/expected/phase7.json`を参照する。不明瞭な発話は成人音声を低音量・平滑化・加雑音した安全な派生データで、特定の文字起こし結果ではなく手動復旧経路を確認する。

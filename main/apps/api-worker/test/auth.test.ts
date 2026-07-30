@@ -26,6 +26,28 @@ describe('デバイストークン認証', () => {
     expect(constantTimeEqualHex(tokenHmac, '0'.repeat(64))).toBe(false);
   });
 
+  it('失効・期限・世帯とsourceの束縛をD1検索条件で強制する', async () => {
+    const sql: string[] = [];
+    const db = {
+      prepare: (statement: string) => {
+        sql.push(statement);
+        return {
+          bind: (..._values: unknown[]) => ({
+            first: async () => null,
+            run: async () => ({ meta: { changes: 0 } }),
+          }),
+        };
+      },
+    } as unknown as D1Database;
+    await authenticateDevice(
+      new Request('https://ingest.example/api', { headers: { Authorization: `Bearer ${'c'.repeat(43)}` } }),
+      { DB: db, DEVICE_TOKEN_HMAC_SECRET: 'x'.repeat(64) } as Env,
+    );
+    expect(sql[0]).toContain('dt.revoked_at IS NULL');
+    expect(sql[0]).toContain('dt.expires_at > ?');
+    expect(sql[0]).toContain('s.household_id = dt.household_id AND s.id = dt.source_id');
+  });
+
   it('期限切れ・不正形式のトークンを拒否する', async () => {
     const env = { DB: database(null), DEVICE_TOKEN_HMAC_SECRET: 'x'.repeat(64) } as Env;
     await expect(authenticateDevice(new Request('https://ingest.example/api', { headers: { Authorization: 'Bearer short' } }), env)).resolves.toBeNull();

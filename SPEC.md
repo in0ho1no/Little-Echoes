@@ -1572,7 +1572,7 @@ little-echoes/
 │  └─ docs/
 │     ├─ architecture.md
 │     ├─ demo-script.md
-│     └─ submission-notes.md
+│     └─ phase7-security-operations.md
 ├─ SPEC.md
 ├─ README.md
 ├─ LICENSE
