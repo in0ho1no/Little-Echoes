@@ -1,0 +1,10 @@
+[tools]
+# Node と pnpm はプロジェクトで再現可能な完全バージョンに固定する。
+node = "24.18.0"
+pnpm = "10.34.5"
+
+[env]
+# パッケージ取得物は、ホストのユーザープロファイルではなく Workspace 内に置く。
+PNPM_STORE_DIR = "{{config_root}}/.tools/pnpm-store"
+NPM_CONFIG_CACHE = "{{config_root}}/.tools/npm-cache"
+COREPACK_HOME = "{{config_root}}/.tools/corepack"

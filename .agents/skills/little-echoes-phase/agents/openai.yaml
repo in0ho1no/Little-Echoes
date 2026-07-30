@@ -1,0 +1,4 @@
+interface:
+  display_name: "Little Echoes Phase Runner"
+  short_description: "Run and review Little Echoes project phases safely."
+  default_prompt: "Use $little-echoes-phase to execute Phase 1 of Little Echoes."

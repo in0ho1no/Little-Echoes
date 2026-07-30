@@ -1,0 +1,56 @@
+name = "little-echoes-api"
+main = "src/index.ts"
+compatibility_date = "2026-07-21"
+workers_dev = false
+
+# 実ID・ホスト名・Secretはこのテンプレートへ書き込まない。
+
+[[d1_databases]]
+binding = "DB"
+database_name = "little-echoes-demo"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "PRIVATE_MEDIA"
+bucket_name = "little-echoes-demo-media"
+
+[[workflows]]
+binding = "ANALYSIS_WORKFLOW"
+name = "little-echoes-analysis"
+class_name = "AnalysisWorkflow"
+
+[[workflows]]
+binding = "DELETE_WORKFLOW"
+name = "little-echoes-delete"
+class_name = "DeleteWorkflow"
+
+[[workflows]]
+binding = "DIARY_WORKFLOW"
+name = "little-echoes-diary"
+class_name = "DiaryWorkflow"
+
+[[workflows]]
+binding = "IMAGE_WORKFLOW"
+name = "little-echoes-image"
+class_name = "ImageWorkflow"
+
+[[workflows]]
+binding = "IMAGE_CLEANUP_WORKFLOW"
+name = "little-echoes-image-cleanup"
+class_name = "ImageCleanupWorkflow"
+
+[triggers]
+# 日次(17 3): 保持期限削除・R2孤児スイープを含む全量。毎時(47): 日記・画像・cleanupの
+# 再調停のみ（stuck jobの収束を最長1日以内へ短縮）。日次cron文字列はsrc/index.tsの
+# DAILY_FULL_CRONと一致させること。
+crons = ["17 3 * * *", "47 * * * *"]
+
+[vars]
+DEMO_WRITE_ENABLED = "false"
+ACCESS_TEAM_DOMAIN = "REPLACE_WITH_ACCESS_TEAM_DOMAIN"
+ACCESS_AUD = "REPLACE_WITH_ACCESS_AUD"
+ADMIN_HOST = "REPLACE_WITH_ADMIN_HOST"
+INGEST_HOST = "REPLACE_WITH_INGEST_HOST"
+
+# DEVICE_TOKEN_HMAC_SECRET と OPENAI_API_KEY は vars に書かず、デプロイ時にSecretとして設定する。
