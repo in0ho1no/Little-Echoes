@@ -15,16 +15,28 @@ interface BoundStatement {
 }
 
 function deleteEnv(
-  options: { alwaysFailR2Delete?: boolean; failFirstR2Delete?: boolean; tombstoneAfterCommitError?: boolean; reconcilingCount?: number } = {},
+  options: {
+    alwaysFailR2Delete?: boolean;
+    failFirstR2Delete?: boolean;
+    imageJobHasAttempt?: boolean;
+    imageJobLastError?: string;
+    imageWorkflowStatus?: 'running' | 'terminated' | 'unknown';
+    imageWorkflowTerminateFails?: boolean;
+    reconcilingCount?: number;
+    tombstoneAfterCommitError?: boolean;
+  } = {},
 ): {
   env: Env;
   statements: BoundStatement[];
   r2Deletes: string[][];
+  workflowEvents: string[];
 } {
   const statements: BoundStatement[] = [];
   const r2Deletes: string[][] = [];
+  const workflowEvents: string[] = [];
   let r2Calls = 0;
   let finalDeleteBatch = false;
+  let imageWorkflowStatus = options.imageWorkflowStatus ?? 'unknown';
   const database = {
     prepare: (sql: string) => ({
       bind: (...values: unknown[]) => {
@@ -44,7 +56,15 @@ function deleteEnv(
               ? [{ dictionary_word_id: 'word_1' }]
               : sql.includes('SELECT image_object_key')
                 ? [{ image_object_key: 'recordings/rec_1/image.webp' }]
-                : sql.includes("r.review_status = 'deleting'")
+                : sql.includes("j.job_type = 'image'")
+                  ? options.imageJobHasAttempt === undefined
+                    ? []
+                    : [{
+                        id: 'job_image_late',
+                        has_attempt: options.imageJobHasAttempt ? 1 : 0,
+                        last_error_code: options.imageJobLastError ?? 'DELETE_REQUESTED',
+                      }]
+                  : sql.includes("r.review_status = 'deleting'")
                   ? Array.from({ length: options.reconcilingCount ?? 0 }, (_, index) => ({
                       id: `rec_reconcile_${index}`,
                       household_id: 'household_1',
@@ -75,11 +95,22 @@ function deleteEnv(
     PRIVATE_MEDIA: {
       delete: async (keys: string | string[]) => {
         r2Calls += 1;
+        workflowEvents.push('r2-delete');
         r2Deletes.push(Array.isArray(keys) ? keys : [keys]);
         if (options.alwaysFailR2Delete || (options.failFirstR2Delete && r2Calls === 1)) throw new Error('temporary R2 failure');
       },
     } as unknown as R2Bucket,
     ANALYSIS_WORKFLOW: {} as Workflow<{ async_job_id: string }>,
+    IMAGE_WORKFLOW: {
+      get: async () => ({
+        status: async () => ({ status: imageWorkflowStatus }),
+        terminate: async () => {
+          workflowEvents.push('workflow-terminate');
+          if (options.imageWorkflowTerminateFails) throw new Error('termination failed');
+          imageWorkflowStatus = 'terminated';
+        },
+      }),
+    } as unknown as Workflow<{ async_job_id: string }>,
     DELETE_WORKFLOW: {
       create: async () => ({}),
       get: async () => ({ status: async () => ({ status: 'running' }) }),
@@ -91,7 +122,7 @@ function deleteEnv(
     ADMIN_HOST: 'app.example.test',
     INGEST_HOST: 'ingest.example.test',
   } as Env;
-  return { env, statements, r2Deletes };
+  return { env, statements, r2Deletes, workflowEvents };
 }
 
 function dispatchEnv(
@@ -237,6 +268,45 @@ describe('削除Workflow', () => {
     });
     expect(calls).toBe(1);
     expect(r2Deletes).toEqual([['recordings/rec_1/audio.wav', 'recordings/rec_1/image.webp']]);
+  });
+
+  it('画像Workflowを終端させてからjob由来の決定的keyもR2削除する', async () => {
+    const { env, r2Deletes, workflowEvents } = deleteEnv({ imageJobHasAttempt: true, imageWorkflowStatus: 'running' });
+    await runDeleteWorkflow(env, 'job_delete', async (_name, operation) => operation());
+    expect(workflowEvents).toEqual(['workflow-terminate', 'r2-delete']);
+    expect(r2Deletes).toEqual([
+      ['recordings/rec_1/audio.wav', 'recordings/rec_1/image.webp', 'diary-images/image_image_late.png'],
+    ]);
+  });
+
+  it('画像Workflowの終端を確認できない場合はR2削除とD1 purgeへ進まない', async () => {
+    const { env, r2Deletes, statements, workflowEvents } = deleteEnv({
+      imageJobHasAttempt: true,
+      imageWorkflowStatus: 'running',
+      imageWorkflowTerminateFails: true,
+    });
+    await runDeleteWorkflow(env, 'job_delete', async (_name, operation) => operation());
+    expect(workflowEvents).toEqual(['workflow-terminate']);
+    expect(r2Deletes).toEqual([]);
+    expect(statements.some((statement) => statement.sql.includes("last_error_code = 'DELETE_FAILED'"))).toBe(true);
+  });
+
+  it('attempt未予約の画像jobはprovider未開始として決定的keyだけを削除対象へ加える', async () => {
+    const { env, r2Deletes, workflowEvents } = deleteEnv({ imageJobHasAttempt: false });
+    await runDeleteWorkflow(env, 'job_delete', async (_name, operation) => operation());
+    expect(workflowEvents).toEqual(['r2-delete']);
+    expect(r2Deletes[0]).toContain('diary-images/image_image_late.png');
+  });
+
+  it('過去に終端した画像jobはWorkflow retention切れでも決定的keyだけを削除対象へ加える', async () => {
+    const { env, r2Deletes, workflowEvents } = deleteEnv({
+      imageJobHasAttempt: true,
+      imageJobLastError: 'OPENAI_NON_RETRYABLE',
+      imageWorkflowStatus: 'unknown',
+    });
+    await runDeleteWorkflow(env, 'job_delete', async (_name, operation) => operation());
+    expect(workflowEvents).toEqual(['r2-delete']);
+    expect(r2Deletes[0]).toContain('diary-images/image_image_late.png');
   });
 
   it('削除本体の3回目の失敗で停止し、4回目を呼ばない', async () => {

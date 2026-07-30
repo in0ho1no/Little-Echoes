@@ -24,6 +24,19 @@ Prioritize these risks:
 
 Do not substitute a historical decision record for a normative requirement. If they conflict, report the conflict and request a `SPEC.md` resolution.
 
+## Known recurring bug classes (check on every review)
+
+These classes recurred across phases. Local tests and mocks cannot catch most of them, so check them explicitly:
+
+1. D1 `meta.changes` includes rows written by triggers (proven in production, fix `44f7ad7`; recurred in Phase 6). Strict `=== 1` / `!== 1` comparisons are forbidden — only `>= 1` (written) or `=== 0` (not written) are valid. A static guard test (`test/d1-changes-guard.test.ts`) enforces this; flag any bypass.
+2. Provider-call idempotency: any Workflow step re-execution path must never resend an external request that may already have been accepted (sent-marker before the call; unresolved sent attempts converge to `UPSTREAM_RESULT_UNKNOWN`, never resend).
+3. Absolute deadlines: every async job type needs a bounded wall-clock deadline enforced on first observation. Liveness observations that reset counters or `updated_at` must never extend a job's life indefinitely.
+4. Paginated external listings: R2 `list()` requires `truncated`/cursor handling with a persisted scan position; per-item loops must respect the Workers subrequest limit (batch queries, bulk deletes).
+5. Error mapping: only the sentinel signature (`NOT NULL constraint failed: recording_tombstones`) maps to `409 VERSION_CONFLICT`; all other D1 failures are `500`.
+6. Scheduled handlers must aggregate and rethrow task failures; a swallowed `Promise.allSettled` hides outages from monitoring.
+7. Terminal convergence must also terminate the job's running `processing_attempts`; no code path may leave an attempt `running` forever.
+8. Bind-order drift in multi-placeholder SQL (found in production during Phase 6 gate 3: `r.id = ?` bound to a diary id, so the reservation INSERT silently matched zero rows). String mocks and `EXPLAIN` cannot catch it — verify placeholder-to-bind alignment positionally, and keep positional bind assertions for statements with many guards.
+
 ## Output
 
 ```md

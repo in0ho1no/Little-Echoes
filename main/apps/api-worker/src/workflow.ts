@@ -245,7 +245,7 @@ async function completeAnalysis(
   );
   const result = await env.DB.batch(statements);
   const recordingResult = result.at(-2);
-  if ((recordingResult?.meta.changes ?? 0) !== 1) await markCommitUnknown(env, job, attempt);
+  if ((recordingResult?.meta.changes ?? 0) === 0) await markCommitUnknown(env, job, attempt);
 }
 
 async function loadJob(env: Env, jobId: string): Promise<JobRow | null> {
@@ -441,7 +441,7 @@ export async function reconcileStaleAnalysisJob(env: Env, job: StaleJobRow, now 
             )`,
       ).bind(at, job.recording_id, job.household_id, job.id),
     ]);
-    return (results[1]?.meta.changes ?? 0) === 1 ? 'converged' : 'active';
+    return (results[1]?.meta.changes ?? 0) >= 1 ? 'converged' : 'active';
   } catch {
     return 'unknown';
   }

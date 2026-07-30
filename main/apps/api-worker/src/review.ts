@@ -57,8 +57,10 @@ function versionConflictSentinel(db: D1Database): D1PreparedStatement {
     .bind();
 }
 
-function isVersionConflictAbort(error: unknown): boolean {
-  return error instanceof Error && error.message.includes('recording_tombstones');
+// テーブル名だけの一致では `no such table: recording_tombstones` 等の環境障害まで409に
+// なるため、番兵が起こすNOT NULL違反の署名全体で判定する。
+export function isVersionConflictAbort(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('NOT NULL constraint failed: recording_tombstones');
 }
 
 function candidateStatements(db: D1Database, target: ReviewTarget, input: ReviewInput, nextVersion: number): D1PreparedStatement[] {

@@ -6,6 +6,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "mutation-check": "node scripts/mutation-check.mjs",
     "typecheck": "pnpm run types && tsc --noEmit",
     "types": "wrangler types --config wrangler.template.toml --env-interface CloudflareBindings"
   },

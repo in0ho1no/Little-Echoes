@@ -329,11 +329,23 @@
         "responses": {
           "200": {
             "$ref": "#/components/responses/DiaryList"
-          }
+          },
+          "401": {"$ref": "#/components/responses/Error"},
+          "422": {"$ref": "#/components/responses/Error"}
         }
       }
     },
     "/api/v1/diary/{diary_id}": {
+      "get": {
+        "operationId": "getDiary",
+        "security": [{"accessJwt": []}],
+        "parameters": [{"$ref": "#/components/parameters/DiaryId"}],
+        "responses": {
+          "200": {"$ref": "#/components/responses/Diary"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"}
+        }
+      },
       "patch": {
         "operationId": "editDiary",
         "security": [
@@ -360,9 +372,13 @@
           "200": {
             "$ref": "#/components/responses/Diary"
           },
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
           "409": {
             "$ref": "#/components/responses/Error"
-          }
+          },
+          "422": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
         }
       }
     },
@@ -393,9 +409,15 @@
           "202": {
             "$ref": "#/components/responses/AcceptedJob"
           },
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
           "409": {
             "$ref": "#/components/responses/Error"
-          }
+          },
+          "422": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
         }
       }
     },
@@ -415,6 +437,9 @@
         "responses": {
           "200": {
             "description": "Authorized private image"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
           },
           "404": {
             "$ref": "#/components/responses/Error"
@@ -447,9 +472,15 @@
           "202": {
             "$ref": "#/components/responses/AcceptedJob"
           },
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
           "409": {
-            "$ref": "#/components/responses/Error"
-          }
+            "$ref": "#/components/responses/ImageReplacementError"
+          },
+          "422": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
         }
       },
       "delete": {
@@ -477,7 +508,12 @@
         "responses": {
           "202": {
             "$ref": "#/components/responses/AcceptedJob"
-          }
+          },
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "422": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
         }
       }
     },
@@ -595,6 +631,16 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ImageReplacementError": {
+        "description": "Replacement confirmation required with the current image context",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ImagePostConflict"
             }
           }
         }
@@ -776,8 +822,8 @@
       "ImageRequest": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["version"],
-        "properties": {"version": {"type": "integer", "minimum": 1}, "replace_image_id": {"type": "string", "pattern": "^image_[A-Za-z0-9_-]+$"}}
+        "required": ["version", "confirmed"],
+        "properties": {"version": {"type": "integer", "minimum": 1}, "confirmed": {"type": "boolean", "enum": [true]}, "replace_image_id": {"type": "string", "pattern": "^image_[A-Za-z0-9_-]+$"}}
       },
       "Error": {
         "type": "object",
@@ -843,7 +889,13 @@
               "AUDIO_NOT_AVAILABLE",
               "INVALID_AUDIO",
               "INTERNAL_ERROR",
-              "IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED"
+               "INVALID_DIARY_INPUT",
+               "INVALID_IMAGE_INPUT",
+               "DIARY_NOT_READY",
+               "DIARY_GENERATION_NOT_AVAILABLE",
+               "IMAGE_GENERATION_NOT_AVAILABLE",
+               "DIARY_STATE_CHANGED",
+               "IMAGE_STATE_CHANGED"
             ]
           },
           "message": {
@@ -862,6 +914,26 @@
             "maxLength": 300
           }
         }
+      },
+      "ImageReplacementError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message", "retryable", "correlation_id", "next_action", "current_image_id", "current_image_created_at"],
+        "properties": {
+          "code": {"enum": ["IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED"]},
+          "message": {"type": "string", "maxLength": 300},
+          "retryable": {"type": "boolean"},
+          "correlation_id": {"type": "string", "pattern": "^corr_[A-Za-z0-9_-]+$"},
+          "next_action": {"type": "string", "maxLength": 300},
+          "current_image_id": {"type": "string", "pattern": "^image_[A-Za-z0-9_-]+$"},
+          "current_image_created_at": {"type": "string", "format": "date-time"}
+        }
+      },
+      "ImagePostConflict": {
+        "oneOf": [
+          {"$ref": "#/components/schemas/Error"},
+          {"$ref": "#/components/schemas/ImageReplacementError"}
+        ]
       },
       "AcceptedJob": {
         "type": "object",
@@ -1118,8 +1190,9 @@
         "required": [
           "diary_id",
           "recording_id",
-          "status",
-          "captured_at",
+           "status",
+          "image_status",
+           "captured_at",
           "new_words",
           "audio_endpoint",
           "version",
@@ -1143,7 +1216,7 @@
             ]
           },
           "captured_at": {"type": "string", "format": "date-time"},
-          "new_words": {"type": "array", "maxItems": 30, "items": {"$ref": "#/components/schemas/WordOccurrence"}},
+          "new_words": {"type": "array", "maxItems": 30, "items": {"type": "string", "minLength": 1, "maxLength": 100}},
           "audio_endpoint": {"type": "string", "pattern": "^/api/v1/recordings/rec_[A-Za-z0-9_-]+/audio$"},
           "scene": {
             "type": [
@@ -1159,13 +1232,16 @@
             ],
             "maxLength": 4000
           },
-          "active_image_id": {
+           "active_image_id": {
             "type": [
               "string",
               "null"
             ],
             "pattern": "^image_[A-Za-z0-9_-]+$"
           },
+          "image_status": {"enum": ["not_requested", "generating", "ready", "failed", "limit_reached"]},
+          "image_endpoint": {"type": ["string", "null"], "pattern": "^/api/v1/diary/diary_[A-Za-z0-9_-]+/image$"},
+          "last_error_code": {"type": ["string", "null"], "maxLength": 100},
           "version": {
             "type": "integer",
             "minimum": 1

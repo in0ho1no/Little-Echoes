@@ -4,7 +4,7 @@
 
 - `migrations/0001_initial.sql` はPhase 1契約の制約をD1へ移す
 - `wrangler.template.toml` はBinding名と互換日だけを固定する。実ID、ホスト名、Secretは含めない
-- `src/` は管理用・デバイス用ホストをルーター段階で分離し、固定WAV、有限上限、非公開R2、OpenAI解析Workflowを実装する
+- `src/` は管理用・デバイス用ホストをルーター段階で分離し、固定WAV、有限上限、非公開R2、OpenAI解析・日記・画像Workflowを実装する
 - 自動テストではOpenAI APIを呼ばず、注入した固定応答だけを使用する
 
 ## ローカル実行
@@ -73,6 +73,24 @@ Secret値をコマンドライン引数、PowerShell履歴、リダイレクト�
 - Responses APIは`store: false`、`background: false`
 - OpenAI SDKは`maxRetries: 0`
 - Workflowへ渡すペイロードは`AsyncJob.id`だけで、音声、文字起こし、プロンプト、Secretを保持しない
+
+## Phase 6 日記・画像Workflow
+
+- 日記文は承認済みの文字起こし、確定単語、場面、親メモだけから`gpt-5.6-luna`の構造化出力で生成する
+- 画像は親の明示操作だけで`gpt-image-2`を呼び、`1024x1024`、`quality=low`、非公開R2へ固定する
+- OpenAI SDKの再試行は0回とし、Workflow側も日記初回2試行、手動再生成1試行、画像1試行へ制限する
+- 日記・画像の予約時に承認済み録音と日記の版番号を保存し、外部応答後のD1確定でも同じ版番号とジョブ状態を再確認する
+- 画像キーは画像ジョブIDから決定的に導出する。D1確定応答が失われた場合は、ジョブ失敗とD1未参照を原子的に確認できたキーだけを削除する
+- 参照のない失敗ジョブと非アクティブ画像の削除は、D1へ成功・失敗・試行数を永続化し、先頭詰まりを起こさない有限なcron収束で回収する
+- Workflow起動結果が不明なジョブは同一IDだけを最大3回照合し、D1を終端状態へ収束させる
+- 画像cleanupの起動照合もlease付きで最大3回に制限する。`failed`隔離後の再開は、D1参照とR2オブジェクトを管理者が確認し、ユーザー承認を得た場合だけ行う
+- 認可済み画像削除と期限後の後始末は`DEMO_WRITE_ENABLED`の停止対象に含めない
+- 画像生成のOpenAI要求タイムアウトは120秒（テキスト系30秒と分離）。cronは日次`17 3 * * *`（保持期限削除・R2孤児スイープを含む全量）と毎時`47 * * * *`（日記・画像・cleanupの再調停のみ）の2本で、非終端ジョブは最長1日以内に終端へ収束する。scheduledは全タスク完了後に失敗を集約してthrowし、監視から失敗が見える
+- 日記・画像・画像cleanupジョブは作成から30分の絶対期限を持つ。超過を再調停・起動照合が観測したら、カウンタを待たず活性Workflowでも終了させ、生成は`GENERATION_DEADLINE_EXCEEDED`、cleanupは`CLEANUP_DEADLINE_EXCEEDED`で即時終端する（cleanupの取り残しは日次スイープが回収）
+- Workflowステップは提供者送信直前にattemptへ送信済みマーカーを記録する。再実行が引き取れるのは送信前attemptだけで、送信済みが残る場合は再送せず`UPSTREAM_RESULT_UNKNOWN`終端（二重課金の禁止）
+- R2孤児スイープは`diary-images/`配下のうち、作成から24時間以上経過しD1参照（削除済みでない`diary_images`行・非終端ジョブ）のないオブジェクトだけを削除する（purge後に遅延着地したputの回収経路）。1回1ページ・D1永続カーソルで巡回し、参照確認は一括クエリ・削除は一括要求でsubrequest上限内に収める
+
+`migrations/0003_phase6_diary_image.sql`〜`0007_r2_sweep_cursor.sql`、3つのWorkflow Binding、実D1/R2での障害注入、実OpenAI呼び出し、デプロイ、書き込み有効化は外部ゲートである。ローカルテスト完了だけでは実行せず、ユーザー承認後に1項目ずつ確認する。
 
 ## Phase 5依存ライセンス
 

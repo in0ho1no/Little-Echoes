@@ -4,9 +4,11 @@ import { html } from 'hono/html';
 import { authenticateDevice, authenticateManagement } from './auth';
 import { verifyAccessJwt } from './access-jwt';
 import { reserveDeleteJob } from './delete';
+import { reconcileGenerationDispatch } from './diary';
+import { dispatchImageCleanup } from './image-cleanup';
 import { CORRELATION_ID_HEADER, errorBody, newCorrelationId } from './errors';
 import { ANALYSIS_STALE_MILLISECONDS, isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter, UPLOAD_RESERVED_STALE_MILLISECONDS } from './limits';
-import { approveReview, saveReview, type ReviewInput, type ReviewTarget } from './review';
+import { approveReview, isVersionConflictAbort, saveReview, type ReviewInput, type ReviewTarget } from './review';
 import type { DeviceIdentity, Env, ManagementIdentity } from './types';
 import { validateCanonicalWav, WavValidationError } from './wav';
 import { reconcileStaleAnalysisJob } from './workflow';
@@ -21,6 +23,8 @@ interface RecordingRow {
   source_id: string;
   audio_sha256: string | null;
   analysis_status: string;
+  diary_status: string;
+  image_status: string;
   review_status: string;
   version: number;
   captured_at: string;
@@ -82,6 +86,8 @@ function allowedRoute(host: string, method: string, path: string, env: Env): boo
   const approvalPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/approve$/;
   const retryAnalysisPath = /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/retry-analysis$/;
   const dictionaryPath = /^\/api\/v1\/dictionary\/word_[a-z0-9]{32}$/;
+  const diaryPath = /^\/api\/v1\/diary\/diary_[a-z0-9]{32}$/;
+  const diaryImagePath = /^\/api\/v1\/diary\/diary_[a-z0-9]{32}\/image$/;
   if (host === env.INGEST_HOST) {
     return (
       (method === 'POST' && path === '/api/v1/recordings') ||
@@ -90,18 +96,18 @@ function allowedRoute(host: string, method: string, path: string, env: Env): boo
     );
   }
   if (host === env.ADMIN_HOST) {
-    if (method === 'DELETE') return recordingPath.test(path);
-    if (method === 'PATCH') return reviewPath.test(path);
-    if (method === 'POST') return approvalPath.test(path) || retryAnalysisPath.test(path);
+    if (method === 'DELETE') return recordingPath.test(path) || diaryImagePath.test(path);
+    if (method === 'PATCH') return reviewPath.test(path) || diaryPath.test(path);
+    if (method === 'POST') return approvalPath.test(path) || retryAnalysisPath.test(path) || /^\/api\/v1\/diary\/diary_[a-z0-9]{32}\/(regenerate|image)$/.test(path);
     return (
       method === 'GET' &&
       (path === '/' ||
-        path === '/dictionary' ||
+        path === '/dictionary' || path === '/diary' ||
         /^\/dictionary\/word_[a-z0-9]{32}$/.test(path) ||
-        path === '/assets/review.js' ||
+        path === '/assets/review.js' || path === '/assets/diary.js' || path === '/assets/diary.css' || path === '/assets/review-remove.js' ||
         path === '/assets/review-detail.js' ||
         path === '/api/v1/review-queue' ||
-        path === '/api/v1/dictionary' ||
+        path === '/api/v1/dictionary' || path === '/api/v1/diary' || diaryPath.test(path) || diaryImagePath.test(path) || /^\/diary\/diary_[a-z0-9]{32}$/.test(path) ||
         dictionaryPath.test(path) ||
         recordingPath.test(path) ||
         /^\/api\/v1\/recordings\/rec_[a-z0-9]{32}\/audio$/.test(path) ||
@@ -229,7 +235,7 @@ function isResponse(value: DeviceIdentity | ManagementIdentity | Response): valu
 
 async function findDeviceRecording(env: Env, identity: DeviceIdentity, id: string): Promise<RecordingRow | null> {
   return env.DB.prepare(
-    `SELECT r.id, r.household_id, r.source_id, r.audio_sha256, r.audio_object_key, r.analysis_status,
+    `SELECT r.id, r.household_id, r.source_id, r.audio_sha256, r.audio_object_key, r.analysis_status, r.diary_status, r.image_status,
             r.review_status, r.version, r.captured_at, r.captured_timezone, r.captured_at_source,
             r.received_at, r.upload_status, r.duration_seconds, r.pre_roll_seconds, r.post_roll_seconds,
             r.draft_scene, r.draft_parent_note, s.source_type
@@ -242,7 +248,7 @@ async function findDeviceRecording(env: Env, identity: DeviceIdentity, id: strin
 
 async function findManagementRecording(env: Env, identity: ManagementIdentity, id: string): Promise<RecordingRow | null> {
   return env.DB.prepare(
-    `SELECT r.id, r.household_id, r.source_id, r.audio_sha256, r.audio_object_key, r.analysis_status,
+    `SELECT r.id, r.household_id, r.source_id, r.audio_sha256, r.audio_object_key, r.analysis_status, r.diary_status, r.image_status,
             r.review_status, r.version, r.captured_at, r.captured_timezone, r.captured_at_source,
             r.received_at, r.upload_status, r.duration_seconds, r.pre_roll_seconds, r.post_roll_seconds,
             r.draft_scene, r.draft_parent_note, s.source_type
@@ -390,7 +396,7 @@ app.post('/api/v1/recordings', async (c) => {
           new Date(reconcileNow.getTime() - UPLOAD_RESERVED_STALE_MILLISECONDS).toISOString(),
         )
         .run();
-      if ((converged.meta.changes ?? 0) !== 1) {
+      if ((converged.meta.changes ?? 0) === 0) {
         return responseError(c, 409, 'UPLOAD_IN_PROGRESS', '同じ録音を保存中です。', true, 'しばらく待ってから状態を確認してください。');
       }
     }
@@ -399,7 +405,7 @@ app.post('/api/v1/recordings', async (c) => {
     )
       .bind('reserved', new Date().toISOString(), existing.id, 'failed')
       .run();
-    if ((retry.meta.changes ?? 0) !== 1 || !existing.audio_object_key) {
+    if ((retry.meta.changes ?? 0) === 0 || !existing.audio_object_key) {
       return responseError(c, 409, 'UPLOAD_RETRY_LIMIT_REACHED', '音声の再保存上限に達しました。', false, '新しい録音を作成してください。');
     }
     try {
@@ -478,7 +484,7 @@ app.post('/api/v1/recordings', async (c) => {
     )
       .bind(new Date().toISOString(), id, 'reserved')
       .run();
-    if ((reserveAttempt.meta.changes ?? 0) !== 1) throw new Error('upload attempt reservation failed');
+    if ((reserveAttempt.meta.changes ?? 0) === 0) throw new Error('upload attempt reservation failed');
     await c.env.PRIVATE_MEDIA.put(key, wav.bytes, { httpMetadata: { contentType: 'audio/wav' } });
     await c.env.DB.prepare('UPDATE recordings SET upload_status = ?, updated_at = ? WHERE id = ? AND upload_status = ?').bind('ready', new Date().toISOString(), id, 'reserved').run();
   } catch {
@@ -533,7 +539,7 @@ async function convergeAnalysisDispatchFailure(env: Env, id: string, errorCode: 
           )`,
     ).bind(failedAt, id, errorCode, id, errorCode, id),
   ]);
-  return (results[1]?.meta.changes ?? 0) === 1;
+  return (results[1]?.meta.changes ?? 0) >= 1;
 }
 
 async function ensureAnalysisWorkflow(env: Env, id: string): Promise<DispatchResult> {
@@ -639,7 +645,7 @@ app.post('/api/v1/recordings/:id/process', async (c) => {
       .bind(id, identity.householdId, recording.id, c.get('correlationId'), identity.id, now, now, recording.id, recording.id, recording.id)
       .run()
       .then((result) => {
-        if ((result.meta.changes ?? 0) !== 1) throw new Error('analysis job was not reserved');
+        if ((result.meta.changes ?? 0) === 0) throw new Error('analysis job was not reserved');
       });
   } catch {
     const raced = await c.env.DB.prepare(
@@ -735,7 +741,7 @@ app.post('/api/v1/recordings/:id/retry-analysis', async (c) => {
     )
       .bind(id, identity.householdId, recording.id, c.get('correlationId'), token.id, now, now, recording.id, recording.id, recording.id, recording.id, identity.householdId, version)
       .run();
-    if ((reserved.meta.changes ?? 0) !== 1) throw new Error('analysis retry was not reserved');
+    if ((reserved.meta.changes ?? 0) === 0) throw new Error('analysis retry was not reserved');
   } catch {
     const existing = await c.env.DB.prepare(
       `SELECT id, status, correlation_id, last_error_code, updated_at, manual_retry FROM async_jobs
@@ -878,6 +884,21 @@ function reviewResultError(c: { json: (body: unknown, status: 400 | 401 | 403 | 
   return responseError(c, 409, 'REVIEW_NOT_AVAILABLE', '処理中または削除中の録音は確認できません。', false, '処理完了後に再度確認してください。');
 }
 
+export async function ensureInitialDiaryGeneration(env: Env, householdId: string, recordingId: string, correlationId: string): Promise<void> {
+  try {
+    const diaryId = await env.DB.prepare(
+      `SELECT d.id FROM diary_entries d JOIN recordings r ON r.id = d.recording_id
+        WHERE d.recording_id = ? AND r.household_id = ? AND r.review_status = 'approved' AND r.diary_status = 'not_started'`,
+    ).bind(recordingId, householdId).first<{ id: string }>();
+    const diary = diaryId ? await findDiary(env, householdId, diaryId.id) : null;
+    if (!diary || diary.diary_status !== 'not_started') return;
+    const diaryJob = await reserveDiaryJob(env, diary, householdId, correlationId, 'diary');
+    if (diaryJob) await dispatchDiaryWorkflow(env, diaryJob, 'diary');
+  } catch {
+    // 承認は確定済みのため応答を失敗させない。欠落した初回日記jobはcronのensureMissingInitialDiaryJobsが補償する。
+  }
+}
+
 app.patch('/api/v1/recordings/:id/review', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
@@ -895,6 +916,9 @@ app.patch('/api/v1/recordings/:id/review', async (c) => {
   if (result !== 'saved') return reviewResultError(c, result);
   const saved = await findManagementRecording(c.env, identity, recording.id);
   if (!saved) return responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '録音状態を取得できません。', true);
+  if (saved.review_status === 'approved' && saved.diary_status === 'not_started') {
+    await ensureInitialDiaryGeneration(c.env, identity.householdId, recording.id, c.get('correlationId'));
+  }
   return c.json(reviewedRecordingResponse(saved, c.get('correlationId')), 200);
 });
 
@@ -912,6 +936,9 @@ app.post('/api/v1/recordings/:id/approve', async (c) => {
   if (result !== 'saved') return reviewResultError(c, result);
   const approved = await findManagementRecording(c.env, identity, recording.id);
   if (!approved) return responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '録音状態を取得できません。', true);
+  if (approved.diary_status === 'not_started') {
+    await ensureInitialDiaryGeneration(c.env, identity.householdId, recording.id, c.get('correlationId'));
+  }
   return c.json(reviewedRecordingResponse(approved, c.get('correlationId')), 200);
 });
 
@@ -935,6 +962,285 @@ app.get('/api/v1/recordings/:id/audio', async (c) => {
       [CORRELATION_ID_HEADER]: c.get('correlationId'),
     },
   });
+});
+
+interface DiaryRow {
+  id: string;
+  household_id: string;
+  recording_id: string;
+  diary_text: string | null;
+  scene: string | null;
+  version: number;
+  recording_version: number;
+  diary_status: string;
+  image_status: string;
+  captured_at: string;
+  last_generation_error: string | null;
+  active_image_id: string | null;
+  active_image_created_at: string | null;
+}
+
+async function diaryResponse(env: Env, row: DiaryRow, correlationId: string): Promise<Record<string, unknown>> {
+  const words = await env.DB.prepare(
+    `SELECT wo.surface FROM word_occurrences wo WHERE wo.recording_id = ? AND wo.household_id = ? AND (wo.new_override = 'force_new' OR (wo.new_override = 'auto' AND wo.is_first = 1)) ORDER BY wo.surface`,
+  ).bind(row.recording_id, row.household_id).all<{ surface: string }>();
+  return {
+    diary_id: row.id, recording_id: row.recording_id, status: row.diary_status, image_status: row.image_status,
+    captured_at: row.captured_at, new_words: words.results.map((word) => word.surface), audio_endpoint: `/api/v1/recordings/${row.recording_id}/audio`, scene: row.scene, diary_text: row.diary_text, active_image_id: row.active_image_id,
+    image_endpoint: row.active_image_id ? `/api/v1/diary/${row.id}/image` : null,
+    version: row.version, last_error_code: row.last_generation_error, correlation_id: correlationId,
+  };
+}
+
+async function findDiary(env: Env, householdId: string, id: string): Promise<DiaryRow | null> {
+  return env.DB.prepare(
+    `SELECT d.id, r.household_id, d.recording_id, d.diary_text, d.scene, d.version, d.last_generation_error,
+             r.diary_status, r.image_status, r.captured_at, r.version AS recording_version, i.id AS active_image_id, i.created_at AS active_image_created_at
+       FROM diary_entries d JOIN recordings r ON r.id = d.recording_id
+       LEFT JOIN diary_images i ON i.diary_entry_id = d.id AND i.is_active = 1 AND i.deleted_at IS NULL
+      WHERE d.id = ? AND r.household_id = ? AND r.review_status = 'approved'`,
+  ).bind(id, householdId).first<DiaryRow>();
+}
+
+async function parseSmallJson(request: Request, maximum: number): Promise<Record<string, unknown> | null> {
+  const length = request.headers.get('Content-Length');
+  if ((length !== null && (!/^[0-9]+$/.test(length) || Number(length) > maximum)) || !request.headers.get('Content-Type')?.startsWith('application/json')) return null;
+  try {
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength > maximum) return null;
+    const body: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    return typeof body === 'object' && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+async function dispatchDiaryWorkflow(env: Env, id: string, kind: 'diary' | 'image'): Promise<'dispatched' | 'unknown'> {
+  try {
+    const binding = kind === 'diary' ? env.DIARY_WORKFLOW : env.IMAGE_WORKFLOW;
+    await binding.create({ id, params: { async_job_id: id } });
+    await env.DB.prepare(`UPDATE async_jobs SET status = 'dispatched', workflow_instance_id = ?, updated_at = ? WHERE id = ? AND status = 'dispatch_pending'`)
+      .bind(id, new Date().toISOString(), id).run();
+    return 'dispatched';
+  } catch {
+    try {
+      const binding = kind === 'diary' ? env.DIARY_WORKFLOW : env.IMAGE_WORKFLOW;
+      const observed = await (await binding.get(id)).status();
+      if (['queued', 'running', 'paused', 'waiting', 'waitingForPause'].includes(String(observed.status))) {
+        await env.DB.prepare(`UPDATE async_jobs SET status = 'dispatched', workflow_instance_id = ?, updated_at = ? WHERE id = ? AND status = 'dispatch_pending'`)
+          .bind(id, new Date().toISOString(), id).run();
+        return 'dispatched';
+      }
+    } catch { /* status cannot prove dispatch; keep the durable reservation for reconciliation. */ }
+    return 'unknown';
+  }
+}
+
+async function reserveDiaryJob(env: Env, diary: DiaryRow, householdId: string, correlationId: string, kind: 'diary' | 'image', replaceImageId?: string, manualRetry = false): Promise<string | null> {
+  const id = jobId(); const now = new Date().toISOString();
+  try {
+    const result = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO async_jobs (id, household_id, recording_id, job_type, status, operation_number, correlation_id, manual_retry, expected_recording_version, expected_diary_version, created_at, updated_at)
+         SELECT ?, ?, ?, ?, 'dispatch_pending', COALESCE(MAX(operation_number)+1, 1), ?, ?, ?, ?, ?, ? FROM async_jobs
+          WHERE recording_id = ? AND job_type = ?
+         HAVING COUNT(*) >= 0
+            AND NOT EXISTS (SELECT 1 FROM async_jobs a WHERE a.recording_id = ? AND a.job_type IN ('diary','image') AND a.status IN ('dispatch_pending','dispatched','running'))
+            AND EXISTS (SELECT 1 FROM recordings r WHERE r.id = ? AND r.household_id = ? AND r.review_status = 'approved' AND r.version = ?
+              AND EXISTS (SELECT 1 FROM diary_entries d WHERE d.id = ? AND d.recording_id = r.id AND d.version = ?)
+              AND (CASE WHEN ? = 'diary' THEN r.diary_status IN ('not_started','failed','ready') ELSE r.image_status IN ('not_requested','failed','ready') END)
+              AND (? IS NULL OR EXISTS (SELECT 1 FROM diary_images i WHERE i.id = ? AND i.diary_entry_id = ? AND i.is_active = 1 AND i.deleted_at IS NULL)))`,
+      ).bind(id, householdId, diary.recording_id, kind, correlationId, manualRetry ? 1 : 0, diary.recording_version, diary.version, now, now, diary.recording_id, kind, diary.recording_id, diary.recording_id, householdId, diary.recording_version, diary.id, diary.version, kind, replaceImageId ?? null, replaceImageId ?? null, diary.id),
+      env.DB.prepare(kind === 'diary'
+        ? `UPDATE recordings SET diary_status = 'generating', updated_at = ? WHERE id = ? AND household_id = ? AND version = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'dispatch_pending')`
+        : `UPDATE recordings SET image_status = 'generating', updated_at = ? WHERE id = ? AND household_id = ? AND version = ? AND EXISTS (SELECT 1 FROM async_jobs WHERE id = ? AND status = 'dispatch_pending')`)
+        .bind(now, diary.recording_id, householdId, diary.recording_version, id),
+    ]);
+    return (result[0]?.meta.changes ?? 0) >= 1 && (result[1]?.meta.changes ?? 0) >= 1 ? id : null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '';
+    if (/UNIQUE|constraint/i.test(message)) return null;
+    throw error;
+  }
+}
+
+export async function ensureMissingInitialDiaryJobs(env: Env, limit = 10): Promise<void> {
+  if (!isDemoWriteAllowed(env.DEMO_WRITE_ENABLED)) return;
+  const rows = await env.DB.prepare(
+    `SELECT d.id, r.household_id FROM diary_entries d JOIN recordings r ON r.id = d.recording_id
+      WHERE r.review_status = 'approved' AND r.diary_status = 'not_started'
+        AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = r.id AND j.job_type = 'diary')
+      ORDER BY r.updated_at ASC LIMIT ?`,
+  ).bind(limit).all<{ id: string; household_id: string }>();
+  for (const row of rows.results) {
+    const diary = await findDiary(env, row.household_id, row.id);
+    if (!diary || diary.diary_status !== 'not_started') continue;
+    const correlationId = newCorrelationId();
+    const diaryJob = await reserveDiaryJob(env, diary, row.household_id, correlationId, 'diary');
+    if (diaryJob) await dispatchDiaryWorkflow(env, diaryJob, 'diary');
+  }
+}
+
+async function generationQuota(env: Env, diary: DiaryRow, kind: 'diary' | 'image'): Promise<'available' | 'daily' | 'lifetime'> {
+  const day = new Date().toISOString().slice(0, 10);
+  const counter = await env.DB.prepare(
+    `SELECT used_count FROM usage_counters WHERE counter_key = ? AND usage_day = ?`,
+  ).bind(kind === 'diary' ? 'demo-global:openai_non_image' : 'demo-global:image_generation', day).first<{ used_count: number }>();
+  if ((counter?.used_count ?? 0) >= (kind === 'diary' ? 100 : 20)) return 'daily';
+  if (kind === 'image') {
+    const lifetime = await env.DB.prepare(
+      `SELECT used_count FROM usage_counters WHERE counter_key = ? AND usage_day = 'lifetime'`,
+    ).bind(`recording:${diary.recording_id}:image`).first<{ used_count: number }>();
+    if ((lifetime?.used_count ?? 0) >= 5) return 'lifetime';
+  }
+  return 'available';
+}
+
+app.get('/api/v1/diary', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  await reconcileGenerationDispatch(c.env, 10, undefined, identity.householdId);
+  const limit = integerInRange(c.req.query('limit') ?? '20', 1, 100);
+  if (limit === null) return responseError(c, 422, 'INVALID_LIMIT', '一覧件数が不正です。');
+  const rows = await c.env.DB.prepare(
+    `SELECT d.id, r.household_id, d.recording_id, d.diary_text, d.scene, d.version, d.last_generation_error, r.diary_status, r.image_status, r.captured_at, r.version AS recording_version,
+            i.id AS active_image_id, i.created_at AS active_image_created_at
+       FROM diary_entries d JOIN recordings r ON r.id = d.recording_id
+       LEFT JOIN diary_images i ON i.diary_entry_id = d.id AND i.is_active = 1 AND i.deleted_at IS NULL
+      WHERE r.household_id = ? AND r.review_status = 'approved' ORDER BY r.captured_at DESC, d.id DESC LIMIT ?`,
+  ).bind(identity.householdId, limit).all<DiaryRow>();
+  return c.json({ items: await Promise.all(rows.results.map((row) => diaryResponse(c.env, row, c.get('correlationId')))), correlation_id: c.get('correlationId') });
+});
+
+app.get('/api/v1/diary/:id', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  let diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
+  if (diary) {
+    await reconcileGenerationDispatch(c.env, 1, diary.recording_id, identity.householdId);
+    diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
+  }
+  return diary ? c.json(await diaryResponse(c.env, diary, c.get('correlationId'))) : responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
+});
+
+app.patch('/api/v1/diary/:id', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  if (!isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED)) return responseError(c, 403, 'DEMO_WRITE_DISABLED', 'デモ書き込みは現在停止しています。', false, '読み取り専用で確認してください。');
+  const body = await parseSmallJson(c.req.raw, 8_192);
+  if (!body || Object.keys(body).length !== 2 || !Number.isSafeInteger(body.version) || typeof body.version !== 'number' || body.version < 1 || normalizedText(body.diary_text, 4000, true) === null) return responseError(c, 422, 'INVALID_DIARY_INPUT', '日記の内容を確認してください。');
+  const text = normalizedText(body.diary_text, 4000, true) ?? '';
+  const now = new Date().toISOString();
+  const sentinel = () => c.env.DB.prepare(
+    `INSERT INTO recording_tombstones (recording_id, household_id, review_status, deleted_at)
+     SELECT NULL, NULL, NULL, NULL WHERE (SELECT changes()) = 0`,
+  );
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `UPDATE diary_entries SET diary_text = ?, model = NULL, prompt_version = NULL, last_generation_error = NULL, version = version + 1, updated_at = ?
+          WHERE id = ? AND version = ? AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = diary_entries.recording_id AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))
+            AND EXISTS (SELECT 1 FROM recordings r WHERE r.id = diary_entries.recording_id AND r.household_id = ? AND r.review_status = 'approved')`,
+      ).bind(text, now, c.req.param('id'), body.version, identity.householdId),
+      sentinel(),
+      c.env.DB.prepare(
+        `UPDATE recordings SET diary_status = 'ready', updated_at = ? WHERE id = (SELECT recording_id FROM diary_entries WHERE id = ? AND version = ?)
+          AND household_id = ? AND review_status = 'approved'
+          AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = recordings.id AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`,
+      ).bind(now, c.req.param('id'), body.version + 1, identity.householdId),
+      sentinel(),
+    ]);
+  } catch (error) {
+    if (isVersionConflictAbort(error)) return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+    return responseError(c, 500, 'INTERNAL_ERROR', '日記を保存できません。', true, '時間をおいて再試行してください。');
+  }
+  const diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
+  return diary ? c.json(await diaryResponse(c.env, diary, c.get('correlationId'))) : responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '日記状態を取得できません。', true);
+});
+
+app.post('/api/v1/diary/:id/regenerate', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  if (!isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED)) return responseError(c, 403, 'DEMO_WRITE_DISABLED', 'デモ書き込みは現在停止しています。');
+  const body = await parseSmallJson(c.req.raw, 256);
+  if (!body || Object.keys(body).length !== 1 || !Number.isSafeInteger(body.version) || typeof body.version !== 'number') return responseError(c, 422, 'INVALID_DIARY_INPUT', '再生成要求が不正です。');
+  const diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
+  if (!diary) return responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
+  if (diary.version !== body.version) return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+  if (await generationQuota(c.env, diary, 'diary') === 'daily') return responseError(c, 429, 'COST_LIMIT_REACHED', '日記生成の本日の上限に達しました。', false, '手動で日記文を入力してください。');
+  const id = await reserveDiaryJob(c.env, diary, identity.householdId, c.get('correlationId'), 'diary', undefined, true);
+  if (!id) return responseError(c, 409, 'DIARY_GENERATION_NOT_AVAILABLE', '日記生成を開始できません。', false, '処理中でないことと上限を確認してください。');
+  const dispatch = await dispatchDiaryWorkflow(c.env, id, 'diary');
+  return dispatch === 'dispatched' ? c.json(acceptedJobResponse(id, 'dispatched', c.get('correlationId')), 202) : responseError(c, 500, 'WORKFLOW_DISPATCH_UNKNOWN', '日記生成の受付結果を確認できません。', false, '状態を確認してください。');
+});
+
+app.post('/api/v1/diary/:id/image', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  if (!isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED)) return responseError(c, 403, 'DEMO_WRITE_DISABLED', 'デモ書き込みは現在停止しています。');
+  const body = await parseSmallJson(c.req.raw, 512);
+  const replace = body?.replace_image_id;
+  if (!body || !Object.keys(body).every((key) => key === 'version' || key === 'replace_image_id' || key === 'confirmed') || !Number.isSafeInteger(body.version) || typeof body.version !== 'number' || body.confirmed !== true || (replace !== undefined && (typeof replace !== 'string' || !/^image_[a-z0-9]{32}$/.test(replace)))) return responseError(c, 422, 'INVALID_IMAGE_INPUT', '画像生成要求が不正です。');
+  const diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
+  if (!diary) return responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
+  if (diary.version !== body.version) return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+  if (!diary.diary_text) return responseError(c, 409, 'DIARY_NOT_READY', '日記文を先に入力または生成してください。');
+  if (diary.active_image_id && replace !== diary.active_image_id) return c.json({ ...errorBody(c.get('correlationId'), 'IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED', '新しい画像の保存成功時だけ既存画像を置き換えます。', false, '現在の画像を確認してから再度実行してください。'), current_image_id: diary.active_image_id, current_image_created_at: diary.active_image_created_at }, 409);
+  const quota = await generationQuota(c.env, diary, 'image');
+  if (quota === 'daily') return responseError(c, 429, 'COST_LIMIT_REACHED', '画像生成の本日の上限に達しました。', false, '翌日以降に再試行してください。');
+  if (quota === 'lifetime') {
+    const limited = await c.env.DB.prepare(`UPDATE recordings SET image_status = 'limit_reached', updated_at = ? WHERE id = ? AND household_id = ? AND version = ? AND review_status = 'approved' AND image_status <> 'generating'
+      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = recordings.id AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`)
+      .bind(new Date().toISOString(), diary.recording_id, identity.householdId, diary.recording_version).run();
+    if ((limited.meta.changes ?? 0) === 0) return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+    return responseError(c, 409, 'COST_LIMIT_REACHED', 'この録音の画像生成上限に達しました。', false, '既存画像を利用してください。');
+  }
+  const id = await reserveDiaryJob(c.env, diary, identity.householdId, c.get('correlationId'), 'image', diary.active_image_id ?? undefined);
+  if (!id) return responseError(c, 409, 'IMAGE_GENERATION_NOT_AVAILABLE', '画像生成を開始できません。', false, '処理中でないことと上限を確認してください。');
+  const dispatch = await dispatchDiaryWorkflow(c.env, id, 'image');
+  return dispatch === 'dispatched' ? c.json(acceptedJobResponse(id, 'dispatched', c.get('correlationId')), 202) : responseError(c, 500, 'WORKFLOW_DISPATCH_UNKNOWN', '画像生成の受付結果を確認できません。', false, '状態を確認してください。');
+});
+
+app.get('/api/v1/diary/:id/image', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  const row = await c.env.DB.prepare(
+    `SELECT i.image_object_key FROM diary_images i JOIN diary_entries d ON d.id = i.diary_entry_id JOIN recordings r ON r.id = d.recording_id
+      WHERE d.id = ? AND r.household_id = ? AND r.review_status = 'approved' AND i.is_active = 1 AND i.deleted_at IS NULL`,
+  ).bind(c.req.param('id'), identity.householdId).first<{ image_object_key: string }>();
+  if (!row) return responseError(c, 404, 'NOT_FOUND', '対象の画像は見つかりません。');
+  const image = await c.env.PRIVATE_MEDIA.get(row.image_object_key);
+  if (!image) return responseError(c, 404, 'NOT_FOUND', '対象の画像は見つかりません。');
+  return new Response(image.body, { headers: { 'Content-Type': 'image/png', 'Content-Disposition': 'inline; filename="diary.png"', 'Cache-Control': 'private, no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
+});
+
+app.delete('/api/v1/diary/:id/image', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  const body = await parseSmallJson(c.req.raw, 256);
+  if (!body || Object.keys(body).length !== 1 || !Number.isSafeInteger(body.version) || typeof body.version !== 'number') return responseError(c, 422, 'INVALID_IMAGE_INPUT', '画像削除要求が不正です。');
+  const diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
+  if (!diary) return responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
+  if (diary.version !== body.version) return responseError(c, 409, 'VERSION_CONFLICT', '日記は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+  if (!diary.active_image_id) return responseError(c, 404, 'NOT_FOUND', '対象の画像は見つかりません。');
+  const now = new Date().toISOString();
+  const cleanupId = jobId();
+  const image = await c.env.DB.prepare('SELECT image_object_key FROM diary_images WHERE id = ? AND diary_entry_id = ? AND is_active = 1').bind(diary.active_image_id, diary.id).first<{ image_object_key: string }>();
+  if (!image) return responseError(c, 404, 'NOT_FOUND', '対象の画像は見つかりません。');
+  const sentinel = () => c.env.DB.prepare(`INSERT INTO recording_tombstones (recording_id, household_id, review_status, deleted_at) SELECT NULL, NULL, NULL, NULL WHERE (SELECT changes()) = 0`);
+  try { await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE diary_images SET is_active = 0, deleted_at = ? WHERE id = ? AND diary_entry_id = ? AND is_active = 1
+      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = ? AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.active_image_id, diary.id, diary.recording_id),
+    sentinel(),
+    c.env.DB.prepare(`UPDATE diary_entries SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?
+      AND EXISTS (SELECT 1 FROM diary_images WHERE id = ? AND is_active = 0 AND deleted_at = ?)
+      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = diary_entries.recording_id AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.id, diary.version, diary.active_image_id, now),
+    sentinel(),
+    c.env.DB.prepare(`UPDATE recordings SET image_status = 'not_requested', updated_at = ? WHERE id = ? AND household_id = ?
+      AND EXISTS (SELECT 1 FROM diary_images WHERE id = ? AND is_active = 0 AND deleted_at = ?)
+      AND NOT EXISTS (SELECT 1 FROM async_jobs j WHERE j.recording_id = recordings.id AND j.job_type IN ('diary','image') AND j.status IN ('dispatch_pending','dispatched','running'))`).bind(now, diary.recording_id, identity.householdId, diary.active_image_id, now),
+    sentinel(),
+    c.env.DB.prepare(`INSERT INTO image_cleanup_jobs (id, household_id, diary_image_id, image_object_key, status, created_at, updated_at)
+      SELECT ?, ?, ?, ?, 'dispatch_pending', ?, ? WHERE EXISTS (SELECT 1 FROM diary_images WHERE id = ? AND is_active = 0 AND deleted_at = ?)`)
+      .bind(cleanupId, identity.householdId, diary.active_image_id, image.image_object_key, now, now, diary.active_image_id, now),
+    sentinel(),
+  ]); } catch (error) {
+    if (isVersionConflictAbort(error)) return responseError(c, 409, 'VERSION_CONFLICT', '画像は別の操作で更新されています。', false, '一覧を再読み込みしてください。');
+    return responseError(c, 500, 'INTERNAL_ERROR', '画像を削除できません。', true, '時間をおいて再試行してください。');
+  }
+  const dispatch = await dispatchImageCleanup(c.env, cleanupId);
+  return dispatch === 'dispatched' ? c.json(acceptedJobResponse(cleanupId, 'dispatched', c.get('correlationId')), 202) : responseError(c, 500, 'WORKFLOW_DISPATCH_UNKNOWN', '画像削除の受付結果を確認できません。', false, '状態を確認してください。');
 });
 
 interface DictionaryWordRow {
@@ -1124,7 +1430,45 @@ app.get('/api/v1/review-queue', async (c) => {
 app.get('/', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes</title></head><body><main><h1>Little Echoes</h1><p><a href="/dictionary">ことば辞典</a></p><p id="status">確認待ちの録音を読み込んでいます。</p><ul id="recordings"></ul></main><script src="/assets/review.js"></script></body></html>`);
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes</title></head><body><main><h1>Little Echoes</h1><p><a href="/diary">絵日記</a> · <a href="/dictionary">ことば辞典</a></p><p id="status">確認待ちの録音を読み込んでいます。</p><ul id="recordings"></ul></main><script src="/assets/review.js"></script></body></html>`);
+});
+
+app.get('/diary', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 絵日記</title><link rel="stylesheet" href="/assets/diary.css"></head><body><main><p><a href="/">確認待ち一覧へ戻る</a></p><h1>絵日記</h1><p id="diary-status" aria-live="polite">絵日記を読み込んでいます。</p><ul id="diaries"></ul></main><script src="/assets/diary.js"></script></body></html>`);
+});
+
+app.get('/diary/:id', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  let diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
+  if (!diary) return responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
+  await reconcileGenerationDispatch(c.env, 1, diary.recording_id, identity.householdId);
+  diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
+  if (!diary) return responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
+  const newWords = await c.env.DB.prepare(
+    `SELECT wo.surface FROM word_occurrences wo JOIN dictionary_words dw ON dw.id = wo.dictionary_word_id AND dw.household_id = wo.household_id
+      WHERE wo.recording_id = ? AND wo.household_id = ? AND (wo.new_override = 'force_new' OR (wo.new_override = 'auto' AND wo.is_first = 1)) ORDER BY dw.normalized`,
+  ).bind(diary.recording_id, identity.householdId).all<{ surface: string }>();
+  const words = newWords.results.length ? `<ul>${newWords.results.map((word) => `<li>NEW: ${escapeHtml(word.surface)}</li>`).join('')}</ul>` : '<p>NEWの単語はありません。</p>';
+  const image = diary.active_image_id ? `<img class="diary-image" src="/api/v1/diary/${diary.id}/image" alt="生成した絵日記イラスト">` : '<p>画像はまだありません。</p>';
+  const manualRetry = await c.env.DB.prepare(
+    `SELECT 1 AS used FROM async_jobs WHERE recording_id = ? AND job_type = 'diary' AND manual_retry = 1 LIMIT 1`,
+  ).bind(diary.recording_id).first<{ used: number }>();
+  const busy = diary.diary_status === 'generating' || diary.image_status === 'generating';
+  const writesEnabled = isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED);
+  const diaryButtons = writesEnabled && !busy
+    ? `<button type="button" data-action="save-diary">手動で保存</button>${manualRetry ? '' : '<button type="button" data-action="regenerate-diary">日記文を生成</button>'}`
+    : '';
+  const imageGenerateButton = writesEnabled && !busy && diary.image_status !== 'limit_reached'
+    ? `<button type="button" data-action="generate-image">${diary.active_image_id ? '画像を再生成' : '画像を生成'}</button>`
+    : '';
+  const imageDeleteButton = diary.active_image_id && !busy ? '<button type="button" data-action="delete-image">画像を削除</button>' : '';
+  const retryMessage = manualRetry ? '<p>日記文の再生成は使用済みです。必要な場合は手動で編集してください。</p>' : '';
+  const imageLimitMessage = diary.image_status === 'limit_reached' ? '<p>この録音の画像生成上限に達しました。保存済み画像は引き続き表示できます。</p>' : '';
+  const imageCreatedMessage = diary.active_image_created_at ? `<p>現在の画像の作成日時: ${escapeHtml(diary.active_image_created_at)}</p>` : '';
+  const status = busy ? '生成中です。少し待つと更新されます。' : diary.last_generation_error ? '生成に失敗しました。手動入力または再試行できます。' : '';
+  const replaceDialog = `<dialog id="replace-dialog"><h2>画像の置き換え</h2><p>新しい画像の生成に成功した場合だけ、現在の画像を置き換えます。</p><img id="replace-thumb" class="diary-thumb" alt="現在の画像"><p id="replace-thumb-missing" hidden>現在の画像を表示できません。</p><p id="replace-created"></p><p><button type="button" id="replace-ok">置き換えを続ける</button> <button type="button" id="replace-cancel">やめる</button></p></dialog>`;
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 絵日記</title><link rel="stylesheet" href="/assets/diary.css"></head><body><main data-diary-id="${diary.id}" data-version="${diary.version}" data-active-image="${diary.active_image_id ?? ''}" data-active-image-created="${diary.active_image_created_at ?? ''}"><p><a href="/diary">絵日記一覧へ戻る</a></p><h1>絵日記</h1><p id="diary-status"${busy ? ' class="busy"' : ''} aria-live="polite">${escapeHtml(status)}</p><p>録音日時: ${escapeHtml(diary.captured_at)}</p><audio controls preload="metadata" src="/api/v1/recordings/${diary.recording_id}/audio">このブラウザでは音声を再生できません。</audio><section><h2>NEWの単語</h2>${words}</section><label>日記文<textarea id="diary-text" maxlength="4000">${escapeHtml(diary.diary_text)}</textarea></label><p>${diaryButtons}</p>${retryMessage}<section><h2>イラスト</h2>${image}${imageCreatedMessage}<p>${imageGenerateButton}${imageDeleteButton}</p>${imageLimitMessage}</section>${replaceDialog}</main><script src="/assets/diary.js"></script></body></html>`);
 });
 
 app.get('/dictionary', async (c) => {
@@ -1221,7 +1565,7 @@ app.get('/recordings/:id', async (c) => {
     editableWords.results
       .map(
         (word, index) =>
-          `<fieldset data-review-word><label>表記<input data-word-display value="${escapeHtml(word.surface)}" maxlength="100" required></label><label>よみ<input data-word-normalized value="${escapeHtml(word.normalized)}" maxlength="100" required></label><label>NEW表示<select data-word-override aria-label="${index + 1}件目のNEW表示"><option value="auto"${word.new_override === 'auto' ? ' selected' : ''}>自動</option><option value="force_new"${word.new_override === 'force_new' ? ' selected' : ''}>常に表示</option><option value="force_not_new"${word.new_override === 'force_not_new' ? ' selected' : ''}>表示しない</option></select></label></fieldset>`,
+           `<fieldset data-review-word><label>表記<input data-word-display value="${escapeHtml(word.surface)}" maxlength="100" required></label><label>よみ<input data-word-normalized value="${escapeHtml(word.normalized)}" maxlength="100" required></label><label>NEW表示<select data-word-override aria-label="${index + 1}件目のNEW表示"><option value="auto"${word.new_override === 'auto' ? ' selected' : ''}>自動</option><option value="force_new"${word.new_override === 'force_new' ? ' selected' : ''}>常に表示</option><option value="force_not_new"${word.new_override === 'force_not_new' ? ' selected' : ''}>表示しない</option></select></label><button type="button" data-remove-word>候補を削除</button></fieldset>`,
       )
       .join('') || '<p>単語候補はありません。必要なら下の追加欄へ入力してください。</p>';
   const retryButton = retryReason
@@ -1230,7 +1574,7 @@ app.get('/recordings/:id', async (c) => {
   const editor = editable
     ? `<h2>確認・承認</h2><p id="save-status" aria-live="polite"></p>${retryButton}<form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><button type="button" data-action="save">下書きを保存</button><button type="button" data-action="approve">承認する</button></form>`
     : '<p>処理中は編集・承認できません。状態は自動的に更新されます。</p>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 録音</title></head><body><main data-recording-id="${recording.id}"><p><a href="/">確認待ち一覧へ戻る</a> · <a href="/dictionary">ことば辞典</a></p><h1>録音の確認</h1><p><strong>状態:</strong> ${escapeHtml(recording.analysis_status)}</p><p id="processing-status">${status}</p><p><strong>録音日時:</strong> ${escapeHtml(recording.captured_at)} (${escapeHtml(recording.captured_timezone)})</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p>${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? 'まだありません。')}</p><h2>単語候補</h2><ul>${candidateList}</ul>${editor}</main><script src="/assets/review-detail.js"></script></body></html>`);
+  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 録音</title></head><body><main data-recording-id="${recording.id}"><p><a href="/">確認待ち一覧へ戻る</a> · <a href="/diary">絵日記</a> · <a href="/dictionary">ことば辞典</a></p><h1>録音の確認</h1><p><strong>状態:</strong> ${escapeHtml(recording.analysis_status)}</p><p id="processing-status">${status}</p><p><strong>録音日時:</strong> ${escapeHtml(recording.captured_at)} (${escapeHtml(recording.captured_timezone)})</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p>${escapeHtml(transcript?.reviewed_text ?? transcript?.raw_text ?? 'まだありません。')}</p><h2>単語候補</h2><ul>${candidateList}</ul>${editor}</main><script src="/assets/review-detail.js"></script><script src="/assets/review-remove.js"></script></body></html>`);
 });
 
 app.get('/assets/review.js', async (c) => {
@@ -1263,4 +1607,22 @@ app.get('/assets/review-detail.js', async (c) => {
       [CORRELATION_ID_HEADER]: c.get('correlationId'),
     },
   });
+});
+
+app.get('/assets/diary.css', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  const stylesheet = `@keyframes spin{to{transform:rotate(360deg)}}.busy::before{content:"";display:inline-block;width:1em;height:1em;margin-right:.5em;border:.18em solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-.15em;animation:spin .8s linear infinite}.busy[data-stage="2"]::before{animation-duration:.6s;border-width:.24em}.busy[data-stage="3"]::before{animation-duration:.45s;border-width:.3em}.busy[data-stage="4"]::before{animation-duration:.3s;border-width:.36em}.diary-image{max-width:100%;height:auto}.diary-thumb{max-width:12rem;height:auto;display:block}#replace-dialog{max-width:22rem}@media(prefers-reduced-motion:reduce){.busy::before{animation:none}}`;
+  return new Response(stylesheet, { headers: { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
+});
+
+app.get('/assets/diary.js', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  const script = `(()=>{const status=document.getElementById('diary-status');const page=document.querySelector('main[data-diary-id]');const fail=async r=>{const e=await r.json().catch(()=>null);throw new Error(e&&e.message?e.message:'操作に失敗しました。')};if(!page){fetch('/api/v1/diary').then(r=>r.ok?r.json():fail(r)).then(data=>{const list=document.getElementById('diaries');status.textContent=data.items.length?'絵日記です。':'承認済みの絵日記はまだありません。';for(const diary of data.items){const li=document.createElement('li'),a=document.createElement('a');a.href='/diary/'+encodeURIComponent(diary.diary_id);a.textContent=diary.captured_at+' — '+(diary.diary_text||({'generating':'生成中','failed':'生成失敗','not_started':'未作成'}[diary.status]||'日記'));li.append(a);list.append(li)}}).catch(e=>status.textContent=e.message);return}const id=page.dataset.diaryId,version=()=>Number(page.dataset.version),post=async(path,method,body)=>{status.textContent='⏳ 処理を受け付けています…';const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)await fail(r);location.reload()};let elapsed=0;const showProgress=()=>{const stage=Math.min(4,1+Math.floor(elapsed/30));status.classList.add('busy');status.dataset.stage=String(stage);status.textContent='生成中です（経過 '+elapsed+'秒・段階 '+stage+'/4）。少し待つと更新されます。'};let remaining=180;const poll=()=>{if(remaining--<=0){status.classList.remove('busy');status.removeAttribute('data-stage');status.textContent='更新が停止しました。ページを再読み込みしてください。';return}fetch('/api/v1/diary/'+encodeURIComponent(id)).then(r=>r.ok?r.json():null).then(data=>{if(data&&(data.status==='generating'||data.image_status==='generating')){elapsed+=5;showProgress();setTimeout(poll,5000)}else if(data)location.reload();else setTimeout(poll,10000)}).catch(()=>{elapsed+=10;showProgress();setTimeout(poll,10000)})};if(status.classList.contains('busy')){showProgress();setTimeout(poll,5000)}const dialog=document.getElementById('replace-dialog');const openReplaceDialog=(active,created,target)=>{const thumb=document.getElementById('replace-thumb');const missing=document.getElementById('replace-thumb-missing');missing.hidden=true;thumb.hidden=false;thumb.onerror=()=>{thumb.hidden=true;missing.hidden=false};document.getElementById('replace-created').textContent='作成日時: '+(created||'不明');document.getElementById('replace-ok').onclick=()=>{dialog.close();void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',{version:version(),confirmed:true,replace_image_id:active}).catch(e=>{status.textContent=e.message;target.disabled=false})};document.getElementById('replace-cancel').onclick=()=>{dialog.close();target.disabled=false};dialog.oncancel=()=>{target.disabled=false};thumb.src='/api/v1/diary/'+encodeURIComponent(id)+'/image';dialog.showModal()};page.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;if(!action)return;target.disabled=true;if(action==='save-diary')void post('/api/v1/diary/'+encodeURIComponent(id),'PATCH',{version:version(),diary_text:String(document.getElementById('diary-text').value)}).catch(e=>{status.textContent=e.message;target.disabled=false});if(action==='regenerate-diary')void post('/api/v1/diary/'+encodeURIComponent(id)+'/regenerate','POST',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false});if(action==='generate-image'){const active=page.dataset.activeImage;if(active){openReplaceDialog(active,page.dataset.activeImageCreated,target);return}if(!confirm('新しい画像を生成します。生成回数の上限を消費します。続けますか？')){target.disabled=false;return}void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',{version:version(),confirmed:true}).catch(e=>{status.textContent=e.message;target.disabled=false})}if(action==='delete-image'){if(!confirm('現在の画像を削除しますか？')){target.disabled=false;return}void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','DELETE',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false})}})})();`;
+  return new Response(script, { headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
+});
+
+app.get('/assets/review-remove.js', async (c) => {
+  const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
+  const script = `document.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement)||!target.hasAttribute('data-remove-word'))return;event.preventDefault();const row=target.closest('[data-review-word]');if(row&&confirm('この候補を確認対象から除外しますか？'))row.remove()});`;
+  return new Response(script, { headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
 });

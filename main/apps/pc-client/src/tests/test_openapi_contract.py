@@ -30,6 +30,17 @@ def resolve_schema(document: dict[str, Any], schema: dict[str, Any]) -> dict[str
 def assert_schema_accepts(document: dict[str, Any], schema: dict[str, Any], value: Any) -> None:
     """この契約で使うJSON Schemaの制限付き検証を行う。"""
     resolved: dict[str, Any] = resolve_schema(document, schema)
+    alternatives: list[dict[str, Any]] | None = resolved.get('oneOf')
+    if alternatives is not None:
+        matches: int = 0
+        for alternative in alternatives:
+            try:
+                assert_schema_accepts(document, alternative, value)
+            except (AssertionError, ValueError):
+                continue
+            matches += 1
+        assert matches == 1
+        return
     expected_type: str | list[str] | None = resolved.get('type')
     expected_types: set[str] = {expected_type} if isinstance(expected_type, str) else set(expected_type or [])
 
@@ -108,7 +119,7 @@ def test_mutation_schemas_accept_valid_payloads_and_reject_unknown_fields() -> N
 
     assert_schema_accepts(document, schemas['Review'], valid_review)
     assert_schema_accepts(document, schemas['DiaryEdit'], {'version': 1, 'diary_text': 'きょうのきろく'})
-    assert_schema_accepts(document, schemas['ImageRequest'], {'version': 1})
+    assert_schema_accepts(document, schemas['ImageRequest'], {'version': 1, 'confirmed': True})
 
     invalid_review: dict[str, Any] = {**valid_review, 'household_id': 'household_other'}
     try:
@@ -131,6 +142,56 @@ def test_mutation_schemas_accept_valid_payloads_and_reject_unknown_fields() -> N
             pass
         else:
             raise AssertionError('invalid schema boundary must be rejected')
+
+    try:
+        assert_schema_accepts(document, schemas['ImageRequest'], {'version': 1, 'confirmed': False})
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('image generation requires an explicit confirmation')
+
+
+def test_phase6_routes_declare_all_error_statuses_and_replacement_context() -> None:
+    """Phase 6 mutation contracts expose every implemented error status and replacement context."""
+    document: dict[str, Any] = load_openapi()
+    paths: dict[str, Any] = document['paths']
+    expected: dict[tuple[str, str], set[str]] = {
+        ('/api/v1/diary/{diary_id}', 'patch'): {'200', '401', '403', '409', '422', '500'},
+        ('/api/v1/diary/{diary_id}/regenerate', 'post'): {'202', '401', '403', '404', '409', '422', '429', '500'},
+        ('/api/v1/diary/{diary_id}/image', 'post'): {'202', '401', '403', '404', '409', '422', '429', '500'},
+        ('/api/v1/diary/{diary_id}/image', 'delete'): {'202', '401', '404', '409', '422', '500'},
+    }
+    for (path, method), statuses in expected.items():
+        assert statuses <= set(paths[path][method]['responses'])
+    replacement_response: dict[str, Any] = paths['/api/v1/diary/{diary_id}/image']['post']['responses']['409']
+    assert replacement_response['$ref'] == '#/components/responses/ImageReplacementError'
+    replacement_schema: dict[str, Any] = document['components']['schemas']['ImageReplacementError']
+    assert {'current_image_id', 'current_image_created_at'} <= set(replacement_schema['required'])
+    conflict_schema: dict[str, Any] = document['components']['schemas']['ImagePostConflict']
+    assert_schema_accepts(
+        document,
+        conflict_schema,
+        {
+            'code': 'IMAGE_REPLACEMENT_CONFIRMATION_REQUIRED',
+            'message': '置換確認が必要です。',
+            'retryable': False,
+            'correlation_id': 'corr_test',
+            'next_action': '現在の画像を確認してください。',
+            'current_image_id': 'image_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            'current_image_created_at': '2026-07-29T00:00:00Z',
+        },
+    )
+    assert_schema_accepts(
+        document,
+        conflict_schema,
+        {
+            'code': 'VERSION_CONFLICT',
+            'message': '競合しました。',
+            'retryable': False,
+            'correlation_id': 'corr_test',
+            'next_action': '再読み込みしてください。',
+        },
+    )
 
 
 def test_management_get_routes_have_access_and_typed_success_responses() -> None:
@@ -204,6 +265,7 @@ ALLOWED_SCHEMA_KEYWORDS: frozenset[str] = frozenset(
         'exclusiveMinimum',
         'contentMediaType',
         'default',
+        'oneOf',
     }
 )
 ALLOWED_FORMATS: frozenset[str] = frozenset({'date-time', 'uuid', 'binary'})
@@ -217,6 +279,8 @@ def iter_schema_nodes(schema: dict[str, Any]) -> list[dict[str, Any]]:
     items: dict[str, Any] | None = schema.get('items')
     if items is not None:
         nodes.extend(iter_schema_nodes(items))
+    for alternative in schema.get('oneOf', []):
+        nodes.extend(iter_schema_nodes(alternative))
     return nodes
 
 

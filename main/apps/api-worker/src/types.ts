@@ -20,10 +20,13 @@ export interface WorkflowParams {
 
 export type Env = Omit<
   CloudflareBindings,
-  'ANALYSIS_WORKFLOW' | 'DELETE_WORKFLOW' | 'DEMO_WRITE_ENABLED' | 'ACCESS_TEAM_DOMAIN' | 'ACCESS_AUD' | 'ADMIN_HOST' | 'INGEST_HOST'
+  'ANALYSIS_WORKFLOW' | 'DELETE_WORKFLOW' | 'DIARY_WORKFLOW' | 'IMAGE_WORKFLOW' | 'IMAGE_CLEANUP_WORKFLOW' | 'DEMO_WRITE_ENABLED' | 'ACCESS_TEAM_DOMAIN' | 'ACCESS_AUD' | 'ADMIN_HOST' | 'INGEST_HOST'
 > & {
   ANALYSIS_WORKFLOW: Workflow<WorkflowParams>;
   DELETE_WORKFLOW: Workflow<WorkflowParams>;
+  DIARY_WORKFLOW: Workflow<WorkflowParams>;
+  IMAGE_WORKFLOW: Workflow<WorkflowParams>;
+  IMAGE_CLEANUP_WORKFLOW: Workflow<WorkflowParams>;
   DEVICE_TOKEN_HMAC_SECRET: string;
   DEMO_WRITE_ENABLED: string;
   ACCESS_TEAM_DOMAIN: string;
