@@ -162,7 +162,6 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 - [x] Sol修正（`aaa575b`）をFable5が確認（2026-07-23）。全ゲート再現（pytest 98件、Vitest 72件、TypeScript型検査、ruff/format/mypy/pyright）。対応は想定範囲内かつ適切: (1) `captured_at`を長押し成立時刻に修正（SPEC 892準拠、Fable5実装の保存時刻より正確）、(2) resumeを「途中状態のみ自動・失敗状態は明示操作待ち」へ整理（SPEC 484/486の解釈としてFable5版より正確）、(3) 自動試行予算の再起動またぎ永続化、(4) 単一配送ワーカー＋有界キュー＋in-flight重複排除でスレッド増殖と二重送信を排除、(5) 202後の状態ポーリング（2秒間隔・最大15分・過渡失敗1回再試行）でSPEC 1158の状態確認を実装、(6) 後録り中切断の途中確定（`post_roll_truncated=true`）→自動再接続1回→手動ボタン（SPEC 521/525準拠）、(7) スプールのRLock・原子的置換・UUID検証（パストラバーサル防止）・破損JSON隔離・孤児WAV清掃、(8) 429を過渡扱い・エラー本文の長さ制限・`next_action`表示・失敗理由の永続化、(9) SQLマニフェストテストを「コミット済みJSONとの一致検証」へ変更（テストが追跡ファイルを書き換えない）。懸念はMinor 2件のみ: SQLマニフェストの再生成手順が未整備（SQL変更時は手動同期が必要。将来`pnpm`スクリプト化を推奨）、状態ポーリングが単一スレッド直列のため多件数時に間隔が延びる（デモ規模では実害なし）。いずれも実機確認をブロックしない。
 - [x] 実機確認を完了（2026-07-22、ユーザー実施・書き込み一時有効化）。1.5秒未満の取り消しは初回から正常。長押し送信は「送信に失敗しました」を繰り返し未送信4件が滞留し、`wrangler tail`でWorkerへのリクエスト到達がゼロ件であることを確認。実要求を再現してクライアントの例外処理外で生例外を暴いたところ`HTTPError 403 / error code: 1010`（Cloudflare Browser Integrity Check/Bot Fight Mode）。原因はPython `urllib`の既定User-Agent（`Python-urllib/3.12`）が既知ボットシグネチャとして遮断され、Workerに到達する前にCloudflareエッジで拒否されていたこと（`curl`は別UAのため疎通確認では見逃していた）。`uploader.py`の全要求へ固有User-Agent（`LittleEchoesPcClient/1.0`）を付与して修正・再検証（`103842b`）。再起動後の再試行で「解析を受け付けました。AI処理中…」→「確認待ちです。」まで到達し、D1へ`source_id=src_pc01`の新規録音を確認。スマートフォンでの音声再生も確認済み（文字起こしはPhase 2固定モックのまま）。検証後に`DEMO_WRITE_ENABLED=false`へ再封止し403を実測。固定サンプル送信は`main/apps/pc-client/src/assets/sample.wav`が未配置のため未検証（Phase 4の必須項目ではないため次回サンプル用意時に確認する）。
 
-
 - [x] GUIライブラリを選定する。`tkinter`以外の依存追加はユーザー承認後にだけ行う。
 - [x] Phase 1A音声部品を製品用へ分離し、実際の押下/解放イベント、1.5秒進捗、複数押し無視、10秒前録り・5秒後録りをPC状態遷移どおりに実装する。
 - [x] 待機、長押し成立、後録り、保存、送信、処理待ち、成功、失敗、未送信件数、再試行、デバイス切断を画面で明示する。
@@ -209,6 +208,7 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
   - 修正後にVitest 115件・Worker型検査・pytest 129件（マニフェスト1件減による自然減）・ruff/format/mypy/pyright・`git diff --check`を再実行し全て成功した。
   - Sol（`282dd06`）による追加確認で、`POST /process`の実装が返す401（認証失敗）と404（録音未検出）がOpenAPIに未定義と判明したため追記し、契約を実装と一致させた。Claude（Sonnet 5）が事後にopenapi.jsonの構文・pytest 129件・Vitest 115件で回帰なしを確認した（2026-07-24）。
 - [x] Fable5レビューを実施（2026-07-24、`282dd06`＋tasks.md未コミット修正対象）。workflow.ts全文・app.tsの/process・retry-analysis・状態取得・0001/0002マイグレーショントリガーを精読し、全ゲート（Vitest 115件、Worker型検査、ruff/format/mypy/pyright、pytest 129件、`git diff --check`）を再現。High/Medium指摘なし。精査して問題なしと確認した点: (1) `active_attempt_id`は0001の活性化トリガー（attempt INSERTと同一文で`transcribing`遷移＋設定、非活性時`RAISE(ABORT)`）で閉じており全ガードの前提が成立、(2) `/process`は認証済みデバイストークンIDを`authorization_token_id`へ設定しreserveAttemptのJOIN前提と整合、(3) 日次上限トリガーは`RAISE(ABORT)`で予約ごとカウンター増分をロールバックし課金と原子一致、(4) 外部応答受領後のD1障害は全経路が`markCommitUnknownBestEffort`（非rethrow）へ落ち、step再実行によるOpenAI再呼び出しは発生しない、(5) step再試行枯渇時のtranscript salvage（partial確定）はattempt状態遷移と整合、(6) 削除競合時はDELETE_REQUESTED側が先に収束しmarkCommitUnknownは安全に空振りする、(7) retry-analysisのTOCTOUはINSERT時CAS＋部分ユニークインデックスで閉鎖。Low 2件（対応不要と判断）: (a) reserveAttempt中の一過性D1障害がstep再試行枯渇まで続いた場合、OpenAI未呼び出しでも失敗コードが`UPSTREAM_RESULT_UNKNOWN`になる（attempt予算は未消費で手動再試行可能、コード名が実態より悲観的なだけ）、(b) 転写のretryableエラーはattemptを即failed化、単語抽出のretryableエラーは次実行のSTEP_REEXECUTED清掃に委ねる非対称があるが、いずれも収束し15分照合の安全網内。既知のコスト挙動として、単語抽出のretryable失敗によるstep再試行は転写呼び出しも再実行する（3試行・日次100の予算で有界）。
+
 ### Phase 5の外部ゲート実施（2026-07-28）
 
 - [x] 非児童固定サンプルを準備した。Claudeが収録台本（`main/docs/fixed-sample-script.md`。メイン＋インジェクション耐性確認用の2本）を作成し、ユーザーが大人の声で収録。ステレオ・サイズ超過だったためClaudeが左右平均mono化とピーク50%正規化を実施し、`main/apps/pc-client/src/assets/sample.wav`（13.98秒・670,898 bytes）と`sample_injection.wav`（11.97秒・574,768 bytes）へ配置。両方とも24kHz/16bit/mono・20秒以下・1,100,000 bytes以下のサーバー検証を満たすことを確認済み。
@@ -265,6 +265,7 @@ Python変更時は既存のPython Quality/Reviewエージェントを、横断�
 ## Phase 7 — セキュリティ・公開強化
 
 - [ ] 認証・認可・ホスト分離・Access JWT・デバイストークン・IDOR・CSRF・CORS・XSS・入力上限・不正WAV/JSONを負のテストで検証する。
+- [ ] CI静的解析（semgrep等）の検出への対応方針を定める（2026-07-30の対応実績を踏まえる）。原則は構造での解消（例: 補間テンプレートへscriptタグを置かない、shell経由spawnの廃止）とし、実害がなく構造化も不合理な検出に限り根拠コメント付き`nosemgrep`を許可、抑止一覧は本Phaseのレビューで棚卸しする。
 - [ ] ログ、エラー、Workflow状態、静的資産、Git履歴にトークン、APIキー、音声、文字起こし、親メモ、R2キーがないことを検査する。
 - [ ] 日次/生涯/録音別上限、有限再試行、`DEMO_WRITE_ENABLED`、2026-09-01期限、削除例外、上流障害を結合テストする。
 - [ ] 固定3音声、復旧手順、読み取り専用デモ、`reference/`なしの再現手順を準備し、実データを使わずに通しデモする。
