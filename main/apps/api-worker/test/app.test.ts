@@ -397,6 +397,61 @@ describe('ルーターと録音API', () => {
     expect(response.status).toBe(422);
   });
 
+  it('日記詳細APIは生成回数の使用済み・上限・残りを返す', async () => {
+    const diary = { id: 'diary_11111111111111111111111111111111', household_id: 'household_1', recording_id: RECORDING_ID, diary_text: '日記', scene: null, version: 1, recording_version: 1, diary_status: 'ready', image_status: 'ready', captured_at: '2026-07-21T00:00:00.000Z', last_generation_error: null, active_image_id: null, active_image_created_at: null };
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
+        if (sql.includes("manual_retry = 1")) return { used: 1 };
+        return null;
+      },
+      undefined,
+      (sql) => {
+        if (sql.includes('SELECT counter_key, used_count FROM usage_counters')) {
+          return [
+            { counter_key: 'demo-global:openai_non_image', used_count: 37 },
+            { counter_key: 'demo-global:image_generation', used_count: 8 },
+            { counter_key: `recording:${RECORDING_ID}:image`, used_count: 2 },
+          ];
+        }
+        if (sql.includes('SELECT wo.surface FROM word_occurrences')) return [{ surface: 'りんご' }];
+        return [];
+      },
+    );
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(new Request(`https://app.example.test/api/v1/diary/${diary.id}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed' } }), supplied);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      generation_usage: {
+        text_daily: { used: 37, limit: 100, remaining: 63 },
+        image_daily: { used: 8, limit: 20, remaining: 12 },
+        image_recording: { used: 2, limit: 5, remaining: 3 },
+        manual_diary_regeneration_used: true,
+      },
+    });
+  });
+
+  it('日記詳細APIは未作成の使用量カウンターを未使用として返す', async () => {
+    const diary = { id: 'diary_11111111111111111111111111111111', household_id: 'household_1', recording_id: RECORDING_ID, diary_text: '日記', scene: null, version: 1, recording_version: 1, diary_status: 'ready', image_status: 'not_requested', captured_at: '2026-07-21T00:00:00.000Z', last_generation_error: null, active_image_id: null, active_image_created_at: null };
+    const supplied = env((sql) => {
+      if (sql.includes('management_principals')) return { household_id: 'household_1' };
+      if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
+      return null;
+    });
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(new Request(`https://app.example.test/api/v1/diary/${diary.id}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed' } }), supplied);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      generation_usage: {
+        text_daily: { used: 0, limit: 100, remaining: 100 },
+        image_daily: { used: 0, limit: 20, remaining: 20 },
+        image_recording: { used: 0, limit: 5, remaining: 5 },
+        manual_diary_regeneration_used: false,
+      },
+    });
+  });
+
   it('絵日記SSRはmanual retry・画像上限・生成中を安全に表示する', async () => {
     const diary = { id: 'diary_11111111111111111111111111111111', household_id: 'household_1', recording_id: RECORDING_ID, diary_text: '日記', scene: null, version: 1, recording_version: 1, diary_status: 'generating', image_status: 'limit_reached', captured_at: '2026-07-21T00:00:00.000Z', last_generation_error: null, active_image_id: 'image_11111111111111111111111111111111', active_image_created_at: '2026-07-21T00:01:00.000Z' };
     const supplied = env((sql) => {
@@ -404,7 +459,13 @@ describe('ルーターと録音API', () => {
       if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
       if (sql.includes("manual_retry = 1")) return { used: 1 };
       return null;
-    }, undefined, () => []);
+    }, undefined, (sql) => sql.includes('SELECT counter_key, used_count FROM usage_counters')
+      ? [
+          { counter_key: 'demo-global:openai_non_image', used_count: 100 },
+          { counter_key: 'demo-global:image_generation', used_count: 20 },
+          { counter_key: `recording:${RECORDING_ID}:image`, used_count: 5 },
+        ]
+      : []);
     supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
     const response = await app.fetch(new Request(`https://app.example.test/diary/${diary.id}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed' } }), supplied);
     const html = await response.text();
@@ -413,6 +474,38 @@ describe('ルーターと録音API', () => {
     expect(html).toContain('class="busy"');
     expect(html).toContain('href="/assets/diary.css"');
     expect(html).toContain('現在の画像の作成日時: 2026-07-21T00:01:00.000Z');
+    expect(html).toContain('この録音の画像:</strong> 残り 0/5回');
+    expect(html).toContain('本日の画像:</strong> 残り 0/20回');
+    expect(html).toContain('本日のテキスト系AI:</strong> 残り 0/100回');
+    expect(html).toContain('aria-labelledby="replace-dialog-title"');
+    expect(html).toContain('この録音の残り生成回数 0/5回');
+  });
+
+  it('絵日記SSRはテキスト日次・画像日次・録音別の各残数を独立に判定する', async () => {
+    const diary = { id: 'diary_11111111111111111111111111111111', household_id: 'household_1', recording_id: RECORDING_ID, diary_text: '日記', scene: null, version: 1, recording_version: 1, diary_status: 'ready', image_status: 'not_requested', captured_at: '2026-07-21T00:00:00.000Z', last_generation_error: null, active_image_id: null, active_image_created_at: null };
+    const cases = [
+      { textUsed: 100, imageDailyUsed: 0, imageRecordingUsed: 0, textDisabled: true, imageDisabled: false },
+      { textUsed: 0, imageDailyUsed: 20, imageRecordingUsed: 0, textDisabled: false, imageDisabled: true },
+      { textUsed: 0, imageDailyUsed: 0, imageRecordingUsed: 5, textDisabled: false, imageDisabled: true },
+    ] as const;
+    for (const testCase of cases) {
+      const supplied = env((sql) => {
+        if (sql.includes('management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM diary_entries d JOIN recordings')) return diary;
+        return null;
+      }, undefined, (sql) => sql.includes('SELECT counter_key, used_count FROM usage_counters')
+        ? [
+            { counter_key: 'demo-global:openai_non_image', used_count: testCase.textUsed },
+            { counter_key: 'demo-global:image_generation', used_count: testCase.imageDailyUsed },
+            { counter_key: `recording:${RECORDING_ID}:image`, used_count: testCase.imageRecordingUsed },
+          ]
+        : []);
+      supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+      const response = await app.fetch(new Request(`https://app.example.test/diary/${diary.id}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed' } }), supplied);
+      const html = await response.text();
+      expect(html.includes('data-action="regenerate-diary" disabled aria-describedby="quota-summary"')).toBe(testCase.textDisabled);
+      expect(html.includes('data-action="generate-image" disabled aria-describedby="quota-summary"')).toBe(testCase.imageDisabled);
+    }
   });
 
   it('diary.jsは初回と置換の双方で確認し確認済みフラグを送る', async () => {
@@ -424,6 +517,8 @@ describe('ルーターと録音API', () => {
     );
     const script = await response.text();
     expect(script).toContain('新しい画像を生成します');
+    expect(script).toContain('この録音の残り生成回数');
+    expect(script).toContain('imageRecordingRemaining');
     expect(script).toContain('作成日時: ');
     expect(script).toContain('confirmed:true');
   });
@@ -441,6 +536,16 @@ describe('ルーターと録音API', () => {
     expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(css).toContain('.busy::before');
     expect(css).toContain('.diary-image');
+    expect(css).toContain('@media(max-width:360px)');
+    expect(css).toContain('grid-template-columns:repeat(3,minmax(0,1fr))');
+    expect(css).toContain('--muted:#756F64');
+    const luminance = (hex: string): number => {
+      const channels = hex.match(/../g)?.map((value) => Number.parseInt(value, 16) / 255) ?? [];
+      const linear = channels.map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+      return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+    };
+    const mutedContrast = (luminance('FFFDF8') + 0.05) / (luminance('756F64') + 0.05);
+    expect(mutedContrast).toBeGreaterThanOrEqual(4.5);
   });
 
   it('未知ホストを認証前にdeny-by-defaultで拒否する', async () => {
@@ -907,6 +1012,33 @@ describe('ルーターと録音API', () => {
     expect(body).not.toContain('（モック）');
   });
 
+  it('承認済み録音のHTMLは解析状態よりレビュー状態を優先して表示する', async () => {
+    const approved = { ...recordingRow('ready'), review_status: 'approved' };
+    const supplied = env(
+      (sql) => {
+        if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
+        if (sql.includes('FROM recordings r JOIN sources')) return approved;
+        if (sql.includes('FROM transcripts')) return { raw_text: 'りんご', reviewed_text: 'りんご' };
+        return null;
+      },
+      undefined,
+      () => [],
+    );
+    supplied.ACCESS_JWT_VERIFY = async () => ({ accessSubject: 'management-subject' });
+    const response = await app.fetch(
+      new Request(`https://app.example.test/recordings/${RECORDING_ID}`, { headers: { 'Cf-Access-Jwt-Assertion': 'signed-test-token' } }),
+      supplied,
+    );
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(body).toContain('<span class="chip chip-ok">承認済み</span>');
+    expect(body).toContain('承認済みです。必要に応じて内容を編集できます。');
+    expect(body).toContain('<h2>承認内容の編集</h2>');
+    expect(body).toContain('data-approved="true"');
+    expect(body).toContain('data-action="approve">変更を保存</button>');
+    expect(body).not.toContain('下書きを保存</button>');
+  });
+
   it('処理中HTMLは状態APIを有限間隔で確認して終端時に再描画する', async () => {
     const supplied = env((sql) => {
       if (sql.includes('FROM management_principals')) return { household_id: 'household_1' };
@@ -930,6 +1062,8 @@ describe('ルーターと録音API', () => {
     expect(script).toContain("fetch('/api/v1/recordings/'");
     expect(script).toContain('let remaining=180');
     expect(script).toContain('setTimeout(poll,5000)');
+    expect(script).toContain("approved?'変更を保存しています。':'承認を保存しています。'");
+    expect(script).toContain("approved?'変更を保存しました。':'承認しました。'");
     expect(html).toContain('id="processing-status"');
     expect(script).toContain('更新が停止しました。ページを再読み込みしてください。');
   });
