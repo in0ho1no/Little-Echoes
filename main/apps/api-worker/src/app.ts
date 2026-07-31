@@ -217,6 +217,25 @@ function escapeHtml(value: string | null | undefined): string {
   return escaped.toString();
 }
 
+type NavKey = 'review' | 'diary' | 'dictionary';
+
+// 全管理画面で同じ head・ヘッダーを共有する。スタイルは CSP(default-src 'self')の
+// 制約下でインラインを使えないため、既存許可経路の /assets/diary.css だけから読み込む。
+function pageShell(title: string, activeNav: NavKey, main: string, scripts = ''): string {
+  const nav = (key: NavKey, href: string, label: string): string =>
+    `<a href="${href}"${key === activeNav ? ' aria-current="page"' : ''}>${label}</a>`;
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><link rel="stylesheet" href="/assets/diary.css"></head><body><header class="masthead"><a class="brand" href="/">Little Echoes</a><nav class="site-nav" aria-label="主要ページ">${nav('review', '/', '確認待ち')}${nav('diary', '/diary', '絵日記')}${nav('dictionary', '/dictionary', 'ことば辞典')}</nav></header>${main}${scripts}</body></html>`;
+}
+
+function analysisStatusView(status: string): { label: string; chip: string } {
+  if (status === 'ready') return { label: '確認待ち', chip: 'chip-ok' };
+  if (status === 'partial') return { label: '一部のみ自動取得', chip: 'chip-quiet' };
+  if (status === 'failed') return { label: '自動解析に失敗', chip: 'chip-alert' };
+  if (status === 'transcribing') return { label: '文字起こし中', chip: 'chip-quiet' };
+  if (status === 'extracting_words') return { label: 'ことば抽出中', chip: 'chip-quiet' };
+  return { label: '受付済み', chip: 'chip-quiet' };
+}
+
 async function deviceIdentity(c: { req: { raw: Request }; env: Env; get: (key: 'correlationId') => string; json: (body: unknown, status: 401) => Response }): Promise<DeviceIdentity | Response> {
   const identity = await authenticateDevice(c.req.raw, c.env);
   return identity ?? c.json(errorBody(c.get('correlationId'), 'UNAUTHORIZED', '認証情報を確認してください。', false, '有効なデバイストークンを設定してください。'), 401);
@@ -1430,12 +1449,26 @@ app.get('/api/v1/review-queue', async (c) => {
 app.get('/', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes</title></head><body><main><h1>Little Echoes</h1><p><a href="/diary">絵日記</a> · <a href="/dictionary">ことば辞典</a></p><p id="status">確認待ちの録音を読み込んでいます。</p><ul id="recordings"></ul></main><script src="/assets/review.js"></script></body></html>`);
+  return c.html(
+    pageShell(
+      'Little Echoes',
+      'review',
+      `<main><h1>確認待ちの録音</h1><p id="status" aria-live="polite">確認待ちの録音を読み込んでいます。</p><ul id="recordings"></ul></main>`,
+      `<script src="/assets/review.js"></script>`,
+    ),
+  );
 });
 
 app.get('/diary', async (c) => {
   const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 絵日記</title><link rel="stylesheet" href="/assets/diary.css"></head><body><main><p><a href="/">確認待ち一覧へ戻る</a></p><h1>絵日記</h1><p id="diary-status" aria-live="polite">絵日記を読み込んでいます。</p><ul id="diaries"></ul></main><script src="/assets/diary.js"></script></body></html>`);
+  return c.html(
+    pageShell(
+      'Little Echoes — 絵日記',
+      'diary',
+      `<main><h1>絵日記</h1><p id="diary-status" aria-live="polite">絵日記を読み込んでいます。</p><ul id="diaries"></ul></main>`,
+      `<script src="/assets/diary.js"></script>`,
+    ),
+  );
 });
 
 app.get('/diary/:id', async (c) => {
@@ -1449,8 +1482,10 @@ app.get('/diary/:id', async (c) => {
     `SELECT wo.surface FROM word_occurrences wo JOIN dictionary_words dw ON dw.id = wo.dictionary_word_id AND dw.household_id = wo.household_id
       WHERE wo.recording_id = ? AND wo.household_id = ? AND (wo.new_override = 'force_new' OR (wo.new_override = 'auto' AND wo.is_first = 1)) ORDER BY dw.normalized`,
   ).bind(diary.recording_id, identity.householdId).all<{ surface: string }>();
-  const words = newWords.results.length ? `<ul>${newWords.results.map((word) => `<li>NEW: ${escapeHtml(word.surface)}</li>`).join('')}</ul>` : '<p>NEWの単語はありません。</p>';
-  const image = diary.active_image_id ? `<img class="diary-image" src="/api/v1/diary/${diary.id}/image" alt="生成した絵日記イラスト">` : '<p>画像はまだありません。</p>';
+  const words = newWords.results.length
+    ? `<ul class="stamp-list">${newWords.results.map((word) => `<li><span class="stamp">NEW</span>${escapeHtml(word.surface)}</li>`).join('')}</ul>`
+    : '<p class="page-meta">NEWの単語はありません。</p>';
+  const image = diary.active_image_id ? `<img class="diary-image" src="/api/v1/diary/${diary.id}/image" alt="生成した絵日記イラスト">` : '<p class="page-meta">画像はまだありません。</p>';
   const manualRetry = await c.env.DB.prepare(
     `SELECT 1 AS used FROM async_jobs WHERE recording_id = ? AND job_type = 'diary' AND manual_retry = 1 LIMIT 1`,
   ).bind(diary.recording_id).first<{ used: number }>();
@@ -1465,10 +1500,17 @@ app.get('/diary/:id', async (c) => {
   const imageDeleteButton = diary.active_image_id && !busy ? '<button type="button" data-action="delete-image">画像を削除</button>' : '';
   const retryMessage = manualRetry ? '<p>日記文の再生成は使用済みです。必要な場合は手動で編集してください。</p>' : '';
   const imageLimitMessage = diary.image_status === 'limit_reached' ? '<p>この録音の画像生成上限に達しました。保存済み画像は引き続き表示できます。</p>' : '';
-  const imageCreatedMessage = diary.active_image_created_at ? `<p>現在の画像の作成日時: ${escapeHtml(diary.active_image_created_at)}</p>` : '';
+  const imageCreatedMessage = diary.active_image_created_at ? `<p class="page-meta">現在の画像の作成日時: ${escapeHtml(diary.active_image_created_at)}</p>` : '';
   const status = busy ? '生成中です。少し待つと更新されます。' : diary.last_generation_error ? '生成に失敗しました。手動入力または再試行できます。' : '';
-  const replaceDialog = `<dialog id="replace-dialog"><h2>画像の置き換え</h2><p>新しい画像の生成に成功した場合だけ、現在の画像を置き換えます。</p><img id="replace-thumb" class="diary-thumb" alt="現在の画像"><p id="replace-thumb-missing" hidden>現在の画像を表示できません。</p><p id="replace-created"></p><p><button type="button" id="replace-ok">置き換えを続ける</button> <button type="button" id="replace-cancel">やめる</button></p></dialog>`;
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 絵日記</title><link rel="stylesheet" href="/assets/diary.css"></head><body><main data-diary-id="${diary.id}" data-version="${diary.version}" data-active-image="${diary.active_image_id ?? ''}" data-active-image-created="${diary.active_image_created_at ?? ''}"><p><a href="/diary">絵日記一覧へ戻る</a></p><h1>絵日記</h1><p id="diary-status"${busy ? ' class="busy"' : ''} aria-live="polite">${escapeHtml(status)}</p><p>録音日時: ${escapeHtml(diary.captured_at)}</p><audio controls preload="metadata" src="/api/v1/recordings/${diary.recording_id}/audio">このブラウザでは音声を再生できません。</audio><section><h2>NEWの単語</h2>${words}</section><label>日記文<textarea id="diary-text" maxlength="4000">${escapeHtml(diary.diary_text)}</textarea></label><p>${diaryButtons}</p>${retryMessage}<section><h2>イラスト</h2>${image}${imageCreatedMessage}<p>${imageGenerateButton}${imageDeleteButton}</p>${imageLimitMessage}</section>${replaceDialog}</main><script src="/assets/diary.js"></script></body></html>`);
+  const replaceDialog = `<dialog id="replace-dialog"><h2>画像の置き換え</h2><p>新しい画像の生成に成功した場合だけ、現在の画像を置き換えます。</p><img id="replace-thumb" class="diary-thumb" alt="現在の画像"><p id="replace-thumb-missing" hidden>現在の画像を表示できません。</p><p id="replace-created" class="page-meta"></p><p class="actions"><button type="button" id="replace-ok">置き換えを続ける</button> <button type="button" id="replace-cancel">やめる</button></p></dialog>`;
+  return c.html(
+    pageShell(
+      'Little Echoes — 絵日記',
+      'diary',
+      `<main data-diary-id="${diary.id}" data-version="${diary.version}" data-active-image="${diary.active_image_id ?? ''}" data-active-image-created="${diary.active_image_created_at ?? ''}"><h1>絵日記</h1><p id="diary-status"${busy ? ' class="busy"' : ''} aria-live="polite">${escapeHtml(status)}</p><p class="page-meta">録音日時: ${escapeHtml(diary.captured_at)}</p><audio controls preload="metadata" src="/api/v1/recordings/${diary.recording_id}/audio">このブラウザでは音声を再生できません。</audio><section><h2>NEWの単語</h2>${words}</section><label>日記文<textarea id="diary-text" maxlength="4000">${escapeHtml(diary.diary_text)}</textarea></label><p class="actions">${diaryButtons}</p>${retryMessage}<section><h2>イラスト</h2>${image}${imageCreatedMessage}<p class="actions">${imageGenerateButton}${imageDeleteButton}</p>${imageLimitMessage}</section>${replaceDialog}</main>`,
+      `<script src="/assets/diary.js"></script>`,
+    ),
+  );
 });
 
 app.get('/dictionary', async (c) => {
@@ -1482,9 +1524,9 @@ app.get('/dictionary', async (c) => {
     .all<DictionaryWordRow>();
   const list =
     words.results
-      .map((word) => `<li><a href="/dictionary/${encodeURIComponent(word.id)}">${escapeHtml(word.display_name)}</a>（${word.occurrence_count}件）</li>`)
+      .map((word) => `<li><a class="word-link" href="/dictionary/${encodeURIComponent(word.id)}">${escapeHtml(word.display_name)}<span class="count">${word.occurrence_count}件</span></a></li>`)
       .join('') || '<li>承認済みの単語はまだありません。</li>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — ことば辞典</title></head><body><main><p><a href="/">確認待ち一覧へ戻る</a></p><h1>ことば辞典</h1><ul>${list}</ul></main></body></html>`);
+  return c.html(pageShell('Little Echoes — ことば辞典', 'dictionary', `<main><h1>ことば辞典</h1><ul class="card-list">${list}</ul></main>`));
 });
 
 app.get('/dictionary/:id', async (c) => {
@@ -1511,10 +1553,16 @@ app.get('/dictionary/:id', async (c) => {
     history.results
       .map(
         (occurrence) =>
-          `<li>${isNewForDisplay(occurrence) ? '<strong>NEW</strong> ' : ''}${escapeHtml(occurrence.spoken_at)} — ${escapeHtml(occurrence.utterance_text ?? '')} <a href="/recordings/${encodeURIComponent(occurrence.recording_id)}">録音を開く</a></li>`,
+          `<li>${isNewForDisplay(occurrence) ? '<strong class="stamp">NEW</strong> ' : ''}<span class="page-meta">${escapeHtml(occurrence.spoken_at)}</span><br>${escapeHtml(occurrence.utterance_text ?? '')} <a href="/recordings/${encodeURIComponent(occurrence.recording_id)}">録音を開く</a></li>`,
       )
       .join('') || '<li>発話履歴はありません。</li>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — ${escapeHtml(word.display_name)}</title></head><body><main><p><a href="/dictionary">ことば辞典へ戻る</a></p><h1>${escapeHtml(word.display_name)}</h1><p>記録回数: ${word.occurrence_count}</p><h2>発話履歴</h2><ul>${list}</ul></main></body></html>`);
+  return c.html(
+    pageShell(
+      `Little Echoes — ${escapeHtml(word.display_name)}`,
+      'dictionary',
+      `<main><h1>${escapeHtml(word.display_name)}</h1><p class="page-meta">記録回数: ${word.occurrence_count}回</p><h2>発話履歴</h2><ul class="card-list">${list}</ul></main>`,
+    ),
+  );
 });
 
 app.get('/recordings/:id', async (c) => {
@@ -1576,15 +1624,23 @@ app.get('/recordings/:id', async (c) => {
     ? `<p id="retry-reason">${escapeHtml(retryReason)}</p>${canRetry ? '<button type="button" id="retry-analysis">自動解析を再試行</button>' : ''}`
     : '';
   const editor = editable
-    ? `<h2>確認・承認</h2><p id="save-status" aria-live="polite"></p>${retryButton}<form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcriptText ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><button type="button" data-action="save">下書きを保存</button><button type="button" data-action="approve">承認する</button></form>`
+    ? `<h2>確認・承認</h2><p id="save-status" aria-live="polite"></p>${retryButton}<form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcriptText ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><p class="actions"><button type="button" data-action="save">下書きを保存</button><button type="button" data-action="approve">承認する</button></p></form>`
     : '<p>処理中は編集・承認できません。状態は自動的に更新されます。</p>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 録音</title></head><body><main data-recording-id="${recording.id}"><p><a href="/">確認待ち一覧へ戻る</a> · <a href="/diary">絵日記</a> · <a href="/dictionary">ことば辞典</a></p><h1>録音の確認</h1><p><strong>状態:</strong> ${escapeHtml(recording.analysis_status)}</p><p id="processing-status">${status}</p><p><strong>録音日時:</strong> ${escapeHtml(recording.captured_at)} (${escapeHtml(recording.captured_timezone)})</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p>${escapeHtml(transcriptText ?? 'まだありません。')}</p><h2>単語候補</h2><ul>${candidateList}</ul>${editor}</main><script src="/assets/review-detail.js"></script><script src="/assets/review-remove.js"></script></body></html>`);
+  const statusView = analysisStatusView(recording.analysis_status);
+  return c.html(
+    pageShell(
+      'Little Echoes — 録音',
+      'review',
+      `<main data-recording-id="${recording.id}"><h1>録音の確認</h1><p class="status-line"><span class="chip ${statusView.chip}">${statusView.label}</span></p><p id="processing-status">${status}</p><p class="page-meta">録音日時: ${escapeHtml(recording.captured_at)}（${escapeHtml(recording.captured_timezone)}）</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p class="transcript">${escapeHtml(transcriptText ?? 'まだありません。')}</p><h2>単語候補</h2><ul class="plain-list">${candidateList}</ul>${editor}</main>`,
+      `<script src="/assets/review-detail.js"></script><script src="/assets/review-remove.js"></script>`,
+    ),
+  );
 });
 
 app.get('/assets/review.js', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  const script = `fetch('/api/v1/review-queue').then(r=>{if(!r.ok)throw new Error('request failed');return r.json()}).then(data=>{const list=document.getElementById('recordings');document.getElementById('status').textContent=data.items.length?'確認待ちの録音です。':'確認待ちの録音はありません。';for(const item of data.items){const recording=item.recording;if(!/^rec_[a-z0-9]{32}$/.test(recording.recording_id))continue;const li=document.createElement('li');const link=document.createElement('a');link.href='/recordings/'+encodeURIComponent(recording.recording_id);link.textContent=recording.captured_at+' — '+recording.analysis_status;li.append(link);list.append(li)}const failed=data.failed_deletions||[];for(const target of failed){if(!/^rec_[a-z0-9]{32}$/.test(target.recording_id))continue;const li=document.createElement('li');li.textContent='削除に失敗した録音（'+target.captured_at+'）: ';const button=document.createElement('button');button.type='button';button.textContent='削除を再試行';button.addEventListener('click',()=>{button.disabled=true;fetch('/api/v1/recordings/'+encodeURIComponent(target.recording_id),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:target.version})}).then(r=>{if(!r.ok)throw new Error('delete failed');location.reload()}).catch(()=>{button.disabled=false;document.getElementById('status').textContent='削除の再試行に失敗しました。時間をおいて再度お試しください。'})});li.append(button);list.append(li)}}).catch(()=>{document.getElementById('status').textContent='読み込みに失敗しました。再読み込みしてください。'});`;
+  const script = `fetch('/api/v1/review-queue').then(r=>{if(!r.ok)throw new Error('request failed');return r.json()}).then(data=>{const list=document.getElementById('recordings');document.getElementById('status').textContent=data.items.length?'確認待ちの録音です。':'確認待ちの録音はありません。';for(const item of data.items){const recording=item.recording;if(!/^rec_[a-z0-9]{32}$/.test(recording.recording_id))continue;const li=document.createElement('li');const link=document.createElement('a');link.href='/recordings/'+encodeURIComponent(recording.recording_id);link.textContent=recording.captured_at+' — '+({ready:'確認待ち',partial:'一部のみ自動取得',failed:'自動解析に失敗',transcribing:'文字起こし中',extracting_words:'ことば抽出中',pending:'受付済み'}[recording.analysis_status]||recording.analysis_status);li.append(link);list.append(li)}const failed=data.failed_deletions||[];for(const target of failed){if(!/^rec_[a-z0-9]{32}$/.test(target.recording_id))continue;const li=document.createElement('li');li.textContent='削除に失敗した録音（'+target.captured_at+'）: ';const button=document.createElement('button');button.type='button';button.textContent='削除を再試行';button.addEventListener('click',()=>{button.disabled=true;fetch('/api/v1/recordings/'+encodeURIComponent(target.recording_id),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:target.version})}).then(r=>{if(!r.ok)throw new Error('delete failed');location.reload()}).catch(()=>{button.disabled=false;document.getElementById('status').textContent='削除の再試行に失敗しました。時間をおいて再度お試しください。'})});li.append(button);list.append(li)}}).catch(()=>{document.getElementById('status').textContent='読み込みに失敗しました。再読み込みしてください。'});`;
   return new Response(script, {
     headers: {
       'Content-Type': 'application/javascript; charset=utf-8',
@@ -1615,7 +1671,72 @@ app.get('/assets/review-detail.js', async (c) => {
 
 app.get('/assets/diary.css', async (c) => {
   const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
-  const stylesheet = `@keyframes spin{to{transform:rotate(360deg)}}.busy::before{content:"";display:inline-block;width:1em;height:1em;margin-right:.5em;border:.18em solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-.15em;animation:spin .8s linear infinite}.busy[data-stage="2"]::before{animation-duration:.6s;border-width:.24em}.busy[data-stage="3"]::before{animation-duration:.45s;border-width:.3em}.busy[data-stage="4"]::before{animation-duration:.3s;border-width:.36em}.diary-image{max-width:100%;height:auto}.diary-thumb{max-width:12rem;height:auto;display:block}#replace-dialog{max-width:22rem}@media(prefers-reduced-motion:reduce){.busy::before{animation:none}}`;
+  const stylesheet = [
+    // トークン: 紙・墨・クレヨン青・朱(スタンプ)。方眼はごく薄い青
+    ':root{color-scheme:light;--paper:#F7F4EC;--card:#FFFDF8;--ink:#35312B;--muted:#7C766A;--line:#E1DCCE;--grid:rgba(70,110,150,.10);--crayon:#3B6FA0;--crayon-deep:#2F5A84;--stamp:#C2402F}',
+    '*{box-sizing:border-box}',
+    'body{margin:0;padding:0 .9rem 3rem;background:var(--paper);color:var(--ink);font-family:"Hiragino Maru Gothic ProN","BIZ UDPGothic","Yu Gothic UI","Yu Gothic",system-ui,sans-serif;line-height:1.65;overflow-wrap:anywhere}',
+    '.masthead{max-width:42rem;margin:0 auto;padding:1rem .2rem .6rem;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .9rem}',
+    '.brand{font-weight:700;letter-spacing:.04em;font-size:1.05rem;color:var(--crayon-deep);text-decoration:none}',
+    '.site-nav{display:flex;gap:.4rem;margin-left:auto}',
+    '.site-nav a{padding:.3rem .8rem;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none;font-size:.88rem}',
+    '.site-nav a[aria-current="page"]{background:var(--crayon);border-color:var(--crayon);color:#fff}',
+    // 方眼ノート紙面: 白カード上に24px方眼を敷き、入力欄・カードの白がその上に載る
+    'main{max-width:42rem;margin:0 auto;padding:1.3rem 1.1rem 2rem;background-color:var(--card);background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:24px 24px;border:1px solid var(--line);border-radius:14px}',
+    'h1{font-size:1.3rem;letter-spacing:.06em;margin:.2rem 0 1rem;padding-bottom:.35rem;border-bottom:3px double var(--crayon)}',
+    'h2{font-size:1.02rem;letter-spacing:.04em;margin:1.6rem 0 .5rem}',
+    'h3{font-size:.95rem;margin:1.2rem 0 .4rem}',
+    'a{color:var(--crayon)}',
+    'img{max-width:100%}',
+    'audio{width:100%;margin:.4rem 0}',
+    '.page-meta{color:var(--muted);font-size:.9rem;margin:.2rem 0}',
+    '#status,#diary-status,#save-status,#processing-status,#retry-reason{font-size:.95rem}',
+    '.status-line{margin:.3rem 0}',
+    '.chip{display:inline-block;padding:.1rem .75rem;border-radius:999px;font-size:.85rem;border:1px solid}',
+    '.chip-ok{color:var(--crayon-deep);border-color:var(--crayon);background:#EFF4F9}',
+    '.chip-quiet{color:var(--muted);border-color:var(--line);background:#fff}',
+    '.chip-alert{color:var(--stamp);border-color:var(--stamp);background:#FAEEEC}',
+    // NEWことばスタンプ: 二重丸+朱色+わずかな傾きで、先生のはんこを模す
+    '.stamp{display:inline-grid;place-items:center;min-width:2.3em;height:2.3em;margin-right:.45em;border:2px solid var(--stamp);border-radius:50%;box-shadow:inset 0 0 0 2px #fff,inset 0 0 0 3px var(--stamp);color:var(--stamp);font-size:.68rem;font-weight:700;letter-spacing:.03em;transform:rotate(-8deg);background:#FBF1EF}',
+    '.stamp-list{list-style:none;padding:0;margin:.4rem 0;display:flex;flex-wrap:wrap;gap:.5rem 1rem}',
+    '.stamp-list li{display:flex;align-items:center}',
+    '#recordings,#diaries,.card-list{list-style:none;margin:.8rem 0 0;padding:0;display:grid;gap:.6rem}',
+    '#recordings li,#diaries li,.card-list li{background:#fff;border:1px solid var(--line);border-radius:10px;padding:.85rem 1rem;box-shadow:0 1px 0 rgba(53,49,43,.05)}',
+    '#recordings li>a,#diaries li>a{display:block;margin:-.85rem -1rem;padding:.85rem 1rem;color:var(--ink);text-decoration:none}',
+    '#recordings li>a:hover,#diaries li>a:hover{color:var(--crayon-deep)}',
+    '.word-link{display:flex;justify-content:space-between;align-items:baseline;gap:.6rem;margin:-.85rem -1rem;padding:.85rem 1rem;color:var(--ink);text-decoration:none;font-weight:700}',
+    '.word-link:hover{color:var(--crayon-deep)}',
+    '.count{color:var(--muted);font-size:.85rem;font-weight:400}',
+    '.plain-list{margin:.4rem 0;padding-left:1.3rem}',
+    '.transcript{background:#fff;border:1px solid var(--line);border-radius:10px;padding:.8rem 1rem;min-height:2.5rem}',
+    'label{display:block;margin:.9rem 0;font-size:.9rem;font-weight:700}',
+    'input,textarea,select{font:inherit;font-weight:400;width:100%;margin-top:.3rem;padding:.55rem .7rem;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}',
+    'textarea{min-height:6rem;resize:vertical}',
+    'fieldset[data-review-word]{border:1px solid var(--line);border-radius:10px;background:#fff;margin:.7rem 0;padding:.2rem .9rem .9rem}',
+    'fieldset[data-review-word] label{margin:.55rem 0 0}',
+    'button{font:inherit;font-size:.92rem;font-weight:700;padding:.5rem 1.1rem;border-radius:10px;border:1px solid var(--crayon);background:#fff;color:var(--crayon-deep);cursor:pointer;min-height:2.5rem}',
+    'button:hover{background:#EFF4F9}',
+    'button:disabled{opacity:.45;cursor:default}',
+    '[data-action="approve"],[data-action="save-diary"]{background:var(--crayon);border-color:var(--crayon);color:#fff}',
+    '[data-action="approve"]:hover,[data-action="save-diary"]:hover{background:var(--crayon-deep)}',
+    '[data-action="delete-image"],[data-remove-word]{border-color:var(--stamp);color:var(--stamp)}',
+    '[data-action="delete-image"]:hover,[data-remove-word]:hover{background:#FAEEEC}',
+    '[data-remove-word]{margin-top:.7rem;font-size:.85rem;padding:.35rem .8rem;min-height:0}',
+    '.actions{display:flex;flex-wrap:wrap;gap:.6rem;margin:.9rem 0}',
+    'a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--crayon);outline-offset:2px}',
+    'dialog{border:1px solid var(--line);border-radius:14px;padding:1.2rem;box-shadow:0 12px 32px rgba(53,49,43,.18)}',
+    'dialog::backdrop{background:rgba(53,49,43,.35)}',
+    '#replace-dialog{max-width:22rem}',
+    '#replace-dialog h2{margin-top:0}',
+    '@keyframes spin{to{transform:rotate(360deg)}}',
+    '.busy::before{content:"";display:inline-block;width:1em;height:1em;margin-right:.5em;border:.18em solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-.15em;animation:spin .8s linear infinite}',
+    '.busy[data-stage="2"]::before{animation-duration:.6s;border-width:.24em}',
+    '.busy[data-stage="3"]::before{animation-duration:.45s;border-width:.3em}',
+    '.busy[data-stage="4"]::before{animation-duration:.3s;border-width:.36em}',
+    '.diary-image{max-width:100%;height:auto;border:1px solid var(--line);border-radius:10px;background:#fff;padding:6px}',
+    '.diary-thumb{max-width:12rem;height:auto;display:block}',
+    '@media(prefers-reduced-motion:reduce){.busy::before{animation:none}}',
+  ].join('');
   return new Response(stylesheet, { headers: { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
 });
 
