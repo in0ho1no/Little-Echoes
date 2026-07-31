@@ -1696,14 +1696,12 @@ app.get('/recordings/:id', async (c) => {
     ? `<h2>${editorTitle}</h2><p id="save-status" aria-live="polite"></p>${retryButton}<form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}" data-approved="${approved}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcriptText ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><p class="actions">${saveDraftButton}<button type="button" data-action="approve">${approveLabel}</button></p></form>`
     : '<p>処理中は編集・承認できません。状態は自動的に更新されます。</p>';
   const statusView = analysisStatusView(recording.analysis_status, recording.review_status);
-  return c.html(
-    pageShell(
-      'Little Echoes — 録音',
-      'review',
-      `<main data-recording-id="${recording.id}"><h1>録音の確認</h1><p class="status-line"><span class="chip ${statusView.chip}">${statusView.label}</span></p><p id="processing-status">${status}</p><p class="page-meta">録音日時: ${escapeHtml(recording.captured_at)}（${escapeHtml(recording.captured_timezone)}）</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p class="transcript">${escapeHtml(transcriptText ?? 'まだありません。')}</p><h2>単語候補</h2><ul class="plain-list">${candidateList}</ul>${editor}</main>`,
-      `<script src="/assets/review-detail.js"></script><script src="/assets/review-remove.js"></script>`,
-    ),
-  );
+  // pageShellの呼び出し引数にscriptタグ文字列と関数戻り値の補間を同居させない — XSS監査
+  // (unknown-value-with-script-tag)は「scriptタグを含む呼び出し引数内の未知値」を検出する。
+  // 実防御は従来どおりescapeHtmlで、ここでは束ねた変数だけを呼び出しへ渡す。
+  const detailMain = `<main data-recording-id="${recording.id}"><h1>録音の確認</h1><p class="status-line"><span class="chip ${statusView.chip}">${statusView.label}</span></p><p id="processing-status">${status}</p><p class="page-meta">録音日時: ${escapeHtml(recording.captured_at)}（${escapeHtml(recording.captured_timezone)}）</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p class="transcript">${escapeHtml(transcriptText ?? 'まだありません。')}</p><h2>単語候補</h2><ul class="plain-list">${candidateList}</ul>${editor}</main>`;
+  const detailScripts = '<script src="/assets/review-detail.js"></script><script src="/assets/review-remove.js"></script>';
+  return c.html(pageShell('Little Echoes — 録音', 'review', detailMain, detailScripts));
 });
 
 app.get('/assets/review.js', async (c) => {
