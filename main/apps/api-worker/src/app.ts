@@ -7,7 +7,17 @@ import { reserveDeleteJob } from './delete';
 import { reconcileGenerationDispatch } from './diary';
 import { dispatchImageCleanup } from './image-cleanup';
 import { CORRELATION_ID_HEADER, errorBody, newCorrelationId } from './errors';
-import { ANALYSIS_STALE_MILLISECONDS, isDemoWriteAllowed, normalizeUtcRfc3339, retentionDeleteAfter, UPLOAD_RESERVED_STALE_MILLISECONDS } from './limits';
+import {
+  ANALYSIS_STALE_MILLISECONDS,
+  isDemoWriteAllowed,
+  MAX_IMAGE_GENERATIONS_PER_RECORDING,
+  MAX_IMAGE_GENERATIONS_PER_UTC_DAY,
+  MAX_NON_IMAGE_AI_REQUESTS_PER_UTC_DAY,
+  normalizeUtcRfc3339,
+  retentionDeleteAfter,
+  UPLOAD_RESERVED_STALE_MILLISECONDS,
+  utcDay,
+} from './limits';
 import { approveReview, isVersionConflictAbort, saveReview, type ReviewInput, type ReviewTarget } from './review';
 import type { DeviceIdentity, Env, ManagementIdentity } from './types';
 import { validateCanonicalWav, WavValidationError } from './wav';
@@ -215,6 +225,26 @@ function escapeHtml(value: string | null | undefined): string {
   const escaped = html`${value ?? ''}`;
   if (escaped instanceof Promise) throw new TypeError('文字列のHTMLエスケープが同期完了しませんでした。');
   return escaped.toString();
+}
+
+type NavKey = 'review' | 'diary' | 'dictionary';
+
+// 全管理画面で同じ head・ヘッダーを共有する。スタイルは CSP(default-src 'self')の
+// 制約下でインラインを使えないため、既存許可経路の /assets/diary.css だけから読み込む。
+function pageShell(title: string, activeNav: NavKey, main: string, scripts = ''): string {
+  const nav = (key: NavKey, href: string, label: string): string =>
+    `<a href="${href}"${key === activeNav ? ' aria-current="page"' : ''}>${label}</a>`;
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><link rel="stylesheet" href="/assets/diary.css"></head><body><header class="masthead"><a class="brand" href="/">Little Echoes</a><nav class="site-nav" aria-label="主要ページ">${nav('review', '/', '確認待ち')}${nav('diary', '/diary', '絵日記')}${nav('dictionary', '/dictionary', 'ことば辞典')}</nav></header>${main}${scripts}</body></html>`;
+}
+
+function analysisStatusView(status: string, reviewStatus: string): { label: string; chip: string } {
+  if (reviewStatus === 'approved') return { label: '承認済み', chip: 'chip-ok' };
+  if (status === 'ready') return { label: '確認待ち', chip: 'chip-ok' };
+  if (status === 'partial') return { label: '一部のみ自動取得', chip: 'chip-quiet' };
+  if (status === 'failed') return { label: '自動解析に失敗', chip: 'chip-alert' };
+  if (status === 'transcribing') return { label: '文字起こし中', chip: 'chip-quiet' };
+  if (status === 'extracting_words') return { label: 'ことば抽出中', chip: 'chip-quiet' };
+  return { label: '受付済み', chip: 'chip-quiet' };
 }
 
 async function deviceIdentity(c: { req: { raw: Request }; env: Env; get: (key: 'correlationId') => string; json: (body: unknown, status: 401) => Response }): Promise<DeviceIdentity | Response> {
@@ -980,6 +1010,46 @@ interface DiaryRow {
   active_image_created_at: string | null;
 }
 
+interface GenerationUsageCounter {
+  used: number;
+  limit: number;
+  remaining: number;
+}
+
+interface GenerationUsage {
+  text_daily: GenerationUsageCounter;
+  image_daily: GenerationUsageCounter;
+  image_recording: GenerationUsageCounter;
+  manual_diary_regeneration_used: boolean;
+}
+
+async function generationUsage(env: Env, recordingId: string): Promise<GenerationUsage> {
+  const day = utcDay();
+  const [counters, manualRegeneration] = await Promise.all([
+    env.DB.prepare(
+      `SELECT counter_key, used_count FROM usage_counters
+        WHERE (counter_key = ? AND usage_day = ?)
+           OR (counter_key = ? AND usage_day = ?)
+           OR (counter_key = ? AND usage_day = 'lifetime')`,
+    )
+      .bind('demo-global:openai_non_image', day, 'demo-global:image_generation', day, `recording:${recordingId}:image`)
+      .all<{ counter_key: string; used_count: number }>(),
+    env.DB.prepare(
+      `SELECT 1 AS used FROM async_jobs WHERE recording_id = ? AND job_type = 'diary' AND manual_retry = 1 LIMIT 1`,
+    )
+      .bind(recordingId)
+      .first<{ used: number }>(),
+  ]);
+  const usedCount = (counterKey: string): number => counters.results.find((counter) => counter.counter_key === counterKey)?.used_count ?? 0;
+  const counter = (used: number, limit: number): GenerationUsageCounter => ({ used, limit, remaining: Math.max(0, limit - used) });
+  return {
+    text_daily: counter(usedCount('demo-global:openai_non_image'), MAX_NON_IMAGE_AI_REQUESTS_PER_UTC_DAY),
+    image_daily: counter(usedCount('demo-global:image_generation'), MAX_IMAGE_GENERATIONS_PER_UTC_DAY),
+    image_recording: counter(usedCount(`recording:${recordingId}:image`), MAX_IMAGE_GENERATIONS_PER_RECORDING),
+    manual_diary_regeneration_used: Boolean(manualRegeneration),
+  };
+}
+
 async function diaryResponse(env: Env, row: DiaryRow, correlationId: string): Promise<Record<string, unknown>> {
   const words = await env.DB.prepare(
     `SELECT wo.surface FROM word_occurrences wo WHERE wo.recording_id = ? AND wo.household_id = ? AND (wo.new_override = 'force_new' OR (wo.new_override = 'auto' AND wo.is_first = 1)) ORDER BY wo.surface`,
@@ -990,6 +1060,11 @@ async function diaryResponse(env: Env, row: DiaryRow, correlationId: string): Pr
     image_endpoint: row.active_image_id ? `/api/v1/diary/${row.id}/image` : null,
     version: row.version, last_error_code: row.last_generation_error, correlation_id: correlationId,
   };
+}
+
+async function diaryDetailResponse(env: Env, row: DiaryRow, correlationId: string): Promise<Record<string, unknown>> {
+  const [diary, usage] = await Promise.all([diaryResponse(env, row, correlationId), generationUsage(env, row.recording_id)]);
+  return { ...diary, generation_usage: usage };
 }
 
 async function findDiary(env: Env, householdId: string, id: string): Promise<DiaryRow | null> {
@@ -1080,16 +1155,16 @@ export async function ensureMissingInitialDiaryJobs(env: Env, limit = 10): Promi
 }
 
 async function generationQuota(env: Env, diary: DiaryRow, kind: 'diary' | 'image'): Promise<'available' | 'daily' | 'lifetime'> {
-  const day = new Date().toISOString().slice(0, 10);
+  const day = utcDay();
   const counter = await env.DB.prepare(
     `SELECT used_count FROM usage_counters WHERE counter_key = ? AND usage_day = ?`,
   ).bind(kind === 'diary' ? 'demo-global:openai_non_image' : 'demo-global:image_generation', day).first<{ used_count: number }>();
-  if ((counter?.used_count ?? 0) >= (kind === 'diary' ? 100 : 20)) return 'daily';
+  if ((counter?.used_count ?? 0) >= (kind === 'diary' ? MAX_NON_IMAGE_AI_REQUESTS_PER_UTC_DAY : MAX_IMAGE_GENERATIONS_PER_UTC_DAY)) return 'daily';
   if (kind === 'image') {
     const lifetime = await env.DB.prepare(
       `SELECT used_count FROM usage_counters WHERE counter_key = ? AND usage_day = 'lifetime'`,
     ).bind(`recording:${diary.recording_id}:image`).first<{ used_count: number }>();
-    if ((lifetime?.used_count ?? 0) >= 5) return 'lifetime';
+    if ((lifetime?.used_count ?? 0) >= MAX_IMAGE_GENERATIONS_PER_RECORDING) return 'lifetime';
   }
   return 'available';
 }
@@ -1116,7 +1191,7 @@ app.get('/api/v1/diary/:id', async (c) => {
     await reconcileGenerationDispatch(c.env, 1, diary.recording_id, identity.householdId);
     diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
   }
-  return diary ? c.json(await diaryResponse(c.env, diary, c.get('correlationId'))) : responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
+  return diary ? c.json(await diaryDetailResponse(c.env, diary, c.get('correlationId'))) : responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
 });
 
 app.patch('/api/v1/diary/:id', async (c) => {
@@ -1150,7 +1225,7 @@ app.patch('/api/v1/diary/:id', async (c) => {
     return responseError(c, 500, 'INTERNAL_ERROR', '日記を保存できません。', true, '時間をおいて再試行してください。');
   }
   const diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
-  return diary ? c.json(await diaryResponse(c.env, diary, c.get('correlationId'))) : responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '日記状態を取得できません。', true);
+  return diary ? c.json(await diaryDetailResponse(c.env, diary, c.get('correlationId'))) : responseError(c, 500, 'RECORDING_STATE_UNAVAILABLE', '日記状態を取得できません。', true);
 });
 
 app.post('/api/v1/diary/:id/regenerate', async (c) => {
@@ -1430,12 +1505,26 @@ app.get('/api/v1/review-queue', async (c) => {
 app.get('/', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes</title></head><body><main><h1>Little Echoes</h1><p><a href="/diary">絵日記</a> · <a href="/dictionary">ことば辞典</a></p><p id="status">確認待ちの録音を読み込んでいます。</p><ul id="recordings"></ul></main><script src="/assets/review.js"></script></body></html>`);
+  return c.html(
+    pageShell(
+      'Little Echoes',
+      'review',
+      `<main><h1>確認待ちの録音</h1><p id="status" aria-live="polite">確認待ちの録音を読み込んでいます。</p><ul id="recordings"></ul></main>`,
+      `<script src="/assets/review.js"></script>`,
+    ),
+  );
 });
 
 app.get('/diary', async (c) => {
   const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 絵日記</title><link rel="stylesheet" href="/assets/diary.css"></head><body><main><p><a href="/">確認待ち一覧へ戻る</a></p><h1>絵日記</h1><p id="diary-status" aria-live="polite">絵日記を読み込んでいます。</p><ul id="diaries"></ul></main><script src="/assets/diary.js"></script></body></html>`);
+  return c.html(
+    pageShell(
+      'Little Echoes — 絵日記',
+      'diary',
+      `<main><h1>絵日記</h1><p id="diary-status" aria-live="polite">絵日記を読み込んでいます。</p><ul id="diaries"></ul></main>`,
+      `<script src="/assets/diary.js"></script>`,
+    ),
+  );
 });
 
 app.get('/diary/:id', async (c) => {
@@ -1445,30 +1534,42 @@ app.get('/diary/:id', async (c) => {
   await reconcileGenerationDispatch(c.env, 1, diary.recording_id, identity.householdId);
   diary = await findDiary(c.env, identity.householdId, c.req.param('id'));
   if (!diary) return responseError(c, 404, 'NOT_FOUND', '対象の日記は見つかりません。');
-  const newWords = await c.env.DB.prepare(
-    `SELECT wo.surface FROM word_occurrences wo JOIN dictionary_words dw ON dw.id = wo.dictionary_word_id AND dw.household_id = wo.household_id
-      WHERE wo.recording_id = ? AND wo.household_id = ? AND (wo.new_override = 'force_new' OR (wo.new_override = 'auto' AND wo.is_first = 1)) ORDER BY dw.normalized`,
-  ).bind(diary.recording_id, identity.householdId).all<{ surface: string }>();
-  const words = newWords.results.length ? `<ul>${newWords.results.map((word) => `<li>NEW: ${escapeHtml(word.surface)}</li>`).join('')}</ul>` : '<p>NEWの単語はありません。</p>';
-  const image = diary.active_image_id ? `<img class="diary-image" src="/api/v1/diary/${diary.id}/image" alt="生成した絵日記イラスト">` : '<p>画像はまだありません。</p>';
-  const manualRetry = await c.env.DB.prepare(
-    `SELECT 1 AS used FROM async_jobs WHERE recording_id = ? AND job_type = 'diary' AND manual_retry = 1 LIMIT 1`,
-  ).bind(diary.recording_id).first<{ used: number }>();
+  const [newWords, usage] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT wo.surface FROM word_occurrences wo JOIN dictionary_words dw ON dw.id = wo.dictionary_word_id AND dw.household_id = wo.household_id
+        WHERE wo.recording_id = ? AND wo.household_id = ? AND (wo.new_override = 'force_new' OR (wo.new_override = 'auto' AND wo.is_first = 1)) ORDER BY dw.normalized`,
+    ).bind(diary.recording_id, identity.householdId).all<{ surface: string }>(),
+    generationUsage(c.env, diary.recording_id),
+  ]);
+  const words = newWords.results.length
+    ? `<ul class="stamp-list">${newWords.results.map((word) => `<li><span class="stamp">NEW</span>${escapeHtml(word.surface)}</li>`).join('')}</ul>`
+    : '<p class="page-meta">NEWの単語はありません。</p>';
+  const image = diary.active_image_id ? `<img class="diary-image" src="/api/v1/diary/${diary.id}/image" alt="生成した絵日記イラスト">` : '<p class="page-meta">画像はまだありません。</p>';
   const busy = diary.diary_status === 'generating' || diary.image_status === 'generating';
   const writesEnabled = isDemoWriteAllowed(c.env.DEMO_WRITE_ENABLED);
+  const textDailyAvailable = usage.text_daily.remaining > 0;
+  const imageAvailable = usage.image_daily.remaining > 0 && usage.image_recording.remaining > 0 && diary.image_status !== 'limit_reached';
   const diaryButtons = writesEnabled && !busy
-    ? `<button type="button" data-action="save-diary">手動で保存</button>${manualRetry ? '' : '<button type="button" data-action="regenerate-diary">日記文を生成</button>'}`
+    ? `<button type="button" data-action="save-diary">手動で保存</button>${usage.manual_diary_regeneration_used ? '' : `<button type="button" data-action="regenerate-diary"${textDailyAvailable ? '' : ' disabled aria-describedby="quota-summary"'}>日記文を生成</button>`}`
     : '';
-  const imageGenerateButton = writesEnabled && !busy && diary.image_status !== 'limit_reached'
-    ? `<button type="button" data-action="generate-image">${diary.active_image_id ? '画像を再生成' : '画像を生成'}</button>`
+  const imageGenerateButton = writesEnabled && !busy
+    ? `<button type="button" data-action="generate-image"${imageAvailable ? '' : ' disabled aria-describedby="quota-summary"'}>${diary.active_image_id ? '画像を再生成' : '画像を生成'}</button>`
     : '';
   const imageDeleteButton = diary.active_image_id && !busy ? '<button type="button" data-action="delete-image">画像を削除</button>' : '';
-  const retryMessage = manualRetry ? '<p>日記文の再生成は使用済みです。必要な場合は手動で編集してください。</p>' : '';
+  const retryMessage = usage.manual_diary_regeneration_used ? '<p>日記文の再生成は使用済みです。必要な場合は手動で編集してください。</p>' : '';
   const imageLimitMessage = diary.image_status === 'limit_reached' ? '<p>この録音の画像生成上限に達しました。保存済み画像は引き続き表示できます。</p>' : '';
-  const imageCreatedMessage = diary.active_image_created_at ? `<p>現在の画像の作成日時: ${escapeHtml(diary.active_image_created_at)}</p>` : '';
+  const imageCreatedMessage = diary.active_image_created_at ? `<p class="page-meta">現在の画像の作成日時: ${escapeHtml(diary.active_image_created_at)}</p>` : '';
+  const quotaSummary = `<section class="quota-card" aria-labelledby="quota-title"><h2 id="quota-title">生成できる回数</h2><ul id="quota-summary" class="plain-list"><li><strong>この録音の画像:</strong> 残り ${usage.image_recording.remaining}/${usage.image_recording.limit}回</li><li><strong>本日の画像:</strong> 残り ${usage.image_daily.remaining}/${usage.image_daily.limit}回</li><li><strong>本日のテキスト系AI:</strong> 残り ${usage.text_daily.remaining}/${usage.text_daily.limit}回</li></ul><p class="page-meta">本日の回数はUTC日単位です。テキスト系AIには文字起こし・単語抽出・日記文生成が含まれます。</p></section>`;
   const status = busy ? '生成中です。少し待つと更新されます。' : diary.last_generation_error ? '生成に失敗しました。手動入力または再試行できます。' : '';
-  const replaceDialog = `<dialog id="replace-dialog"><h2>画像の置き換え</h2><p>新しい画像の生成に成功した場合だけ、現在の画像を置き換えます。</p><img id="replace-thumb" class="diary-thumb" alt="現在の画像"><p id="replace-thumb-missing" hidden>現在の画像を表示できません。</p><p id="replace-created"></p><p><button type="button" id="replace-ok">置き換えを続ける</button> <button type="button" id="replace-cancel">やめる</button></p></dialog>`;
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 絵日記</title><link rel="stylesheet" href="/assets/diary.css"></head><body><main data-diary-id="${diary.id}" data-version="${diary.version}" data-active-image="${diary.active_image_id ?? ''}" data-active-image-created="${diary.active_image_created_at ?? ''}"><p><a href="/diary">絵日記一覧へ戻る</a></p><h1>絵日記</h1><p id="diary-status"${busy ? ' class="busy"' : ''} aria-live="polite">${escapeHtml(status)}</p><p>録音日時: ${escapeHtml(diary.captured_at)}</p><audio controls preload="metadata" src="/api/v1/recordings/${diary.recording_id}/audio">このブラウザでは音声を再生できません。</audio><section><h2>NEWの単語</h2>${words}</section><label>日記文<textarea id="diary-text" maxlength="4000">${escapeHtml(diary.diary_text)}</textarea></label><p>${diaryButtons}</p>${retryMessage}<section><h2>イラスト</h2>${image}${imageCreatedMessage}<p>${imageGenerateButton}${imageDeleteButton}</p>${imageLimitMessage}</section>${replaceDialog}</main><script src="/assets/diary.js"></script></body></html>`);
+  const replaceDialog = `<dialog id="replace-dialog" aria-labelledby="replace-dialog-title"><h2 id="replace-dialog-title">画像の置き換え</h2><p>新しい画像の生成に成功した場合だけ、現在の画像を置き換えます。</p><p id="replace-quota"><strong>この録音の残り生成回数 ${usage.image_recording.remaining}/${usage.image_recording.limit}回</strong><br>本日の画像生成は残り ${usage.image_daily.remaining}/${usage.image_daily.limit}回です。</p><img id="replace-thumb" class="diary-thumb" alt="現在の画像"><p id="replace-thumb-missing" hidden>現在の画像を表示できません。</p><p id="replace-created" class="page-meta"></p><p class="actions"><button type="button" id="replace-ok">置き換えを続ける</button> <button type="button" id="replace-cancel">やめる</button></p></dialog>`;
+  return c.html(
+    pageShell(
+      'Little Echoes — 絵日記',
+      'diary',
+      `<main data-diary-id="${escapeHtml(diary.id)}" data-version="${diary.version}" data-active-image="${escapeHtml(diary.active_image_id)}" data-active-image-created="${escapeHtml(diary.active_image_created_at)}" data-image-recording-remaining="${usage.image_recording.remaining}" data-image-recording-limit="${usage.image_recording.limit}" data-image-daily-remaining="${usage.image_daily.remaining}" data-image-daily-limit="${usage.image_daily.limit}"><h1>絵日記</h1><p id="diary-status"${busy ? ' class="busy"' : ''} aria-live="polite">${escapeHtml(status)}</p><p class="page-meta">録音日時: ${escapeHtml(diary.captured_at)}</p>${quotaSummary}<audio controls preload="metadata" src="/api/v1/recordings/${escapeHtml(diary.recording_id)}/audio">このブラウザでは音声を再生できません。</audio><section><h2>NEWの単語</h2>${words}</section><label>日記文<textarea id="diary-text" maxlength="4000">${escapeHtml(diary.diary_text)}</textarea></label><p class="actions">${diaryButtons}</p>${retryMessage}<section><h2>イラスト</h2>${image}${imageCreatedMessage}<p class="actions">${imageGenerateButton}${imageDeleteButton}</p>${imageLimitMessage}</section>${replaceDialog}</main>`,
+      `<script src="/assets/diary.js"></script>`,
+    ),
+  );
 });
 
 app.get('/dictionary', async (c) => {
@@ -1482,9 +1583,9 @@ app.get('/dictionary', async (c) => {
     .all<DictionaryWordRow>();
   const list =
     words.results
-      .map((word) => `<li><a href="/dictionary/${encodeURIComponent(word.id)}">${escapeHtml(word.display_name)}</a>（${word.occurrence_count}件）</li>`)
+      .map((word) => `<li><a class="word-link" href="/dictionary/${encodeURIComponent(word.id)}">${escapeHtml(word.display_name)}<span class="count">${word.occurrence_count}件</span></a></li>`)
       .join('') || '<li>承認済みの単語はまだありません。</li>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — ことば辞典</title></head><body><main><p><a href="/">確認待ち一覧へ戻る</a></p><h1>ことば辞典</h1><ul>${list}</ul></main></body></html>`);
+  return c.html(pageShell('Little Echoes — ことば辞典', 'dictionary', `<main><h1>ことば辞典</h1><ul class="card-list">${list}</ul></main>`));
 });
 
 app.get('/dictionary/:id', async (c) => {
@@ -1511,10 +1612,16 @@ app.get('/dictionary/:id', async (c) => {
     history.results
       .map(
         (occurrence) =>
-          `<li>${isNewForDisplay(occurrence) ? '<strong>NEW</strong> ' : ''}${escapeHtml(occurrence.spoken_at)} — ${escapeHtml(occurrence.utterance_text ?? '')} <a href="/recordings/${encodeURIComponent(occurrence.recording_id)}">録音を開く</a></li>`,
+          `<li>${isNewForDisplay(occurrence) ? '<strong class="stamp">NEW</strong> ' : ''}<span class="page-meta">${escapeHtml(occurrence.spoken_at)}</span><br>${escapeHtml(occurrence.utterance_text ?? '')} <a href="/recordings/${encodeURIComponent(occurrence.recording_id)}">録音を開く</a></li>`,
       )
       .join('') || '<li>発話履歴はありません。</li>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — ${escapeHtml(word.display_name)}</title></head><body><main><p><a href="/dictionary">ことば辞典へ戻る</a></p><h1>${escapeHtml(word.display_name)}</h1><p>記録回数: ${word.occurrence_count}</p><h2>発話履歴</h2><ul>${list}</ul></main></body></html>`);
+  return c.html(
+    pageShell(
+      `Little Echoes — ${escapeHtml(word.display_name)}`,
+      'dictionary',
+      `<main><h1>${escapeHtml(word.display_name)}</h1><p class="page-meta">記録回数: ${word.occurrence_count}回</p><h2>発話履歴</h2><ul class="card-list">${list}</ul></main>`,
+    ),
+  );
 });
 
 app.get('/recordings/:id', async (c) => {
@@ -1562,7 +1669,13 @@ app.get('/recordings/:id', async (c) => {
     else retryReason = '再解析を利用できません。手動で内容を補完してください。';
     retryReason = `${analysisReason} ${retryReason}`;
   }
-  const status = ['ready', 'partial'].includes(recording.analysis_status) ? '確認待ちです。内容を確認・補完してください。' : recording.analysis_status === 'failed' ? '処理に失敗しました。手動入力または再試行が必要です。' : '処理中です。少し待つと自動で更新されます。';
+  const status = recording.review_status === 'approved'
+    ? '承認済みです。必要に応じて内容を編集できます。'
+    : ['ready', 'partial'].includes(recording.analysis_status)
+      ? '確認待ちです。内容を確認・補完してください。'
+      : recording.analysis_status === 'failed'
+        ? '処理に失敗しました。手動入力または再試行が必要です。'
+        : '処理中です。少し待つと自動で更新されます。';
   const candidateList = editableWords.results.map((candidate) => `<li>${escapeHtml(candidate.surface)}（${escapeHtml(candidate.normalized)}）</li>`).join('') || '<li>候補はまだありません。</li>';
   const editable = ['ready', 'partial', 'failed'].includes(recording.analysis_status);
   const wordControls =
@@ -1575,16 +1688,28 @@ app.get('/recordings/:id', async (c) => {
   const retryButton = retryReason
     ? `<p id="retry-reason">${escapeHtml(retryReason)}</p>${canRetry ? '<button type="button" id="retry-analysis">自動解析を再試行</button>' : ''}`
     : '';
+  const approved = recording.review_status === 'approved';
+  const editorTitle = approved ? '承認内容の編集' : '確認・承認';
+  const saveDraftButton = approved ? '' : '<button type="button" data-action="save">下書きを保存</button>';
+  const approveLabel = approved ? '変更を保存' : '承認する';
   const editor = editable
-    ? `<h2>確認・承認</h2><p id="save-status" aria-live="polite"></p>${retryButton}<form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcriptText ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><button type="button" data-action="save">下書きを保存</button><button type="button" data-action="approve">承認する</button></form>`
+    ? `<h2>${editorTitle}</h2><p id="save-status" aria-live="polite"></p>${retryButton}<form id="review-form" data-recording-id="${recording.id}" data-version="${recording.version}" data-approved="${approved}"><label>文字起こし<textarea name="reviewed_text" maxlength="2000">${escapeHtml(transcriptText ?? '')}</textarea></label><h3>単語とNEW表示</h3><div id="word-inputs">${wordControls}</div><label>単語を追加（1行につき 表記|よみ）<textarea name="additional_words" maxlength="6030"></textarea></label><label>録音日時（UTC）<input name="captured_at" value="${escapeHtml(recording.captured_at)}" maxlength="24" required></label><label>タイムゾーン<input name="captured_timezone" value="${escapeHtml(recording.captured_timezone)}" maxlength="64" required></label><label>場面<textarea name="scene" maxlength="300">${escapeHtml(recording.draft_scene)}</textarea></label><label>親メモ<textarea name="parent_note" maxlength="2000">${escapeHtml(recording.draft_parent_note)}</textarea></label><p class="actions">${saveDraftButton}<button type="button" data-action="approve">${approveLabel}</button></p></form>`
     : '<p>処理中は編集・承認できません。状態は自動的に更新されます。</p>';
-  return c.html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Little Echoes — 録音</title></head><body><main data-recording-id="${recording.id}"><p><a href="/">確認待ち一覧へ戻る</a> · <a href="/diary">絵日記</a> · <a href="/dictionary">ことば辞典</a></p><h1>録音の確認</h1><p><strong>状態:</strong> ${escapeHtml(recording.analysis_status)}</p><p id="processing-status">${status}</p><p><strong>録音日時:</strong> ${escapeHtml(recording.captured_at)} (${escapeHtml(recording.captured_timezone)})</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p>${escapeHtml(transcriptText ?? 'まだありません。')}</p><h2>単語候補</h2><ul>${candidateList}</ul>${editor}</main><script src="/assets/review-detail.js"></script><script src="/assets/review-remove.js"></script></body></html>`);
+  const statusView = analysisStatusView(recording.analysis_status, recording.review_status);
+  return c.html(
+    pageShell(
+      'Little Echoes — 録音',
+      'review',
+      `<main data-recording-id="${recording.id}"><h1>録音の確認</h1><p class="status-line"><span class="chip ${statusView.chip}">${statusView.label}</span></p><p id="processing-status">${status}</p><p class="page-meta">録音日時: ${escapeHtml(recording.captured_at)}（${escapeHtml(recording.captured_timezone)}）</p><audio controls preload="metadata" src="/api/v1/recordings/${recording.id}/audio">このブラウザでは音声を再生できません。</audio><h2>文字起こし</h2><p class="transcript">${escapeHtml(transcriptText ?? 'まだありません。')}</p><h2>単語候補</h2><ul class="plain-list">${candidateList}</ul>${editor}</main>`,
+      `<script src="/assets/review-detail.js"></script><script src="/assets/review-remove.js"></script>`,
+    ),
+  );
 });
 
 app.get('/assets/review.js', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  const script = `fetch('/api/v1/review-queue').then(r=>{if(!r.ok)throw new Error('request failed');return r.json()}).then(data=>{const list=document.getElementById('recordings');document.getElementById('status').textContent=data.items.length?'確認待ちの録音です。':'確認待ちの録音はありません。';for(const item of data.items){const recording=item.recording;if(!/^rec_[a-z0-9]{32}$/.test(recording.recording_id))continue;const li=document.createElement('li');const link=document.createElement('a');link.href='/recordings/'+encodeURIComponent(recording.recording_id);link.textContent=recording.captured_at+' — '+recording.analysis_status;li.append(link);list.append(li)}const failed=data.failed_deletions||[];for(const target of failed){if(!/^rec_[a-z0-9]{32}$/.test(target.recording_id))continue;const li=document.createElement('li');li.textContent='削除に失敗した録音（'+target.captured_at+'）: ';const button=document.createElement('button');button.type='button';button.textContent='削除を再試行';button.addEventListener('click',()=>{button.disabled=true;fetch('/api/v1/recordings/'+encodeURIComponent(target.recording_id),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:target.version})}).then(r=>{if(!r.ok)throw new Error('delete failed');location.reload()}).catch(()=>{button.disabled=false;document.getElementById('status').textContent='削除の再試行に失敗しました。時間をおいて再度お試しください。'})});li.append(button);list.append(li)}}).catch(()=>{document.getElementById('status').textContent='読み込みに失敗しました。再読み込みしてください。'});`;
+  const script = `fetch('/api/v1/review-queue').then(r=>{if(!r.ok)throw new Error('request failed');return r.json()}).then(data=>{const list=document.getElementById('recordings');document.getElementById('status').textContent=data.items.length?'確認待ちの録音です。':'確認待ちの録音はありません。';for(const item of data.items){const recording=item.recording;if(!/^rec_[a-z0-9]{32}$/.test(recording.recording_id))continue;const li=document.createElement('li');const link=document.createElement('a');link.href='/recordings/'+encodeURIComponent(recording.recording_id);link.textContent=recording.captured_at+' — '+({ready:'確認待ち',partial:'一部のみ自動取得',failed:'自動解析に失敗',transcribing:'文字起こし中',extracting_words:'ことば抽出中',pending:'受付済み'}[recording.analysis_status]||recording.analysis_status);li.append(link);list.append(li)}const failed=data.failed_deletions||[];for(const target of failed){if(!/^rec_[a-z0-9]{32}$/.test(target.recording_id))continue;const li=document.createElement('li');li.textContent='削除に失敗した録音（'+target.captured_at+'）: ';const button=document.createElement('button');button.type='button';button.textContent='削除を再試行';button.addEventListener('click',()=>{button.disabled=true;fetch('/api/v1/recordings/'+encodeURIComponent(target.recording_id),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:target.version})}).then(r=>{if(!r.ok)throw new Error('delete failed');location.reload()}).catch(()=>{button.disabled=false;document.getElementById('status').textContent='削除の再試行に失敗しました。時間をおいて再度お試しください。'})});li.append(button);list.append(li)}}).catch(()=>{document.getElementById('status').textContent='読み込みに失敗しました。再読み込みしてください。'});`;
   return new Response(script, {
     headers: {
       'Content-Type': 'application/javascript; charset=utf-8',
@@ -1600,7 +1725,7 @@ app.get('/assets/review.js', async (c) => {
 app.get('/assets/review-detail.js', async (c) => {
   const identity = await managementIdentity(c);
   if (isResponse(identity)) return identity;
-  const script = `(()=>{const form=document.getElementById('review-form');if(!form){const page=document.querySelector('main[data-recording-id]');if(!page||!/^rec_[a-z0-9]{32}$/.test(page.dataset.recordingId||''))return;let remaining=180;const stalled=()=>{const el=document.getElementById('processing-status');if(el)el.textContent='更新が停止しました。ページを再読み込みしてください。'};const poll=()=>{if(remaining--<=0){stalled();return}fetch('/api/v1/recordings/'+encodeURIComponent(page.dataset.recordingId)).then(response=>{if(!response.ok)throw new Error('status failed');return response.json()}).then(data=>{if(['ready','partial','failed'].includes(data.analysis_status)){location.reload();return}setTimeout(poll,5000)}).catch(()=>setTimeout(poll,10000))};setTimeout(poll,5000);return}const status=document.getElementById('save-status');const field=name=>form.elements.namedItem(name);const buttons=form.querySelectorAll('button');const retry=document.getElementById('retry-analysis');const submit=async action=>{const words=[];for(const row of form.querySelectorAll('[data-review-word]')){const display=row.querySelector('[data-word-display]').value.trim();const normalized=row.querySelector('[data-word-normalized]').value.trim();const override=row.querySelector('[data-word-override]').value;if(!display||!normalized){status.textContent='候補の表記とよみを入力してください。';return}words.push({display_name:display,normalized,new_override:override})}const lines=String(field('additional_words').value).split('\\n').map(line=>line.trim()).filter(Boolean);for(const line of lines){const parts=line.split('|');if(parts.length!==2||!parts[0].trim()||!parts[1].trim()){status.textContent='追加単語は「表記|よみ」の形式で入力してください。';return}words.push({display_name:parts[0].trim(),normalized:parts[1].trim(),new_override:'auto'})}if(words.length>30||new Set(words.map(word=>word.normalized.normalize('NFKC').trim().toLocaleLowerCase('ja-JP'))).size!==words.length){status.textContent='単語は30件以内で、同じよみを重複登録できません。';return}const body={version:Number(form.dataset.version),reviewed_text:String(field('reviewed_text').value),words,captured_at:String(field('captured_at').value),captured_timezone:String(field('captured_timezone').value),scene:String(field('scene').value),parent_note:String(field('parent_note').value)};buttons.forEach(button=>button.disabled=true);status.textContent=action==='approve'?'承認を保存しています。':'下書きを保存しています。';try{const response=await fetch('/api/v1/recordings/'+encodeURIComponent(form.dataset.recordingId)+'/'+(action==='approve'?'approve':'review'),{method:action==='approve'?'POST':'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok){const error=await response.json().catch(()=>null);throw new Error(error&&error.message?error.message:'保存に失敗しました。')}status.textContent=action==='approve'?'承認しました。':'下書きを保存しました。';location.reload()}catch(error){status.textContent=error instanceof Error?error.message:'保存に失敗しました。'}finally{buttons.forEach(button=>button.disabled=false)}};if(retry)retry.addEventListener('click',()=>{retry.disabled=true;status.textContent='自動解析を再試行しています。';fetch('/api/v1/recordings/'+encodeURIComponent(form.dataset.recordingId)+'/retry-analysis',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:Number(form.dataset.version)})}).then(async response=>{if(!response.ok){const error=await response.json().catch(()=>null);throw new Error(error&&error.message?error.message:'再試行を開始できませんでした。')}location.reload()}).catch(error=>{status.textContent=error instanceof Error?error.message:'再試行を開始できませんでした。';retry.disabled=false})});form.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;if(action==='save'||action==='approve'){event.preventDefault();void submit(action)}})})();`;
+  const script = `(()=>{const form=document.getElementById('review-form');if(!form){const page=document.querySelector('main[data-recording-id]');if(!page||!/^rec_[a-z0-9]{32}$/.test(page.dataset.recordingId||''))return;let remaining=180;const stalled=()=>{const el=document.getElementById('processing-status');if(el)el.textContent='更新が停止しました。ページを再読み込みしてください。'};const poll=()=>{if(remaining--<=0){stalled();return}fetch('/api/v1/recordings/'+encodeURIComponent(page.dataset.recordingId)).then(response=>{if(!response.ok)throw new Error('status failed');return response.json()}).then(data=>{if(['ready','partial','failed'].includes(data.analysis_status)){location.reload();return}setTimeout(poll,5000)}).catch(()=>setTimeout(poll,10000))};setTimeout(poll,5000);return}const status=document.getElementById('save-status');const field=name=>form.elements.namedItem(name);const buttons=form.querySelectorAll('button');const retry=document.getElementById('retry-analysis');const approved=form.dataset.approved==='true';const submit=async action=>{const words=[];for(const row of form.querySelectorAll('[data-review-word]')){const display=row.querySelector('[data-word-display]').value.trim();const normalized=row.querySelector('[data-word-normalized]').value.trim();const override=row.querySelector('[data-word-override]').value;if(!display||!normalized){status.textContent='候補の表記とよみを入力してください。';return}words.push({display_name:display,normalized,new_override:override})}const lines=String(field('additional_words').value).split('\\n').map(line=>line.trim()).filter(Boolean);for(const line of lines){const parts=line.split('|');if(parts.length!==2||!parts[0].trim()||!parts[1].trim()){status.textContent='追加単語は「表記|よみ」の形式で入力してください。';return}words.push({display_name:parts[0].trim(),normalized:parts[1].trim(),new_override:'auto'})}if(words.length>30||new Set(words.map(word=>word.normalized.normalize('NFKC').trim().toLocaleLowerCase('ja-JP'))).size!==words.length){status.textContent='単語は30件以内で、同じよみを重複登録できません。';return}const body={version:Number(form.dataset.version),reviewed_text:String(field('reviewed_text').value),words,captured_at:String(field('captured_at').value),captured_timezone:String(field('captured_timezone').value),scene:String(field('scene').value),parent_note:String(field('parent_note').value)};buttons.forEach(button=>button.disabled=true);status.textContent=action==='approve'?(approved?'変更を保存しています。':'承認を保存しています。'):'下書きを保存しています。';try{const response=await fetch('/api/v1/recordings/'+encodeURIComponent(form.dataset.recordingId)+'/'+(action==='approve'?'approve':'review'),{method:action==='approve'?'POST':'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok){const error=await response.json().catch(()=>null);throw new Error(error&&error.message?error.message:'保存に失敗しました。')}status.textContent=action==='approve'?(approved?'変更を保存しました。':'承認しました。'):'下書きを保存しました。';location.reload()}catch(error){status.textContent=error instanceof Error?error.message:'保存に失敗しました。'}finally{buttons.forEach(button=>button.disabled=false)}};if(retry)retry.addEventListener('click',()=>{retry.disabled=true;status.textContent='自動解析を再試行しています。';fetch('/api/v1/recordings/'+encodeURIComponent(form.dataset.recordingId)+'/retry-analysis',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:Number(form.dataset.version)})}).then(async response=>{if(!response.ok){const error=await response.json().catch(()=>null);throw new Error(error&&error.message?error.message:'再試行を開始できませんでした。')}location.reload()}).catch(error=>{status.textContent=error instanceof Error?error.message:'再試行を開始できませんでした。';retry.disabled=false})});form.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;if(action==='save'||action==='approve'){event.preventDefault();void submit(action)}})})();`;
   return new Response(script, {
     headers: {
       'Content-Type': 'application/javascript; charset=utf-8',
@@ -1615,13 +1740,161 @@ app.get('/assets/review-detail.js', async (c) => {
 
 app.get('/assets/diary.css', async (c) => {
   const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
-  const stylesheet = `@keyframes spin{to{transform:rotate(360deg)}}.busy::before{content:"";display:inline-block;width:1em;height:1em;margin-right:.5em;border:.18em solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-.15em;animation:spin .8s linear infinite}.busy[data-stage="2"]::before{animation-duration:.6s;border-width:.24em}.busy[data-stage="3"]::before{animation-duration:.45s;border-width:.3em}.busy[data-stage="4"]::before{animation-duration:.3s;border-width:.36em}.diary-image{max-width:100%;height:auto}.diary-thumb{max-width:12rem;height:auto;display:block}#replace-dialog{max-width:22rem}@media(prefers-reduced-motion:reduce){.busy::before{animation:none}}`;
+  const stylesheet = [
+    // トークン: 紙・墨・クレヨン青・朱(スタンプ)。方眼はごく薄い青
+    ':root{color-scheme:light;--paper:#F7F4EC;--card:#FFFDF8;--ink:#35312B;--muted:#756F64;--line:#E1DCCE;--grid:rgba(70,110,150,.10);--crayon:#3B6FA0;--crayon-deep:#2F5A84;--stamp:#C2402F}',
+    '*{box-sizing:border-box}',
+    'body{margin:0;padding:0 .9rem 3rem;background:var(--paper);color:var(--ink);font-family:"Hiragino Maru Gothic ProN","BIZ UDPGothic","Yu Gothic UI","Yu Gothic",system-ui,sans-serif;line-height:1.65;overflow-wrap:anywhere}',
+    '.masthead{max-width:42rem;margin:0 auto;padding:1rem .2rem .6rem;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .9rem}',
+    '.brand{font-weight:700;letter-spacing:.04em;font-size:1.05rem;color:var(--crayon-deep);text-decoration:none}',
+    '.site-nav{display:flex;gap:.4rem;margin-left:auto}',
+    '.site-nav a{padding:.3rem .8rem;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none;font-size:.88rem}',
+    '.site-nav a[aria-current="page"]{background:var(--crayon);border-color:var(--crayon);color:#fff}',
+    // 方眼ノート紙面: 白カード上に24px方眼を敷き、入力欄・カードの白がその上に載る
+    'main{max-width:42rem;margin:0 auto;padding:1.3rem 1.1rem 2rem;background-color:var(--card);background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:24px 24px;border:1px solid var(--line);border-radius:14px}',
+    'h1{font-size:1.3rem;letter-spacing:.06em;margin:.2rem 0 1rem;padding-bottom:.35rem;border-bottom:3px double var(--crayon)}',
+    'h2{font-size:1.02rem;letter-spacing:.04em;margin:1.6rem 0 .5rem}',
+    'h3{font-size:.95rem;margin:1.2rem 0 .4rem}',
+    'a{color:var(--crayon)}',
+    'img{max-width:100%}',
+    'audio{width:100%;margin:.4rem 0}',
+    '.page-meta{color:var(--muted);font-size:.9rem;margin:.2rem 0}',
+    '#status,#diary-status,#save-status,#processing-status,#retry-reason{font-size:.95rem}',
+    '.status-line{margin:.3rem 0}',
+    '.chip{display:inline-block;padding:.1rem .75rem;border-radius:999px;font-size:.85rem;border:1px solid}',
+    '.chip-ok{color:var(--crayon-deep);border-color:var(--crayon);background:#EFF4F9}',
+    '.chip-quiet{color:var(--muted);border-color:var(--line);background:#fff}',
+    '.chip-alert{color:var(--stamp);border-color:var(--stamp);background:#FAEEEC}',
+    // NEWことばスタンプ: 二重丸+朱色+わずかな傾きで、先生のはんこを模す
+    '.stamp{display:inline-grid;place-items:center;min-width:2.3em;height:2.3em;margin-right:.45em;border:2px solid var(--stamp);border-radius:50%;box-shadow:inset 0 0 0 2px #fff,inset 0 0 0 3px var(--stamp);color:var(--stamp);font-size:.68rem;font-weight:700;letter-spacing:.03em;transform:rotate(-8deg);background:#FBF1EF}',
+    '.stamp-list{list-style:none;padding:0;margin:.4rem 0;display:flex;flex-wrap:wrap;gap:.5rem 1rem}',
+    '.stamp-list li{display:flex;align-items:center}',
+    '#recordings,#diaries,.card-list{list-style:none;margin:.8rem 0 0;padding:0;display:grid;gap:.6rem}',
+    '#recordings li,#diaries li,.card-list li{background:#fff;border:1px solid var(--line);border-radius:10px;padding:.85rem 1rem;box-shadow:0 1px 0 rgba(53,49,43,.05)}',
+    '#recordings li>a,#diaries li>a{display:block;margin:-.85rem -1rem;padding:.85rem 1rem;color:var(--ink);text-decoration:none}',
+    '#recordings li>a:hover,#diaries li>a:hover{color:var(--crayon-deep)}',
+    '.word-link{display:flex;justify-content:space-between;align-items:baseline;gap:.6rem;margin:-.85rem -1rem;padding:.85rem 1rem;color:var(--ink);text-decoration:none;font-weight:700}',
+    '.word-link:hover{color:var(--crayon-deep)}',
+    '.count{color:var(--muted);font-size:.85rem;font-weight:400}',
+    '.plain-list{margin:.4rem 0;padding-left:1.3rem}',
+    '.transcript{background:#fff;border:1px solid var(--line);border-radius:10px;padding:.8rem 1rem;min-height:2.5rem}',
+    '.quota-card{margin:1rem 0;padding:.75rem .9rem;background:#fff;border:1px solid var(--line);border-radius:10px}',
+    '.quota-card h2{margin-top:0}',
+    '.quota-card .plain-list{margin-bottom:.35rem}',
+    'label{display:block;margin:.9rem 0;font-size:.9rem;font-weight:700}',
+    'input,textarea,select{font:inherit;font-weight:400;width:100%;margin-top:.3rem;padding:.55rem .7rem;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}',
+    'textarea{min-height:6rem;resize:vertical}',
+    'fieldset[data-review-word]{border:1px solid var(--line);border-radius:10px;background:#fff;margin:.7rem 0;padding:.2rem .9rem .9rem}',
+    'fieldset[data-review-word] label{margin:.55rem 0 0}',
+    'button{font:inherit;font-size:.92rem;font-weight:700;padding:.5rem 1.1rem;border-radius:10px;border:1px solid var(--crayon);background:#fff;color:var(--crayon-deep);cursor:pointer;min-height:2.5rem}',
+    'button:hover{background:#EFF4F9}',
+    'button:disabled{opacity:.45;cursor:default}',
+    '[data-action="approve"],[data-action="save-diary"]{background:var(--crayon);border-color:var(--crayon);color:#fff}',
+    '[data-action="approve"]:hover,[data-action="save-diary"]:hover{background:var(--crayon-deep)}',
+    '[data-action="delete-image"],[data-remove-word]{border-color:var(--stamp);color:var(--stamp)}',
+    '[data-action="delete-image"]:hover,[data-remove-word]:hover{background:#FAEEEC}',
+    '[data-remove-word]{margin-top:.7rem;font-size:.85rem;padding:.35rem .8rem;min-height:0}',
+    '.actions{display:flex;flex-wrap:wrap;gap:.6rem;margin:.9rem 0}',
+    'a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--crayon);outline-offset:2px}',
+    'dialog{border:1px solid var(--line);border-radius:14px;padding:1.2rem;box-shadow:0 12px 32px rgba(53,49,43,.18)}',
+    'dialog::backdrop{background:rgba(53,49,43,.35)}',
+    '#replace-dialog{max-width:22rem}',
+    '#replace-dialog h2{margin-top:0}',
+    '@keyframes spin{to{transform:rotate(360deg)}}',
+    '.busy::before{content:"";display:inline-block;width:1em;height:1em;margin-right:.5em;border:.18em solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-.15em;animation:spin .8s linear infinite}',
+    '.busy[data-stage="2"]::before{animation-duration:.6s;border-width:.24em}',
+    '.busy[data-stage="3"]::before{animation-duration:.45s;border-width:.3em}',
+    '.busy[data-stage="4"]::before{animation-duration:.3s;border-width:.36em}',
+    '.diary-image{max-width:100%;height:auto;border:1px solid var(--line);border-radius:10px;background:#fff;padding:6px}',
+    '.diary-thumb{max-width:12rem;height:auto;display:block}',
+    '@media(max-width:360px){body{padding:0 .45rem 2rem}.masthead{padding:.7rem 0 .45rem}.site-nav{width:100%;margin-left:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.25rem}.site-nav a{padding:.35rem .2rem;text-align:center;font-size:.78rem}main{padding:1rem .75rem 1.5rem;border-radius:10px}.actions>button{flex:1 1 8rem}dialog{width:calc(100% - 1rem);margin:auto}}',
+    '@media(prefers-reduced-motion:reduce){.busy::before{animation:none}}',
+  ].join('');
   return new Response(stylesheet, { headers: { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
 });
 
 app.get('/assets/diary.js', async (c) => {
   const identity = await managementIdentity(c); if (isResponse(identity)) return identity;
-  const script = `(()=>{const status=document.getElementById('diary-status');const page=document.querySelector('main[data-diary-id]');const fail=async r=>{const e=await r.json().catch(()=>null);throw new Error(e&&e.message?e.message:'操作に失敗しました。')};if(!page){fetch('/api/v1/diary').then(r=>r.ok?r.json():fail(r)).then(data=>{const list=document.getElementById('diaries');status.textContent=data.items.length?'絵日記です。':'承認済みの絵日記はまだありません。';for(const diary of data.items){const li=document.createElement('li'),a=document.createElement('a');a.href='/diary/'+encodeURIComponent(diary.diary_id);a.textContent=diary.captured_at+' — '+(diary.diary_text||({'generating':'生成中','failed':'生成失敗','not_started':'未作成'}[diary.status]||'日記'));li.append(a);list.append(li)}}).catch(e=>status.textContent=e.message);return}const id=page.dataset.diaryId,version=()=>Number(page.dataset.version),post=async(path,method,body)=>{status.textContent='⏳ 処理を受け付けています…';const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)await fail(r);location.reload()};let elapsed=0;const showProgress=()=>{const stage=Math.min(4,1+Math.floor(elapsed/30));status.classList.add('busy');status.dataset.stage=String(stage);status.textContent='生成中です（経過 '+elapsed+'秒・段階 '+stage+'/4）。少し待つと更新されます。'};let remaining=180;const poll=()=>{if(remaining--<=0){status.classList.remove('busy');status.removeAttribute('data-stage');status.textContent='更新が停止しました。ページを再読み込みしてください。';return}fetch('/api/v1/diary/'+encodeURIComponent(id)).then(r=>r.ok?r.json():null).then(data=>{if(data&&(data.status==='generating'||data.image_status==='generating')){elapsed+=5;showProgress();setTimeout(poll,5000)}else if(data)location.reload();else setTimeout(poll,10000)}).catch(()=>{elapsed+=10;showProgress();setTimeout(poll,10000)})};if(status.classList.contains('busy')){showProgress();setTimeout(poll,5000)}const dialog=document.getElementById('replace-dialog');const openReplaceDialog=(active,created,target)=>{const thumb=document.getElementById('replace-thumb');const missing=document.getElementById('replace-thumb-missing');missing.hidden=true;thumb.hidden=false;thumb.onerror=()=>{thumb.hidden=true;missing.hidden=false};document.getElementById('replace-created').textContent='作成日時: '+(created||'不明');document.getElementById('replace-ok').onclick=()=>{dialog.close();void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',{version:version(),confirmed:true,replace_image_id:active}).catch(e=>{status.textContent=e.message;target.disabled=false})};document.getElementById('replace-cancel').onclick=()=>{dialog.close();target.disabled=false};dialog.oncancel=()=>{target.disabled=false};thumb.src='/api/v1/diary/'+encodeURIComponent(id)+'/image';dialog.showModal()};page.addEventListener('click',event=>{const target=event.target;if(!(target instanceof HTMLButtonElement))return;const action=target.dataset.action;if(!action)return;target.disabled=true;if(action==='save-diary')void post('/api/v1/diary/'+encodeURIComponent(id),'PATCH',{version:version(),diary_text:String(document.getElementById('diary-text').value)}).catch(e=>{status.textContent=e.message;target.disabled=false});if(action==='regenerate-diary')void post('/api/v1/diary/'+encodeURIComponent(id)+'/regenerate','POST',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false});if(action==='generate-image'){const active=page.dataset.activeImage;if(active){openReplaceDialog(active,page.dataset.activeImageCreated,target);return}if(!confirm('新しい画像を生成します。生成回数の上限を消費します。続けますか？')){target.disabled=false;return}void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',{version:version(),confirmed:true}).catch(e=>{status.textContent=e.message;target.disabled=false})}if(action==='delete-image'){if(!confirm('現在の画像を削除しますか？')){target.disabled=false;return}void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','DELETE',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false})}})})();`;
+  const script = `(()=>{
+    const status=document.getElementById('diary-status');
+    const page=document.querySelector('main[data-diary-id]');
+    const fail=async r=>{const e=await r.json().catch(()=>null);throw new Error(e&&e.message?e.message:'操作に失敗しました。')};
+    if(!page){
+      fetch('/api/v1/diary').then(r=>r.ok?r.json():fail(r)).then(data=>{
+        const list=document.getElementById('diaries');
+        status.textContent=data.items.length?'絵日記です。':'承認済みの絵日記はまだありません。';
+        for(const diary of data.items){
+          const li=document.createElement('li'),a=document.createElement('a');
+          a.href='/diary/'+encodeURIComponent(diary.diary_id);
+          a.textContent=diary.captured_at+' — '+(diary.diary_text||({'generating':'生成中','failed':'生成失敗','not_started':'未作成'}[diary.status]||'日記'));
+          li.append(a);list.append(li);
+        }
+      }).catch(e=>status.textContent=e.message);
+      return;
+    }
+    const id=page.dataset.diaryId;
+    const version=()=>Number(page.dataset.version);
+    const imageQuotaMessage=()=>
+      'この録音の残り生成回数 '+page.dataset.imageRecordingRemaining+'/'+page.dataset.imageRecordingLimit+'回。\\n'+
+      '本日の画像生成は残り '+page.dataset.imageDailyRemaining+'/'+page.dataset.imageDailyLimit+'回です。';
+    const post=async(path,method,body)=>{
+      status.textContent='⏳ 処理を受け付けています…';
+      const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      if(!r.ok)await fail(r);
+      location.reload();
+    };
+    let elapsed=0;
+    const showProgress=()=>{
+      const stage=Math.min(4,1+Math.floor(elapsed/30));
+      status.classList.add('busy');status.dataset.stage=String(stage);
+      status.textContent='生成中です（経過 '+elapsed+'秒・段階 '+stage+'/4）。少し待つと更新されます。';
+    };
+    let remaining=180;
+    const poll=()=>{
+      if(remaining--<=0){status.classList.remove('busy');status.removeAttribute('data-stage');status.textContent='更新が停止しました。ページを再読み込みしてください。';return}
+      fetch('/api/v1/diary/'+encodeURIComponent(id)).then(r=>r.ok?r.json():null).then(data=>{
+        if(data&&(data.status==='generating'||data.image_status==='generating')){elapsed+=5;showProgress();setTimeout(poll,5000)}
+        else if(data)location.reload();
+        else setTimeout(poll,10000);
+      }).catch(()=>{elapsed+=10;showProgress();setTimeout(poll,10000)});
+    };
+    if(status.classList.contains('busy')){showProgress();setTimeout(poll,5000)}
+    const dialog=document.getElementById('replace-dialog');
+    const openReplaceDialog=(active,created,target)=>{
+      const thumb=document.getElementById('replace-thumb');
+      const missing=document.getElementById('replace-thumb-missing');
+      missing.hidden=true;thumb.hidden=false;
+      thumb.onerror=()=>{thumb.hidden=true;missing.hidden=false};
+      document.getElementById('replace-created').textContent='作成日時: '+(created||'不明');
+      document.getElementById('replace-ok').onclick=()=>{
+        dialog.close();
+        void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',{version:version(),confirmed:true,replace_image_id:active}).catch(e=>{status.textContent=e.message;target.disabled=false});
+      };
+      document.getElementById('replace-cancel').onclick=()=>{dialog.close();target.disabled=false};
+      dialog.oncancel=()=>{target.disabled=false};
+      thumb.src='/api/v1/diary/'+encodeURIComponent(id)+'/image';
+      dialog.showModal();
+    };
+    page.addEventListener('click',event=>{
+      const target=event.target;
+      if(!(target instanceof HTMLButtonElement))return;
+      const action=target.dataset.action;
+      if(!action)return;
+      target.disabled=true;
+      if(action==='save-diary')void post('/api/v1/diary/'+encodeURIComponent(id),'PATCH',{version:version(),diary_text:String(document.getElementById('diary-text').value)}).catch(e=>{status.textContent=e.message;target.disabled=false});
+      if(action==='regenerate-diary')void post('/api/v1/diary/'+encodeURIComponent(id)+'/regenerate','POST',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false});
+      if(action==='generate-image'){
+        const active=page.dataset.activeImage;
+        if(active){openReplaceDialog(active,page.dataset.activeImageCreated,target);return}
+        if(!confirm('新しい画像を生成します。\\n'+imageQuotaMessage()+'\\n生成すると1回消費します。続けますか？')){target.disabled=false;return}
+        void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','POST',{version:version(),confirmed:true}).catch(e=>{status.textContent=e.message;target.disabled=false});
+      }
+      if(action==='delete-image'){
+        if(!confirm('現在の画像を削除しますか？')){target.disabled=false;return}
+        void post('/api/v1/diary/'+encodeURIComponent(id)+'/image','DELETE',{version:version()}).catch(e=>{status.textContent=e.message;target.disabled=false});
+      }
+    });
+  })();`;
   return new Response(script, { headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', [CORRELATION_ID_HEADER]: c.get('correlationId') } });
 });
 
