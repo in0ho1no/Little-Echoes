@@ -56,6 +56,12 @@
 - コミットログには Why
 - コードコメントには Why not
 
+## セキュリティスキャンのローカル検証
+
+- `develop` / `main` へpushする前に、CIのSecurity Scanをローカルで再現して確認する: `./docker/security-scan-local.ps1`
+- WSL(Ubuntu)上のDockerで、CIと同じ固定バージョンイメージ（`docker/semgrep/`・`docker/gitleaks/`）を使い、semgrep（`p/default`）、Markdown平文HTTPリンク、gitleaks（全履歴）を検査する
+- いずれかの検出で終了コードが非0になる。レポート`semgrep-results.json` / `gitleaks-results.json`はgitignore済みでコミットしない
+
 ## Fable5などのフロンティアモデル利用時の注意
 
 ### 出力の簡潔さ

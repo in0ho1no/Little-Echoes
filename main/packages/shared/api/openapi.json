@@ -341,7 +341,7 @@
         "security": [{"accessJwt": []}],
         "parameters": [{"$ref": "#/components/parameters/DiaryId"}],
         "responses": {
-          "200": {"$ref": "#/components/responses/Diary"},
+          "200": {"$ref": "#/components/responses/DiaryDetail"},
           "401": {"$ref": "#/components/responses/Error"},
           "404": {"$ref": "#/components/responses/Error"}
         }
@@ -370,7 +370,7 @@
         },
         "responses": {
           "200": {
-            "$ref": "#/components/responses/Diary"
+            "$ref": "#/components/responses/DiaryDetail"
           },
           "401": {"$ref": "#/components/responses/Error"},
           "403": {"$ref": "#/components/responses/Error"},
@@ -714,6 +714,16 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/Diary"
+            }
+          }
+        }
+      },
+      "DiaryDetail": {
+        "description": "Management diary entry with current generation usage",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/DiaryDetail"
             }
           }
         }
@@ -1250,6 +1260,68 @@
             "type": "string",
             "pattern": "^corr_[A-Za-z0-9_-]+$"
           }
+        }
+      },
+      "GenerationUsageCounter": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["used", "limit", "remaining"],
+        "properties": {
+          "used": {"type": "integer", "minimum": 0},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+          "remaining": {"type": "integer", "minimum": 0, "maximum": 100}
+        }
+      },
+      "GenerationUsage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text_daily", "image_daily", "image_recording", "manual_diary_regeneration_used"],
+        "properties": {
+          "text_daily": {"$ref": "#/components/schemas/GenerationUsageCounter"},
+          "image_daily": {"$ref": "#/components/schemas/GenerationUsageCounter"},
+          "image_recording": {"$ref": "#/components/schemas/GenerationUsageCounter"},
+          "manual_diary_regeneration_used": {"type": "boolean"}
+        }
+      },
+      "DiaryDetail": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "diary_id",
+          "recording_id",
+          "status",
+          "image_status",
+          "captured_at",
+          "new_words",
+          "audio_endpoint",
+          "version",
+          "correlation_id",
+          "generation_usage"
+        ],
+        "properties": {
+          "diary_id": {
+            "type": "string",
+            "pattern": "^diary_[A-Za-z0-9_-]+$"
+          },
+          "recording_id": {
+            "type": "string",
+            "pattern": "^rec_[A-Za-z0-9_-]+$"
+          },
+          "status": {
+            "enum": ["not_started", "generating", "ready", "failed"]
+          },
+          "captured_at": {"type": "string", "format": "date-time"},
+          "new_words": {"type": "array", "maxItems": 30, "items": {"type": "string", "minLength": 1, "maxLength": 100}},
+          "audio_endpoint": {"type": "string", "pattern": "^/api/v1/recordings/rec_[A-Za-z0-9_-]+/audio$"},
+          "scene": {"type": ["string", "null"], "maxLength": 300},
+          "diary_text": {"type": ["string", "null"], "maxLength": 4000},
+          "active_image_id": {"type": ["string", "null"], "pattern": "^image_[A-Za-z0-9_-]+$"},
+          "image_status": {"enum": ["not_requested", "generating", "ready", "failed", "limit_reached"]},
+          "image_endpoint": {"type": ["string", "null"], "pattern": "^/api/v1/diary/diary_[A-Za-z0-9_-]+/image$"},
+          "last_error_code": {"type": ["string", "null"], "maxLength": 100},
+          "version": {"type": "integer", "minimum": 1},
+          "correlation_id": {"type": "string", "pattern": "^corr_[A-Za-z0-9_-]+$"},
+          "generation_usage": {"$ref": "#/components/schemas/GenerationUsage"}
         }
       },
       "DiaryList": {
